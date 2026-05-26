@@ -32,12 +32,13 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("allow_from"))
     adapter._group_policy = str(extra.get("group_policy", "open")).strip().lower()
     adapter._group_allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("group_allow_from"))
+    adapter._observe_unmentioned = False
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._free_response_chats = adapter._whatsapp_free_response_chats()
     return adapter
 
 
-def _group_message(body="hello", **overrides):
+def _group_message(body="hello", *, sender_id="111", sender_name="Alice Example", **overrides):
     data = {
         "isGroup": True,
         "body": body,
@@ -45,6 +46,8 @@ def _group_message(body="hello", **overrides):
         "mentionedIds": [],
         "botIds": ["15551230000@s.whatsapp.net", "15551230000@lid"],
         "quotedParticipant": "",
+        "senderId": sender_id,
+        "senderName": sender_name,
     }
     data.update(overrides)
     return data
@@ -371,3 +374,289 @@ def test_is_broadcast_chat_helper_recognizes_common_jids():
     assert WhatsAppAdapter._is_broadcast_chat("120363001234567890@g.us") is False
     assert WhatsAppAdapter._is_broadcast_chat("") is False
     assert WhatsAppAdapter._is_broadcast_chat(None) is False  # type: ignore[arg-type]
+
+
+# --- Passive / observed group context tests ---
+
+
+class _FakeSessionEntry:
+    session_id = "whatsapp-group-session"
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
+def _make_observe_adapter(**kw):
+    """Create a WhatsAppAdapter with observe group settings preloaded."""
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="open",
+        **kw,
+    )
+    adapter._observe_unmentioned = True
+    store = _FakeSessionStore()
+    adapter._session_store = store
+    return adapter, store
+
+
+# --- Detection gate tests ---
+
+
+def test_should_observe_returns_false_when_disabled():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+    adapter._observe_unmentioned = False
+    data = _group_message("side chatter")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_true_for_unmentioned_group():
+    adapter, _store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message("side chatter")
+    assert adapter._should_observe_unmentioned_group_message(data) is True
+
+
+def test_should_observe_returns_false_for_dm():
+    adapter, _store = _make_observe_adapter()
+    data = _dm_message("hello")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_when_bot_mentioned():
+    adapter, _store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message(
+        "hey @15551230000",
+        mentionedIds=["15551230000@s.whatsapp.net"],
+    )
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_when_reply_to_bot():
+    adapter, _store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message(
+        "replying",
+        quotedParticipant="15551230000@s.whatsapp.net",
+    )
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_for_free_response_chat():
+    adapter, _store = _make_observe_adapter(
+        free_response_chats=["120363001234567890@g.us"],
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message("hello everyone")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_for_mention_pattern_match():
+    adapter, _store = _make_observe_adapter(
+        mention_patterns=[r"^\s*chompy\b"],
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message("chompy what's up")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_when_require_mention_disabled():
+    adapter = _make_adapter(
+        require_mention=False,
+        group_policy="open",
+    )
+    adapter._observe_unmentioned = True
+    store = _FakeSessionStore()
+    adapter._session_store = store
+    data = _group_message("hello everyone")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+def test_should_observe_returns_false_for_broadcast():
+    adapter, _store = _make_observe_adapter()
+    data = _group_message("story update", isGroup=True, chatId="status@broadcast")
+    assert adapter._should_observe_unmentioned_group_message(data) is False
+
+
+# --- Observation storage tests ---
+
+
+def test_observe_unmentioned_stores_attributed_entry():
+    adapter, store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message("side chatter")
+
+    adapter._observe_unmentioned_group_message(data)
+
+    assert len(store.messages) == 1
+    session_id, message, skip_db = store.messages[0]
+    assert session_id == "whatsapp-group-session"
+    assert skip_db is False
+    assert message["role"] == "user"
+    assert message.get("observed") is True
+    assert "Alice Example" in message["content"]
+    assert "111" in message["content"]
+    assert "side chatter" in message["content"]
+
+
+def test_observe_source_is_shared_no_user_id():
+    adapter, store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    data = _group_message("side chatter")
+
+    adapter._observe_unmentioned_group_message(data)
+
+    assert len(store.sources) == 1
+    source = store.sources[0]
+    assert source.user_id is None
+    assert source.user_name is None
+    assert source.chat_id == "120363001234567890@g.us"
+    assert source.chat_type == "group"
+
+
+def test_observe_does_not_store_when_disabled():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+    adapter._observe_unmentioned = False
+    store = _FakeSessionStore()
+    adapter._session_store = store
+    data = _group_message("side chatter")
+
+    adapter._observe_unmentioned_group_message(data)
+
+    assert store.messages == []
+
+
+# --- Triggered message attribution tests ---
+
+
+def test_triggered_group_message_applies_observe_attribution():
+    adapter, _store = _make_observe_adapter(
+        group_allow_from=["120363001234567890@g.us"],
+    )
+    from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+
+    data = _group_message(
+        "@15551230000 what's the weather?",
+        mentionedIds=["15551230000@s.whatsapp.net"],
+    )
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="120363001234567890@g.us",
+        chat_type="group",
+        user_id="111",
+        user_name="Alice Example",
+    )
+    event = MessageEvent(
+        text="what's the weather?",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=data,
+        message_id="42",
+    )
+    result = adapter._apply_whatsapp_group_observe_attribution(event)
+    assert result.source.user_id is None
+    assert result.source.user_name is None
+    assert "Alice Example" in result.text
+    assert "what's the weather?" in result.text
+    assert "@15551230000" not in result.text
+    assert result.channel_prompt is not None
+    assert "observed WhatsApp group context" in result.channel_prompt
+
+
+def test_triggered_group_message_no_attribution_when_observe_disabled():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+    adapter._observe_unmentioned = False
+    from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+
+    data = _group_message("hello")
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="120363001234567890@g.us",
+        chat_type="group",
+        user_id="111",
+        user_name="Alice",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=data,
+    )
+    result = adapter._apply_whatsapp_group_observe_attribution(event)
+    assert result is event  # returned unchanged
+    assert result.source.user_id == "111"
+
+
+# --- Gateway integration test ---
+
+
+def test_whatsapp_observed_context_wires_through_gateway_history():
+    """Observed WhatsApp entries are stripped from replay and wrapped as context."""
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "session_meta", "content": "tool defs"},
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+        {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True},
+        {"role": "assistant", "content": "previous explicit reply"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed WhatsApp group context is present.",
+    )
+    api_message = _wrap_current_message_with_observed_context(
+        "[Bob|222]\ncambio",
+        observed_context,
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
+    assert "[Observed" in api_message
+    assert "Acha que dá fazer estoque?" in api_message
+    assert "Tem lote e vencimento" in api_message
+    assert api_message.endswith("[Bob|222]\ncambio")
+
+
+# --- Config bridging test ---
+
+
+def test_config_bridges_whatsapp_observe_setting(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n"
+        "  observe_unmentioned_group_messages: true\n"
+        "  group_policy: allowlist\n"
+        "  group_allow_from:\n"
+        "    - \"120363001234567890@g.us\"\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_POLICY", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_ALLOWED_USERS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    assert config.platforms[Platform.WHATSAPP].extra["observe_unmentioned_group_messages"] is True
+    assert __import__("os").environ["WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "true"
