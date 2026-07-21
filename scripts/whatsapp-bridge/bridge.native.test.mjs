@@ -20,6 +20,7 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
@@ -43,6 +44,27 @@ import {
   assert.equal(receiptKeys[0], groupKey);
   assert.equal(receiptKeys[0].participant, groupKey.participant);
   console.log('  ✓ inbound read receipts preserve the original group message key');
+}
+
+// -- WhatsApp identifier normalization ------------------------------------
+{
+  const deviceSuffixedLid = '123456789:1@lid';
+  const suffixFreeLid = '123456789@lid';
+  assert.equal(normalizeWhatsAppId(deviceSuffixedLid), suffixFreeLid);
+  assert.equal(normalizeWhatsAppId(suffixFreeLid), suffixFreeLid);
+  assert.equal(
+    normalizeWhatsAppId(deviceSuffixedLid),
+    normalizeWhatsAppId(suffixFreeLid),
+  );
+  assert.equal(
+    normalizeWhatsAppId('15551234567:47@s.whatsapp.net'),
+    '15551234567@s.whatsapp.net',
+  );
+  assert.notEqual(
+    normalizeWhatsAppId(deviceSuffixedLid),
+    normalizeWhatsAppId('987654321@lid'),
+  );
+  console.log('  ✓ device-suffixed JIDs canonicalize without collapsing accounts');
 }
 
 // -- quoted outbound text -------------------------------------------------
