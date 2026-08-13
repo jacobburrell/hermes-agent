@@ -673,19 +673,50 @@ export function pollCreationMessageFromPayload(payload) {
  */
 export function createReconnectScheduler(startFn, {
   retryDelayMs = 5000,
+  maxDelayMs = 300000,
+  jitterRatio = 0.2,
   log = console.log,
   setTimeoutFn = setTimeout,
+  randomFn = Math.random,
 } = {}) {
+  // Consecutive scheduling attempts since the last healthy connection.
+  // Reset via scheduleReconnect.reset() from the 'open' handler; without
+  // that a persistent failure (unreachable proxy, 428/503 flapping) retried
+  // every 3-5s forever, because each close scheduled a fresh fixed delay.
+  let attempts = 0;
+
+  function nextDelay(baseMs) {
+    // The first two attempts keep the caller's delay verbatim -- a single
+    // blip should still recover promptly -- then it doubles to the cap.
+    const exponent = Math.max(0, attempts - 1);
+    if (exponent === 0) return baseMs;
+    const grown = Math.min(baseMs * 2 ** exponent, maxDelayMs);
+    // Jitter only once backing off, so many bridges recovering from the
+    // same outage don't retry in lockstep.
+    const spread = grown * jitterRatio;
+    return Math.round(grown - spread + randomFn() * spread * 2);
+  }
+
   function scheduleReconnect(delayMs) {
+    const wait = nextDelay(delayMs);
+    attempts += 1;
     setTimeoutFn(() => {
       Promise.resolve()
         .then(startFn)
         .catch((err) => {
-          log(`⚠️  Reconnect failed (${err?.message || err}). Retrying in ${Math.round(retryDelayMs / 1000)}s...`);
-          scheduleReconnect(retryDelayMs);
+          const next = scheduleReconnect(retryDelayMs);
+          log(`⚠️  Reconnect failed (${err?.message || err}). Retrying in ${Math.round(next / 1000)}s...`);
         });
-    }, delayMs);
+    }, wait);
+    return wait;
   }
+
+  // Attached rather than returned separately so existing callers, which
+  // treat the scheduler as a plain function, keep working unchanged.
+  scheduleReconnect.reset = () => {
+    attempts = 0;
+  };
+
   return scheduleReconnect;
 }
 
