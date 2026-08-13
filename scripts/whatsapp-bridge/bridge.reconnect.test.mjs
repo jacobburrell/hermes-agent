@@ -89,6 +89,92 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   assert.equal(timers.length, 2);
 }
 
+// Consecutive attempts back off exponentially and stop at the cap. Without
+// this a persistent failure (unreachable proxy, 428/503 flapping) reconnected
+// every 3-5s indefinitely, because each close scheduled a fresh fixed delay.
+{
+  const timers = [];
+  const schedule = createReconnectScheduler(async () => {}, {
+    maxDelayMs: 60000,
+    randomFn: () => 0.5,          // midpoint => jitter contributes nothing
+    log: () => {},
+    setTimeoutFn: (fn, ms) => timers.push({ fn, ms }),
+  });
+
+  const waits = [];
+  for (let i = 0; i < 7; i += 1) waits.push(schedule(3000));
+
+  // First two keep the caller's delay so a single blip recovers promptly.
+  assert.deepEqual(waits.slice(0, 2), [3000, 3000]);
+  // Then it doubles, and never exceeds the cap.
+  assert.deepEqual(waits.slice(2, 5), [6000, 12000, 24000]);
+  assert.deepEqual(waits.slice(5), [48000, 60000]);
+  assert.ok(waits.every(w => w <= 60000), 'delay must never exceed the cap');
+  assert.deepEqual(timers.map(t => t.ms), waits, 'scheduled delay must match');
+}
+
+// A healthy connection resets the backoff, so an unrelated later drop does
+// not inherit the previous outage's delay.
+{
+  const schedule = createReconnectScheduler(async () => {}, {
+    randomFn: () => 0.5,
+    log: () => {},
+    setTimeoutFn: () => {},
+  });
+
+  for (let i = 0; i < 5; i += 1) schedule(3000);
+  assert.ok(schedule(3000) > 3000, 'backoff should have grown');
+
+  schedule.reset();
+  assert.equal(schedule(3000), 3000, 'reset must return to the base delay');
+}
+
+// The scheduler stays a plain callable so existing call sites are unaffected.
+{
+  const schedule = createReconnectScheduler(async () => {}, {
+    log: () => {},
+    setTimeoutFn: () => {},
+  });
+  assert.equal(typeof schedule, 'function');
+  assert.equal(typeof schedule.reset, 'function');
+}
+
+// Jitter spreads retries around the backed-off delay rather than having every
+// bridge recovering from one outage retry in lockstep.
+{
+  const mk = random => {
+    const schedule = createReconnectScheduler(async () => {}, {
+      jitterRatio: 0.2,
+      randomFn: () => random,
+      log: () => {},
+      setTimeoutFn: () => {},
+    });
+    for (let i = 0; i < 3; i += 1) schedule(1000);   // reach the 2x step
+    return schedule(1000);
+  };
+
+  const low = mk(0);
+  const high = mk(1);
+  const mid = mk(0.5);
+
+  assert.ok(low < mid && mid < high, 'jitter must vary with the RNG');
+  assert.ok(low >= mid * 0.8 - 1 && high <= mid * 1.2 + 1, 'jitter stays within +/-20%');
+}
+
+// Jitter never perturbs the first two attempts -- callers and the existing
+// close handler rely on the exact delay they asked for.
+{
+  const timers = [];
+  const schedule = createReconnectScheduler(async () => {}, {
+    randomFn: () => 1,            // maximum jitter, if it applied
+    log: () => {},
+    setTimeoutFn: (fn, ms) => timers.push({ fn, ms }),
+  });
+
+  assert.equal(schedule(3000), 3000);
+  assert.equal(schedule(1000), 1000);
+}
+
 // -- createVersionResolver ------------------------------------------------
 
 // A successful fetch returns and caches the version.
