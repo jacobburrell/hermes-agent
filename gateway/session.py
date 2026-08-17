@@ -2007,6 +2007,11 @@ class SessionStore:
         if getattr(self.config, "multiplex_profiles", False):
             return True
 
+        active_profile = self._active_profile_name()
+        durable_profile = str(recovered.get("profile_name") or "").strip()
+        if durable_profile:
+            return durable_profile == active_profile
+
         recovered_key = str(recovered.get("session_key") or "")
         if not recovered_key or recovered_key == requested_session_key:
             return True
@@ -2015,7 +2020,7 @@ class SessionStore:
         if recovered_profile is None:
             return True
 
-        return recovered_profile == self._active_profile_name()
+        return recovered_profile == active_profile
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
