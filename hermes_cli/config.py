@@ -2184,6 +2184,30 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             "    base_url: https://...",
         ))
 
+    # ── platform_toolsets must resolve to real toolsets ─────────────────
+    # An unknown entry is not cosmetic: resolution drops it silently, and a
+    # platform with no remaining valid entries starts the agent without tools.
+    # Keep this diagnostic non-mutating — choosing a replacement can broaden a
+    # messaging channel's capabilities and must remain an explicit user choice.
+    try:
+        from hermes_cli.toolset_validation import validate_platform_toolsets
+        from toolsets import validate_toolset
+
+        for warning in validate_platform_toolsets(
+            config.get("platform_toolsets"), validate_toolset
+        ):
+            zero_toolsets = warning.startswith("platform_toolsets resolves to zero")
+            issues.append(ConfigIssue(
+                "error" if zero_toolsets else "warning",
+                warning,
+                "Run 'hermes tools' to choose valid toolsets; Hermes will not "
+                "change a messaging channel's tool permissions automatically.",
+            ))
+    except Exception:
+        # Plugin/toolset discovery is best-effort during early startup. Other
+        # structural diagnostics must still be available if it is unavailable.
+        pass
+
     # ── Root-level keys that look misplaced ──────────────────────────────
     # Only provider-like fields (base_url, api_key, …) are flagged. Arbitrary
     # unknown top-level keys are deliberately NOT warned about: top-level
@@ -5914,6 +5938,15 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
+
+        config_issues = validate_config_structure(read_raw_config())
+        if config_issues:
+            print()
+            print(color("  Configuration issues:", Colors.YELLOW, Colors.BOLD))
+            for issue in config_issues:
+                marker = "✗" if issue.severity == "error" else "⚠"
+                print(color(f"    {marker} {issue.message}", Colors.RED if issue.severity == "error" else Colors.YELLOW))
+                print(color(f"      {issue.hint}", Colors.DIM))
         
         print()
     
