@@ -2196,7 +2196,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
         for warning in validate_platform_toolsets(
             config.get("platform_toolsets"), validate_toolset
         ):
-            zero_toolsets = warning.startswith("platform_toolsets resolves to zero")
+            zero_toolsets = "resolves to zero valid toolsets" in warning
             issues.append(ConfigIssue(
                 "error" if zero_toolsets else "warning",
                 warning,

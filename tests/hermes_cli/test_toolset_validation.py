@@ -36,15 +36,22 @@ def test_38798_corruption_warns_and_suggests_correct_name():
     assert any("zero valid toolsets" in w for w in warnings)
 
 
-def test_mixed_valid_and_invalid_flags_only_the_invalid():
+def test_invalid_platform_is_not_masked_by_another_platforms_valid_toolset():
     cfg = {"cli": ["hermes-cli"], "discord": ["bogus"]}
     warnings = validate_platform_toolsets(cfg, _is_valid)
-    # One valid entry exists, so no zero-valid warning.
-    assert not any("zero valid toolsets" in w for w in warnings)
-    assert len(warnings) == 1
-    assert "platform 'discord'" in warnings[0]
-    assert "unknown toolset 'bogus'" in warnings[0]
+    assert len(warnings) == 2
+    assert any(
+        "platform 'discord'" in warning and "unknown toolset 'bogus'" in warning
+        for warning in warnings
+    )
+    assert any(
+        "platform 'discord' resolves to zero valid toolsets" in warning
+        for warning in warnings
+    )
 
+
+def test_empty_platform_toolset_list_is_an_intentional_disable():
+    assert validate_platform_toolsets({"telegram": []}, _is_valid) == []
 
 
 

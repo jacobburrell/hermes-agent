@@ -27,8 +27,8 @@ def validate_platform_toolsets(
        renamed entry. When ``hermes-<platform>`` would have been valid (the exact
        #38798 shape, where ``cli`` held ``hermes`` instead of ``hermes-cli``),
        the warning includes that as a suggestion.
-    2. The mapping is non-empty but resolves to *zero* valid toolsets, so the
-       agent would start with no tools at all.
+    2. A platform's explicit list resolves to *zero* valid toolsets, so that
+       platform's agent would start with no tools at all.
 
     ``is_valid_toolset`` is injected (normally :func:`toolsets.validate_toolset`)
     so this function performs no imports or I/O and is testable in isolation.
@@ -46,15 +46,17 @@ def validate_platform_toolsets(
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
         return warnings
 
-    valid_count = 0
     for platform, raw in platform_toolsets.items():
         names = raw if isinstance(raw, list) else [raw]
+        valid_count = 0
+        invalid_count = 0
         for name in names:
             if not isinstance(name, str) or not name:
                 continue
             if is_valid_toolset(name):
                 valid_count += 1
                 continue
+            invalid_count += 1
             suggestion = f"hermes-{platform}"
             hint = (
                 f" — did you mean '{suggestion}'?"
@@ -66,9 +68,12 @@ def validate_platform_toolsets(
                 f"'{name}'{hint}"
             )
 
-    if valid_count == 0:
-        warnings.append(
-            "platform_toolsets resolves to zero valid toolsets — the agent will "
-            "have no tools. Run `hermes tools` to reconfigure."
-        )
+        # An empty list is an intentional way to disable tools for a platform;
+        # only flag a zero-tools outcome caused by one or more invalid names.
+        if invalid_count and valid_count == 0:
+            warnings.append(
+                f"platform '{platform}' resolves to zero valid toolsets — the "
+                "agent will have no tools on this platform. Run `hermes tools` "
+                "to reconfigure."
+            )
     return warnings
