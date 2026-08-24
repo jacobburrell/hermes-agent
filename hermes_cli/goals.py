@@ -15,8 +15,9 @@ Design notes / invariants:
 - The continuation prompt is just a normal user message appended to the
   session via ``run_conversation``. No system-prompt mutation, no toolset
   swap — prompt caching stays intact.
-- Judge failures are fail-OPEN: ``continue``. A broken judge must not wedge
-  progress; the turn budget is the backstop.
+- Legacy bounded goals retain their fixed turn budget. Judge-led goals retry
+  controller calls without spending an agent turn, then park as a recoverable
+  control-plane error until a health probe succeeds.
 - When a real user message arrives mid-loop it preempts the continuation
   prompt and also pauses the goal loop for that turn (we still re-judge
   after, so if the user's message happens to complete the goal the judge
@@ -2255,11 +2256,33 @@ class GoalManager:
         s = self._state
         if s is None or s.status in {"cleared",}:
             return "No active goal. Set one with /goal <text>."
-        turns = (
-            f"{s.turns_used} turns (judge-led)"
-            if s.termination == "judge"
-            else f"{s.turns_used}/{s.max_turns} turns"
-        )
+        if s.termination == "judge":
+            latest = next(
+                (
+                    entry for entry in reversed(s.progress_ledger)
+                    if isinstance(entry, dict)
+                ),
+                {},
+            )
+            progress = str(latest.get("progress") or "not yet observed")
+            blocker = str(
+                latest.get("blocker_class") or s.last_verdict or "none"
+            )
+            paths = [path for path in s.recovery_paths if isinstance(path, dict)]
+            tried = sum(1 for path in paths if path.get("state") == "tried")
+            pending = sum(
+                1 for path in paths if path.get("state") in {"untried", "in_progress"}
+            )
+            # Turn count remains telemetry in the state/ledger but is not a
+            # pressure signal in judge mode. Status explains whether the work
+            # is advancing, which recovery routes remain, and why it may be
+            # parked instead of presenting an implicit quota.
+            turns = (
+                f"judge-led; progress {progress}; strategies {tried} tried/{pending} pending; "
+                f"blocker {blocker}"
+            )
+        else:
+            turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
@@ -3330,6 +3353,21 @@ class GoalManager:
         """Verify terminal decisions and turn rejected ones into recovery."""
         state = self._state
         assert state is not None
+        if (
+            decision.get("verdict") in {"achieved", "not_achievable"}
+            and not self._has_independent_terminal_evidence()
+        ):
+            return self._replan_with_recovery({
+                **decision,
+                "reason": (
+                    "terminal claim lacks independently observed evidence; "
+                    "collect a deterministic gate, tool result, or authorized evidence source"
+                ),
+                "next_strategy_constraint": (
+                    "do not claim completion or impossibility from assistant prose; "
+                    "obtain independent evidence"
+                ),
+            })
         verifier = verify_terminal_goal_decision(state, decision)
         if verifier.get("control_plane_error"):
             return self._park_control_plane_error(str(verifier["control_plane_error"]))
