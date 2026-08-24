@@ -81,6 +81,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "goal_mode": t.goal_mode,
+        "goal_termination": t.goal_termination,
+        "goal_max_turns": t.goal_max_turns,
     }
 
 
@@ -393,6 +396,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--goal-termination", choices=("bounded", "judge"),
+                          default="bounded", dest="goal_termination",
+                          help="Termination policy for --goal workers. judge keeps "
+                               "working through productive turns and relies on the "
+                               "progress/recovery controller; bounded retains "
+                               "--goal-max-turns compatibility.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1584,6 +1593,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
+            goal_termination=getattr(args, "goal_termination", "bounded"),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )

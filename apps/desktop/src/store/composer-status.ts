@@ -22,7 +22,7 @@ export interface ComposerStatusItem {
   exitCode?: number
   /** subagent: active tool label shown on the right. */
   currentTool?: string
-  /** goal: active | paused | waiting | done. */
+  /** Durable goal lifecycle state; only `done` means achieved. */
   goalStatus?: GoalStatus
   id: string
   /** background process: captured stdout/stderr tail for the inline viewer. */
@@ -157,7 +157,12 @@ const goalToItem = (goal: { detail?: string; status: GoalStatus; title: string }
   currentTool: goal.detail,
   goalStatus: goal.status,
   id: 'goal:standing',
-  state: goal.status === 'active' || goal.status === 'waiting' ? 'running' : 'done',
+  state:
+    goal.status === 'active' || goal.status === 'waiting'
+      ? 'running'
+      : goal.status === 'blocked' || goal.status === 'unachievable' || goal.status === 'control_plane_error'
+        ? 'failed'
+        : 'done',
   title: goal.title,
   type: 'goal'
 })

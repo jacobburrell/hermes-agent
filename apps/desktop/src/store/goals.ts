@@ -4,7 +4,7 @@ import { keyedTimeouts } from '@/lib/keyed-timeouts'
 
 import { $gateway } from './gateway'
 
-export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting'
+export type GoalStatus = 'active' | 'awaiting_user' | 'blocked' | 'control_plane_error' | 'done' | 'paused' | 'stopped' | 'unachievable' | 'waiting'
 
 export interface SessionGoal {
   detail?: string
@@ -77,7 +77,7 @@ function nextGoalFromText(text: string, previous?: SessionGoal): SessionGoal | n
     return { status: 'active', title: fromSet || fromActive || fromResume, updatedAt: now }
   }
 
-  const fromWaiting = goalTitleFromLine(line, /^⏳ Goal\s*\([^)]*(?:parked|active)[^)]*\):\s*(.+)$/)
+  const fromWaiting = goalTitleFromLine(line, /^⏳ Goal\s*\([^)]*(?:parked|active|waiting)[^)]*\):\s*(.+)$/)
 
   if (fromWaiting) {
     return { status: 'waiting', title: fromWaiting, updatedAt: now }
@@ -117,6 +117,51 @@ function nextGoalFromText(text: string, previous?: SessionGoal): SessionGoal | n
     return {
       detail: line.replace(/^⏸\s*/, ''),
       status: 'paused',
+      title: previous?.title || 'Standing goal',
+      updatedAt: now
+    }
+  }
+
+  if (/^✋ Goal (?:awaiting|completion is ready)/i.test(line)) {
+    return {
+      detail: line.replace(/^✋\s*/, ''),
+      status: 'awaiting_user',
+      title: previous?.title || 'Standing goal',
+      updatedAt: now
+    }
+  }
+
+  if (/^⚠ Goal controller (?:is unavailable|retrying)/i.test(line)) {
+    return {
+      detail: line.replace(/^⚠\s*/, ''),
+      status: 'control_plane_error',
+      title: previous?.title || 'Standing goal',
+      updatedAt: now
+    }
+  }
+
+  if (/^⛔ Goal blocked\b/i.test(line)) {
+    return {
+      detail: line.replace(/^⛔\s*/, ''),
+      status: 'blocked',
+      title: previous?.title || 'Standing goal',
+      updatedAt: now
+    }
+  }
+
+  if (/^⊘ Goal (?:is )?unachievable\b/i.test(line)) {
+    return {
+      detail: line.replace(/^⊘\s*/, ''),
+      status: 'unachievable',
+      title: previous?.title || 'Standing goal',
+      updatedAt: now
+    }
+  }
+
+  if (/^■ Goal stopped\b/i.test(line)) {
+    return {
+      detail: line.replace(/^■\s*/, ''),
+      status: 'stopped',
       title: previous?.title || 'Standing goal',
       updatedAt: now
     }

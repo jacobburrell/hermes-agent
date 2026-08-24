@@ -10545,6 +10545,43 @@ _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
 
+def _maybe_fire_tui_goal_wake(sid: str, session: dict) -> None:
+    """Claim a due goal wake for an idle TUI/Desktop session.
+
+    This is the missing half of a WAIT barrier: post-turn evaluation can park
+    the goal, but only an independent idle poll can wake it after a process
+    exits or its deadline passes.  The manager's durable claim prevents a
+    second visible surface from injecting the same continuation.
+    """
+    try:
+        from hermes_cli.goals import GoalManager
+    except Exception:
+        return
+    sid_key = session.get("session_key") or ""
+    if not sid_key:
+        return
+    mgr = GoalManager(session_id=sid_key)
+    if not mgr.has_due_wake():
+        return
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        session["running"] = True
+    claim = mgr.claim_due_wake()
+    if not claim:
+        with session["history_lock"]:
+            session["running"] = False
+        return
+    try:
+        _emit("status.update", sid, {"kind": "goal", "text": "↻ /goal wakeup firing…"})
+        _emit("message.start", sid)
+        _run_prompt_submit(f"__goal__{int(time.time() * 1000)}", sid, session, claim["prompt"])
+    except Exception:
+        with session["history_lock"]:
+            session["running"] = False
+        mgr.abandon_wake(str(claim.get("claim_id") or ""))
+
+
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     """Fire a due /loop wakeup for an idle TUI/Desktop/dashboard session.
 
@@ -10817,8 +10854,22 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
+    _last_goal_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        # /goal owns its durable schedule, including wait-barrier recovery.
+        # Run it before legacy /loop so a scheduled goal continuation cannot
+        # be interleaved with an unrelated recurring prompt.
+        if _now - _last_goal_poll >= _LOOP_POLL_SECONDS:
+            _last_goal_poll = _now
+            try:
+                _maybe_fire_tui_goal_wake(sid, session)
+            except Exception as _goal_wake_exc:
+                print(
+                    f"[tui_gateway] goal wakeup poll failed: "
+                    f"{type(_goal_wake_exc).__name__}: {_goal_wake_exc}",
+                    file=sys.stderr,
+                )
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same
         # claim-under-lock pattern as the kanban dispatch below. Active
@@ -11472,6 +11523,24 @@ def _run_prompt_submit(
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
+            # Owner input reactivates a needs-input goal before this ordinary
+            # turn is evaluated. Auto-continuations and slash commands are
+            # excluded; approval completion is still token-bound elsewhere.
+            if (
+                display_kind != "auto_continue"
+                and isinstance(text, str)
+                and text.strip()
+                and not text.lstrip().startswith("/")
+            ):
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    GoalManager(session_id=str(session.get("session_key") or "")).resume_from_user_input(
+                        text,
+                        actor_id=str(session.get("session_key") or ""),
+                    )
+                except Exception:
+                    logger.debug("tui goal input-resume check failed", exc_info=True)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -12036,9 +12105,9 @@ def _run_prompt_submit(
                                     {"kind": "goal", "text": verdict_msg},
                                 )
                             if decision.get("should_continue"):
-                                cont_prompt = decision.get("continuation_prompt") or ""
-                                if cont_prompt:
-                                    goal_followup = cont_prompt
+                                claim = goal_mgr.claim_due_wake()
+                                if claim:
+                                    goal_followup = claim["prompt"]
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "

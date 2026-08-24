@@ -12820,6 +12820,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     # ────────────────────────────────────────────────────────────────
     # /loop — recurring in-session wakeups (Claude Code /loop parity)
     # ────────────────────────────────────────────────────────────────
+    def _maybe_fire_goal_wake(self) -> None:
+        """Claim and inject one due durable /goal wake while this CLI is idle.
+
+        This is deliberately separate from the post-turn judge: a WAIT
+        verdict has no following turn, so only the idle scheduler can resume
+        it after a process exits or deadline passes.  The persisted claim is
+        released by the next post-turn evaluation or its expiry after a crash.
+        """
+        mgr = self._get_goal_manager()
+        if mgr is None or not mgr.has_due_wake():
+            return
+        try:
+            if not self._pending_input.empty():
+                return
+        except Exception:
+            return
+        claim = mgr.claim_due_wake()
+        if not claim:
+            return
+        try:
+            self._pending_input.put(claim["prompt"])
+            _cprint(f"  {_DIM}↻ /goal wakeup firing…{_RST}")
+        except Exception as exc:
+            logging.debug("goal wake injection failed: %s", exc)
+            mgr.abandon_wake(claim.get("claim_id", ""))
+
     def _get_loop_manager(self):
         """Return the LoopManager bound to the current session_id.
 
@@ -13155,12 +13181,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"  {msg}")
 
         if decision.get("should_continue"):
-            prompt = decision.get("continuation_prompt")
-            if prompt:
-                try:
-                    self._pending_input.put(prompt)
-                except Exception as exc:
-                    logging.debug("goal continuation enqueue failed: %s", exc)
+            try:
+                claim = mgr.claim_due_wake()
+                if claim:
+                    self._pending_input.put(claim["prompt"])
+            except Exception as exc:
+                logging.debug("goal continuation enqueue failed: %s", exc)
 
 
 
@@ -20362,8 +20388,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 self._drain_process_notifications("cli-idle")
                             except Exception:
                                 pass
-                            # Fire a due /loop wakeup while idle (defers to
-                            # queued user input and active /goal loops).
+                            # Fire a due goal first: its persistent scheduler
+                            # owns active/waiting goals, including WAIT wakes
+                            # that otherwise have no future user turn.  The
+                            # ordinary /loop remains a compatibility feature
+                            # and defers when a goal is actively driving.
+                            try:
+                                self._maybe_fire_goal_wake()
+                            except Exception:
+                                pass
                             try:
                                 self._maybe_fire_loop_tick()
                             except Exception:
@@ -20482,6 +20515,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
                     # Regular chat - run agent
+                    # A judge-led goal parked for irreducible owner input
+                    # resumes on the owner's next ordinary message. Approval
+                    # completion remains capability-bound to /goal approve,
+                    # so this cannot turn a stray "yes" into success.
+                    try:
+                        _goal_mgr = self._get_goal_manager()
+                        if _goal_mgr is not None and isinstance(user_input, str):
+                            _goal_mgr.resume_from_user_input(user_input, actor_id="local")
+                    except Exception:
+                        logging.debug("goal input-resume check failed", exc_info=True)
                     self._agent_running = True
                     self._interactive_turn = True
                     self._pet_turn_error = False
@@ -20987,7 +21030,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if not goal_text:
         return
 
-    max_turns = task.goal_max_turns or _DEF_TURNS
+    termination = "judge" if getattr(task, "goal_termination", "bounded") == "judge" else "bounded"
+    max_turns = None if termination == "judge" else (task.goal_max_turns or _DEF_TURNS)
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -21030,16 +21074,72 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    def _save_controller_state(state: dict) -> None:
+        c = _kb.connect()
+        try:
+            _kb.save_goal_controller_state(
+                c,
+                task_id,
+                state,
+                expected_run_id=worker_run_id,
+            )
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    outcome = _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
         max_turns=max_turns,
+        termination=termination,
         first_response=first_response or "",
+        controller_state=getattr(task, "goal_controller_state", None),
+        save_controller_state=_save_controller_state if termination == "judge" else None,
         log=lambda m: logger.info("%s", m),
     )
+    # Card lifecycle remains controller-owned in judge mode. A genuine human
+    # dependency is a recoverable blocked card; a controller outage releases
+    # the lane for its scheduled health retry; independent terminal failure or
+    # a policy stop routes to triage, never done.
+    loop_outcome = str((outcome or {}).get("outcome") or "")
+    loop_reason = str((outcome or {}).get("reason") or "")
+    if termination != "judge":
+        return
+    c = _kb.connect()
+    try:
+        if loop_outcome == "control_plane_error":
+            _kb.park_goal_control_plane_error(
+                c,
+                task_id,
+                reason=loop_reason,
+                expected_run_id=worker_run_id,
+            )
+        elif loop_outcome == "needs_input":
+            _kb.block_task(
+                c,
+                task_id,
+                reason=loop_reason,
+                kind="needs_input",
+                expected_run_id=worker_run_id,
+            )
+        elif loop_outcome in {"not_achievable", "policy_stop"}:
+            _kb.triage_goal_terminal_failure(
+                c,
+                task_id,
+                reason=loop_reason,
+                verdict=loop_outcome,
+                expected_run_id=worker_run_id,
+            )
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 def main(

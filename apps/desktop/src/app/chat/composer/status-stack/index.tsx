@@ -54,13 +54,15 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
   if (group.type === 'goal') {
     const status = group.items[0]?.goalStatus
 
-    return status === 'paused'
-      ? s.goalPaused
-      : status === 'waiting'
-        ? s.goalWaiting
-        : status === 'done'
-          ? s.goalDone
-          : s.goalActive
+    if (status === 'paused') return s.goalPaused
+    if (status === 'waiting') return s.goalWaiting
+    if (status === 'awaiting_user') return s.goalAwaitingUser
+    if (status === 'control_plane_error') return s.goalControllerRetry
+    if (status === 'blocked') return s.goalBlocked
+    if (status === 'unachievable') return s.goalUnachievable
+    if (status === 'stopped') return s.goalStopped
+    if (status === 'done') return s.goalDone
+    return s.goalActive
   }
 
   if (group.type === 'todo') {
