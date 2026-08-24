@@ -74,6 +74,27 @@ def test_judge_mode_allows_productive_work_beyond_legacy_turn_cap(
     assert manager.state.status == "active"
 
 
+def test_judge_status_reports_progress_and_recovery_state_not_a_turn_quota(
+    hermes_home, monkeypatch
+):
+    from hermes_cli import goals
+
+    monkeypatch.setattr(goals, "_goal_controller_defaults", _judge_defaults)
+    manager = goals.GoalManager("judge-status")
+    state = manager.set("repair the approved integration")
+    state.progress_ledger = [{"progress": "stalled", "blocker_class": "capability"}]
+    state.recovery_paths = [
+        {"family": "logs", "state": "tried"},
+        {"family": "web", "state": "untried"},
+    ]
+    goals.save_goal(manager.session_id, state)
+
+    status = manager.status_line()
+    assert "judge-led; progress stalled" in status
+    assert "strategies 1 tried/1 pending" in status
+    assert "/20 turns" not in status
+
+
 def test_identical_stalled_actions_force_replan_before_third_attempt(
     hermes_home, monkeypatch
 ):
@@ -179,9 +200,79 @@ def test_terminal_success_requires_independent_verifier(
         "verify_terminal_goal_decision",
         lambda *_a, **_kw: {"accept": True, "reason": "quality gate and artifact receipt verified", "untried_strategy_families": []},
     )
+    manager.record_observed_evidence(
+        "gate-pass",
+        "the required quality gate exited 0",
+        provenance="deterministic_gate",
+    )
     completed = manager.evaluate_after_turn("The gate now passes with the artifact receipt")
     assert completed["verdict"] == "achieved"
     assert manager.state is not None and manager.state.status == "done"
+
+
+def test_needs_input_requires_three_safe_recovery_families_before_parking(
+    hermes_home, monkeypatch
+):
+    from hermes_cli import goals
+
+    monkeypatch.setattr(goals, "_goal_controller_defaults", _judge_defaults)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal_with_ledger",
+        lambda *_a, **_kw: _decision(
+            verdict="needs_input",
+            progress="stalled",
+            blocker_class="authorization",
+            reason="an owner credential is required",
+        ),
+    )
+    # The recovery model provides no useful route, so the controller must use
+    # its safe read-only floor rather than immediately park the goal.
+    monkeypatch.setattr(
+        goals,
+        "recovery_coach",
+        lambda *_a, **_kw: {"strategies": []},
+    )
+    monkeypatch.setattr(
+        goals,
+        "verify_terminal_goal_decision",
+        lambda *_a, **_kw: {"accept": True, "reason": "routes exhausted", "untried_strategy_families": []},
+    )
+
+    manager = goals.GoalManager("judge-three-routes")
+    manager.set("complete the authorized operation")
+    for attempt in range(3):
+        result = manager.evaluate_after_turn(f"recovery attempt {attempt}")
+        assert result["verdict"] == "replan"
+        assert manager.state is not None and manager.state.status == "active"
+
+    parked = manager.evaluate_after_turn("all safe diagnostic routes were attempted")
+    assert parked["verdict"] == "needs_input"
+    assert manager.state is not None and manager.state.status == "awaiting_user"
+    assert len({path["family"] for path in manager.state.recovery_paths if path.get("state") == "tried"}) >= 3
+
+
+def test_owner_input_reactivates_needs_input_goal_without_approving_completion(
+    hermes_home, monkeypatch
+):
+    from hermes_cli import goals
+
+    monkeypatch.setattr(goals, "_goal_controller_defaults", _judge_defaults)
+    manager = goals.GoalManager("judge-owner-input")
+    state = manager.set("finish the configured delivery", owner_id="owner-1")
+    state.status = "awaiting_user"
+    state.pending_approval_reason = "provide the approved destination"
+    goals.save_goal(manager.session_id, state)
+
+    assert manager.resume_from_user_input("destination is now configured", actor_id="other") is False
+    assert manager.resume_from_user_input("destination is now configured", actor_id="owner-1") is True
+    assert manager.state is not None
+    assert manager.state.status == "active"
+    assert manager.state.pending_approval_id == ""
+    assert any(
+        entry.get("provenance") == "user_confirmed"
+        for entry in manager.state.progress_ledger
+    )
 
 
 def test_controller_outage_parks_without_a_followup_agent_turn(hermes_home, monkeypatch):

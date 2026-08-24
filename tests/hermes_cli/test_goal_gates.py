@@ -71,7 +71,11 @@ def test_run_gate_fail_captures_output():
     assert "broken" in out
 
 
+@pytest.mark.live_system_guard_bypass
 def test_run_gate_timeout():
+    # ``subprocess.run(..., timeout=...)`` must signal the real short-lived
+    # child to exercise the timeout path. The repository guard otherwise
+    # rejects that signal after ``sh -c`` has reparented ``sleep``.
     passed, code, out = run_gate(GoalGate(command="sleep 5", timeout_seconds=1))
     assert passed is False
     assert code == -1

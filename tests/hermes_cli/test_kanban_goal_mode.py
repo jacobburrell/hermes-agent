@@ -105,6 +105,45 @@ def test_judge_termination_persists_without_goal_turn_budget(kanban_home):
     assert task.goal_mode is True
     assert task.goal_termination == "judge"
     assert task.goal_max_turns is None
+    # Judge-led orchestration gets three restore attempts before the normal
+    # failure circuit breaker may route it for human triage.
+    assert task.max_retries == 4
+
+
+def test_judge_card_persists_controller_checkpoint_and_block_proposal(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Recover from an approved connector failure",
+            assignee="jack",
+            goal_mode=True,
+            goal_termination="judge",
+        )
+        assert kb.save_goal_controller_state(
+            conn,
+            task_id,
+            {
+                "progress_ledger": [{"provenance": "tool_observed", "evidence": "bridge timeout"}],
+                "recovery_paths": [{"family": "web interface", "state": "tried"}],
+            },
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.goal_controller_state is not None
+        assert task.goal_controller_state["recovery_paths"][0]["family"] == "web interface"
+
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+
+        assert kb.propose_goal_block(
+            conn,
+            task_id,
+            reason="bridge remains unavailable",
+            kind="needs_input",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+        assert any(event.kind == "goal_block_proposed" for event in kb.list_events(conn, task_id))
 
 
 def test_required_skill_preflight_is_profile_scoped_and_nonsemantic(
