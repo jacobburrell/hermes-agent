@@ -1,6 +1,8 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+from argparse import Namespace
 
+import hermes_cli.config as config_module
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _EXTRA_KNOWN_ROOT_KEYS,
@@ -111,6 +113,40 @@ class TestVoiceSubmitModeValidation:
         )
 
 
+class TestPlatformToolsetValidation:
+    def test_unknown_platform_toolsets_are_visible_without_auto_repair(self):
+        issues = validate_config_structure({
+            "platform_toolsets": {
+                "teams": ["hermes-teams"],
+                "google_chat": ["hermes-google_chat"],
+            },
+        })
+
+        unknown = [issue for issue in issues if "unknown toolset" in issue.message]
+        assert {issue.severity for issue in unknown} == {"warning"}
+        assert any("hermes-teams" in issue.message for issue in unknown)
+        assert any("hermes-google_chat" in issue.message for issue in unknown)
+        zero_toolsets = [issue for issue in issues if "zero valid toolsets" in issue.message]
+        assert len(zero_toolsets) == 1
+        assert zero_toolsets[0].severity == "error"
+        assert "will not change" in zero_toolsets[0].hint
+
+    def test_config_check_renders_platform_toolset_issues(self, monkeypatch, capsys):
+        config = {"platform_toolsets": {"teams": ["hermes-teams"]}}
+        monkeypatch.setattr(config_module, "check_config_version", lambda: (38, 38))
+        monkeypatch.setattr(config_module, "REQUIRED_ENV_VARS", [])
+        monkeypatch.setattr(config_module, "OPTIONAL_ENV_VARS", {})
+        monkeypatch.setattr(config_module, "get_missing_config_fields", lambda: [])
+        monkeypatch.setattr(config_module, "read_raw_config", lambda: config)
+
+        config_module.config_command(Namespace(config_command="check"))
+
+        output = capsys.readouterr().out
+        assert "Configuration issues:" in output
+        assert "unknown toolset 'hermes-teams'" in output
+        assert "zero valid toolsets" in output
+
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
@@ -140,4 +176,3 @@ class TestUnknownTopLevelKeys:
         ]
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
-
