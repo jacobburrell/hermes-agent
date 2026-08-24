@@ -2081,9 +2081,9 @@ DEFAULT_CONFIG = {
     # whether the active /goal is satisfied by the assistant's last
     # response. If not, Hermes feeds a continuation prompt back into the
     # same session and keeps working until the goal is done, the turn
-    # budget is exhausted, or the user pauses/clears it. Judge failures
-    # fail OPEN (continue) so a flaky judge never wedges progress — the
-    # turn budget is the real backstop.
+    # budget is exhausted (bounded mode only), or the user pauses/clears it.
+    # Judge-led mode parks controller outages for health retries instead of
+    # spending worker turns while the controller is unavailable.
     "goals": {
         # ``bounded`` is the compatibility default.  ``judge`` removes the
         # goal-turn cap while retaining repetition, policy, and controller
@@ -2741,6 +2741,15 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Optional profile-scoped override for judge-led Kanban workers. This
+        # lets a profile keep a fast default model for small bounded work while
+        # routing persistent engineering cards to a stronger model without
+        # changing the card's scope or the global profile default.
+        "goal_mode_worker": {
+            "model": "",
+            "provider": "",
+            "reasoning_effort": "",
+        },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

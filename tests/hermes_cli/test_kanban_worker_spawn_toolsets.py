@@ -134,6 +134,82 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_routes_judge_goal_worker_without_changing_bounded_default(monkeypatch, tmp_path):
+    """A profile can reserve its stronger lane for persistent goal cards.
+
+    William, for example, keeps Spark as the normal profile default and uses
+    Terra/high only for judge-led Kanban engineering work.  A card-level pin
+    remains authoritative over the profile routing default.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "william"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+kanban:
+  goal_mode_worker:
+    model: gpt-5.6-terra
+    provider: openai-codex
+    reasoning_effort: high
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured: list[list[str]] = []
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured.append(list(cmd))
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    persistent = _make_task(kb, assignee="william")
+    persistent.goal_mode = True
+    persistent.goal_termination = "judge"
+    kb._default_spawn(persistent, str(workspace))
+    cmd = captured.pop()
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
+    assert cmd[cmd.index("--provider") + 1] == "openai-codex"
+    assert cmd[cmd.index("--reasoning") + 1] == "high"
+
+    bounded = _make_task(kb, assignee="william")
+    kb._default_spawn(bounded, str(workspace))
+    cmd = captured.pop()
+    assert "-m" not in cmd
+    assert "--provider" not in cmd
+    assert "--reasoning" not in cmd
+
+    legacy_goal = _make_task(kb, assignee="william")
+    legacy_goal.goal_mode = True
+    legacy_goal.goal_termination = "bounded"
+    kb._default_spawn(legacy_goal, str(workspace))
+    cmd = captured.pop()
+    assert "-m" not in cmd
+    assert "--provider" not in cmd
+    assert "--reasoning" not in cmd
+
+    pinned = _make_task(kb, assignee="william")
+    pinned.goal_mode = True
+    pinned.model_override = "gpt-5.6-sol"
+    pinned.provider_override = "openai-codex"
+    pinned.reasoning_effort = "medium"
+    kb._default_spawn(pinned, str(workspace))
+    cmd = captured.pop()
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
+    assert cmd[cmd.index("--provider") + 1] == "openai-codex"
+    assert cmd[cmd.index("--reasoning") + 1] == "medium"
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
