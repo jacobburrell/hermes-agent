@@ -13737,6 +13737,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def compare_and_set_meta(self, key: str, expected: str, value: str) -> bool:
+        """Replace a metadata value only when it still equals ``expected``.
+
+        Scheduler clients use this as a tiny durable lease primitive.  The
+        equality check and write share one ``BEGIN IMMEDIATE`` transaction, so
+        two gateway/CLI processes that observe the same due record cannot both
+        claim it.  It deliberately does *not* create missing rows: callers
+        must first establish their state with :meth:`set_meta`.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 

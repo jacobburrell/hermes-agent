@@ -799,6 +799,26 @@ def _(rid, params: dict) -> dict:
         lower = arg.strip().lower()
         if not arg.strip() or lower == "status":
             return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower.startswith("approval "):
+            try:
+                state = mgr.set_approval_policy(arg.split(None, 1)[1].strip())
+            except (RuntimeError, ValueError) as exc:
+                return _err(rid, 4004, f"/goal approval: {exc}")
+            return _ok(rid, {"type": "exec", "output": f"✓ Goal completion policy: {state.approval_policy}."})
+        if lower.startswith("approve "):
+            approval_id = arg.split(None, 1)[1].strip()
+            out = "✓ Goal achieved with owner approval." if mgr.approve_completion(approval_id, actor_id=sid_key) else "/goal approve: no matching pending owner approval."
+            return _ok(rid, {"type": "exec", "output": out})
+        if lower.startswith("reject ") or lower.startswith("deny "):
+            pieces = arg.split(None, 2)
+            approval_id = pieces[1] if len(pieces) > 1 else ""
+            reason = pieces[2] if len(pieces) > 2 else ""
+            if not mgr.deny_completion(approval_id, reason, actor_id=sid_key):
+                return _ok(rid, {"type": "exec", "output": "/goal reject: no matching pending owner approval."})
+            claim = mgr.claim_due_wake()
+            if not claim:
+                return _ok(rid, {"type": "exec", "output": "↻ Completion rejected; goal is scheduled to continue."})
+            return _ok(rid, {"type": "send", "notice": "↻ Completion rejected; continuing.", "message": claim["prompt"], "display": "/goal reject"})
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
@@ -814,7 +834,8 @@ def _(rid, params: dict) -> dict:
             # continuation prompt so the client fires the next turn
             # immediately; `display` keeps the transcript showing the
             # concise invocation instead of the model-facing scaffolding.
-            prompt = mgr.next_continuation_prompt()
+            claim = mgr.claim_due_wake()
+            prompt = claim.get("prompt") if claim else ""
             notice = f"▶ Goal resumed: {state.goal}\nContinuing now — taking the next step."
             if not prompt:
                 return _ok(rid, {"type": "exec", "output": f"▶ Goal resumed: {state.goal}"})
@@ -827,7 +848,12 @@ def _(rid, params: dict) -> dict:
                     "display": "/goal resume",
                 },
             )
-        if lower in {"clear", "stop", "done"}:
+        if lower == "stop":
+            state = mgr.stop()
+            return _ok(rid, {"type": "exec", "output": "■ Goal stopped." if state else "No active goal."})
+        if lower == "done":
+            return _ok(rid, {"type": "exec", "output": "/goal done cannot mark a goal successful. Use /goal stop or /goal clear."})
+        if lower == "clear":
             had = mgr.has_goal()
             mgr.clear()
             return _ok(
@@ -838,55 +864,88 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
+        from hermes_cli.goals import parse_goal_start_args
+
+        start = parse_goal_start_args(arg)
+        if start.get("error"):
+            return _err(rid, 4004, f"invalid goal: {start['error']}")
         # Otherwise — treat the remaining text as the new goal.
         try:
-            state = mgr.set(arg)
+            state = mgr.set(
+                start["goal"],
+                approval_policy=start["approval_policy"],
+                owner_id=sid_key,
+                termination=start["termination"],
+                interval_seconds=start["interval_seconds"],
+                max_runs=start["max_runs"],
+            )
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
 
+        budget = "judge-led persistence" if state.termination == "judge" else f"{state.max_turns}-turn budget"
+        stop_condition = (
+            "I'll keep working until the goal is done, you pause/clear it, or a safety/authority boundary stops it."
+            if state.termination == "judge"
+            else "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted."
+        )
         notice = (
-            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
-            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            f"⊙ Goal set ({budget}"
+            f"{', owner approval required' if state.approval_policy == 'owner' else ''}): {state.goal}\n"
+            f"{stop_condition}\n"
             "Controls: /goal status · /goal pause · /goal resume · /goal clear"
         )
         # Send the goal text as the kickoff prompt. The TUI client sees
         # {type: send, notice, message} → renders `notice` as a sys line,
         # then submits `message` as a user turn. The post-turn judge
         # wired in _run_prompt_submit takes over from there.
+        claim = mgr.claim_due_wake()
+        if not claim:
+            return _ok(rid, {"type": "exec", "output": notice})
         return _ok(
             rid,
-            {"type": "send", "notice": notice, "message": state.goal},
+            {"type": "send", "notice": notice, "message": claim["prompt"]},
         )
 
     if name == "loop":
-        # /loop — recurring in-session wakeups (Claude Code parity). State
-        # mutation via the shared dispatcher; the notification poller thread
-        # fires due wakeups into this session while it's idle.
+        # /loop is retained as a compatibility spelling for scheduled /goal.
+        # Old LoopManager rows stay controllable until cleared, but new work
+        # uses the durable goal scheduler so it shares lifecycle/approval
+        # semantics with /goal.
         if not session:
             return _err(rid, 4001, "no active session")
         try:
             from hermes_cli.loops import LoopManager, dispatch_loop_command
+            from hermes_cli.goals import GoalManager, dispatch_goal_loop_alias
         except Exception as exc:
-            return _err(rid, 5030, f"loops unavailable: {exc}")
+            return _err(rid, 5030, f"goal scheduling unavailable: {exc}")
 
         sid_key = session.get("session_key") or ""
         if not sid_key:
             return _err(rid, 4001, "no session key")
 
         mgr = LoopManager(session_id=sid_key)
-        result = dispatch_loop_command(mgr, arg)
+        goal_mgr = GoalManager(session_id=sid_key)
+        lower = arg.strip().lower()
+        legacy_state = mgr.state
+        legacy_control = not arg.strip() or lower in {"status", "pause", "resume", "stop", "clear", "cancel"}
+        if legacy_state is not None and not goal_mgr.has_goal() and legacy_control:
+            result = dispatch_loop_command(mgr, arg)
+        else:
+            result = dispatch_goal_loop_alias(goal_mgr, arg, owner_id=sid_key)
+            if result.get("created") and legacy_state is not None:
+                mgr.clear()
         output = result.get("output") or ""
-        if result.get("created"):
-            try:
-                from hermes_cli.loops import goal_blocks_loop_tick
-
-                if goal_blocks_loop_tick(sid_key):
-                    output += (
-                        "\nNote: an active /goal is driving this session — loop "
-                        "wakeups defer until the goal finishes, pauses, or parks."
-                    )
-            except Exception:
-                pass
+        claim = result.get("claim") or {}
+        if isinstance(claim, dict) and claim.get("prompt"):
+            return _ok(
+                rid,
+                {
+                    "type": "send",
+                    "notice": output,
+                    "message": claim["prompt"],
+                    "display": "/loop",
+                },
+            )
         return _ok(rid, {"type": "exec", "output": output})
 
     if name == "undo":

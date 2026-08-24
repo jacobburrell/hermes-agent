@@ -2747,6 +2747,45 @@ class GatewaySlashCommandsMixin:
         if lower == "show":
             return f"{mgr.status_line()}\n{mgr.render_contract()}"
 
+        if lower.startswith("approval "):
+            policy = args.split(None, 1)[1].strip()
+            try:
+                state = mgr.set_approval_policy(policy)
+            except (RuntimeError, ValueError) as exc:
+                return f"/goal approval: {exc}"
+            return f"✓ Goal completion policy: {state.approval_policy}."
+
+        if lower.startswith("approve "):
+            approval_id = args.split(None, 1)[1].strip()
+            actor_id = str(getattr(event.source, "user_id", "") or "")
+            return (
+                "✓ Goal achieved with owner approval."
+                if mgr.approve_completion(approval_id, actor_id=actor_id)
+                else "/goal approve: no matching owner approval for this user."
+            )
+
+        if lower.startswith("reject ") or lower.startswith("deny "):
+            pieces = args.split(None, 2)
+            approval_id = pieces[1] if len(pieces) > 1 else ""
+            reason = pieces[2] if len(pieces) > 2 else ""
+            actor_id = str(getattr(event.source, "user_id", "") or "")
+            if not mgr.deny_completion(approval_id, reason, actor_id=actor_id):
+                return "/goal reject: no matching owner approval for this user."
+            claim = mgr.claim_due_wake()
+            if claim:
+                try:
+                    adapter = self.adapters.get(event.source.platform) if event.source else None
+                    quick_key = self._session_key_for_source(event.source) if event.source else None
+                    if adapter and quick_key:
+                        self._enqueue_fifo(
+                            quick_key,
+                            MessageEvent(text=claim["prompt"], message_type=MessageType.TEXT, source=event.source),
+                            adapter,
+                        )
+                except Exception:
+                    mgr.abandon_wake(claim.get("claim_id", ""))
+            return "↻ Completion rejected; goal will continue."
+
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
             if state is None:
@@ -2770,7 +2809,8 @@ class GatewaySlashCommandsMixin:
             # the next turn fires as soon as this reply is delivered. A
             # real user message already queued still preempts naturally,
             # and pause/clear's stale-continuation cleanup recognizes it.
-            prompt = mgr.next_continuation_prompt()
+            claim = mgr.claim_due_wake()
+            prompt = claim.get("prompt") if claim else ""
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -2787,7 +2827,14 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal resume: continuation enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
 
-        if lower in {"clear", "stop", "done"}:
+        if lower == "stop":
+            state = mgr.stop()
+            return "■ Goal stopped." if state else t("gateway.no_active_goal")
+
+        if lower == "done":
+            return "/goal done cannot mark a goal successful. Use /goal stop or /goal clear."
+
+        if lower == "clear":
             had = mgr.has_goal()
             mgr.clear()
             try:
@@ -2857,6 +2904,13 @@ class GatewaySlashCommandsMixin:
 
         # /goal draft <objective> → draft a structured completion contract,
         # then set it. The aux LLM call is sync; run it off the event loop.
+        from hermes_cli.goals import parse_goal_start_args
+
+        start = parse_goal_start_args(args)
+        if start.get("error"):
+            return f"Invalid goal: {start['error']}"
+        args = start["goal"]
+        lower = args.lower()
         draft_contract_obj = None
         if lower.startswith("draft"):
             objective = args[len("draft"):].strip()
@@ -2886,7 +2940,28 @@ class GatewaySlashCommandsMixin:
 
         # Otherwise — treat the remaining text as the new goal.
         try:
-            state = mgr.set(args, contract=contract)
+            route: dict = {}
+            src = event.source
+            if src is not None:
+                platform = getattr(src, "platform", "")
+                route = {
+                    "platform": platform.value if hasattr(platform, "value") else str(platform or ""),
+                    "chat_id": str(getattr(src, "chat_id", "") or ""),
+                    "chat_type": str(getattr(src, "chat_type", "") or ""),
+                    "thread_id": str(getattr(src, "thread_id", "") or ""),
+                    "user_id": str(getattr(src, "user_id", "") or ""),
+                    "user_name": str(getattr(src, "user_name", "") or ""),
+                }
+            state = mgr.set(
+                args,
+                contract=contract,
+                approval_policy=start["approval_policy"],
+                owner_id=str(getattr(event.source, "user_id", "") or ""),
+                termination=start["termination"],
+                interval_seconds=start["interval_seconds"],
+                max_runs=start["max_runs"],
+                route=route,
+            )
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
@@ -2896,8 +2971,11 @@ class GatewaySlashCommandsMixin:
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
+                claim = mgr.claim_due_wake()
+                if not claim:
+                    raise RuntimeError("goal wake was not claimable")
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=claim["prompt"],
                     message_type=MessageType.TEXT,
                     source=event.source,
                     message_id=event.message_id,
@@ -2907,7 +2985,10 @@ class GatewaySlashCommandsMixin:
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
-        base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        cadence = f", every {int(state.interval_seconds)}s" if state.schedule_mode == "interval" else ""
+        approval = ", owner approval required" if state.approval_policy == "owner" else ""
+        budget = "judge-led persistence" if state.termination == "judge" else f"{state.max_turns}-turn budget"
+        base = f"⊙ Goal set ({budget}{cadence}{approval}): {state.goal}"
         if state.has_contract():
             return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
         if lower.startswith("draft"):
@@ -3166,15 +3247,9 @@ class GatewaySlashCommandsMixin:
         return LoopManager(session_id=sid), session_entry
 
     async def _handle_loop_command(self, event: "MessageEvent") -> str:
-        """Handle /loop for gateway platforms — recurring in-session wakeups.
-
-        Mirrors the CLI handler via the shared ``dispatch_loop_command``.
-        New loops capture the event's routing (platform/chat/thread) so the
-        gateway's idle loop-wakeup watcher can inject ticks back into this
-        chat even after a restart.
-        """
+        """Handle ``/loop`` as a compatibility spelling for scheduled goals."""
         try:
-            from hermes_cli.loops import dispatch_loop_command, goal_blocks_loop_tick
+            from hermes_cli.loops import dispatch_loop_command
         except Exception as exc:
             logger.debug("loops module unavailable: %s", exc)
             return "Loops unavailable."
@@ -3182,6 +3257,16 @@ class GatewaySlashCommandsMixin:
         mgr, _session_entry = await self._get_loop_manager_for_event(event)
         if mgr is None:
             return "Loops unavailable (no active session)."
+
+        try:
+            from hermes_cli.goals import dispatch_goal_loop_alias
+
+            goal_mgr, _goal_entry = await self._get_goal_manager_for_event(event)
+        except Exception as exc:
+            logger.debug("goal-backed loop unavailable: %s", exc)
+            return "Goal scheduling unavailable."
+        if goal_mgr is None:
+            return "Goal scheduling unavailable (no active session)."
 
         route: dict = {}
         try:
@@ -3201,17 +3286,45 @@ class GatewaySlashCommandsMixin:
             route = {}
 
         args = (event.get_command_args() or "").strip()
-        result = dispatch_loop_command(mgr, args, route=route)
+        lower = args.lower()
+        legacy_state = mgr.state
+        legacy_control = not args or lower in {"status", "pause", "resume", "stop", "clear", "cancel"}
+        if legacy_state is not None and not goal_mgr.has_goal() and legacy_control:
+            # A persisted pre-migration loop retains its old controls until
+            # its owner clears it. New /loop work always uses GoalManager.
+            result = dispatch_loop_command(mgr, args, route=route)
+        else:
+            result = dispatch_goal_loop_alias(
+                goal_mgr,
+                args,
+                owner_id=str(getattr(event.source, "user_id", "") or ""),
+                route=route,
+            )
+            if result.get("created") and legacy_state is not None:
+                mgr.clear()
         output = result.get("output") or ""
-        if result.get("created"):
+        claim = result.get("claim") or {}
+        if isinstance(claim, dict) and claim.get("prompt"):
             try:
-                if goal_blocks_loop_tick(mgr.session_id):
-                    output += (
-                        "\nNote: an active /goal is driving this session — loop "
-                        "wakeups defer until the goal finishes, pauses, or parks."
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and quick_key:
+                    self._enqueue_fifo(
+                        quick_key,
+                        MessageEvent(
+                            text=claim["prompt"],
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            message_id=None,
+                            channel_prompt=None,
+                        ),
+                        adapter,
                     )
-            except Exception:
-                pass
+                else:
+                    goal_mgr.abandon_wake(str(claim.get("claim_id") or ""))
+            except Exception as exc:
+                logger.debug("goal-backed /loop wake enqueue failed: %s", exc)
+                goal_mgr.abandon_wake(str(claim.get("claim_id") or ""))
         return output
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
@@ -5844,6 +5957,18 @@ class GatewaySlashCommandsMixin:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
+            # Goal approval is deliberately only a fallback: an in-flight
+            # dangerous command always retains /approve ownership.  The token
+            # is capability-bound to the persisted goal and to this sender.
+            approval_id = event.get_command_args().strip()
+            if approval_id and " " not in approval_id:
+                try:
+                    mgr, _entry = await self._get_goal_manager_for_event(event)
+                    actor_id = str(getattr(source, "user_id", "") or "")
+                    if mgr and mgr.approve_completion(approval_id, actor_id=actor_id):
+                        return "✓ Goal achieved with owner approval."
+                except Exception:
+                    logger.debug("goal approval fallback failed", exc_info=True)
             return t("gateway.approve.no_pending")
 
         # Parse args: support "all", "all session", "all always", "session", "always"
@@ -5893,6 +6018,34 @@ class GatewaySlashCommandsMixin:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
+            raw_goal_args = event.get_command_args().strip()
+            pieces = raw_goal_args.split(None, 1)
+            approval_id = pieces[0] if pieces else ""
+            if approval_id:
+                try:
+                    mgr, _entry = await self._get_goal_manager_for_event(event)
+                    actor_id = str(getattr(source, "user_id", "") or "")
+                    reason = pieces[1] if len(pieces) > 1 else ""
+                    if mgr and mgr.deny_completion(approval_id, reason, actor_id=actor_id):
+                        claim = mgr.claim_due_wake()
+                        if claim:
+                            adapter = self.adapters.get(source.platform) if source else None
+                            quick_key = self._session_key_for_source(source) if source else None
+                            if adapter and quick_key:
+                                self._enqueue_fifo(
+                                    quick_key,
+                                    MessageEvent(
+                                        text=claim["prompt"],
+                                        message_type=MessageType.TEXT,
+                                        source=source,
+                                    ),
+                                    adapter,
+                                )
+                            else:
+                                mgr.abandon_wake(claim.get("claim_id", ""))
+                        return "↻ Goal completion rejected; continuing."
+                except Exception:
+                    logger.debug("goal denial fallback failed", exc_info=True)
             return t("gateway.deny.no_pending")
 
         # Parse args: a leading "all" token denies every pending command;

@@ -89,6 +89,40 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
     assert task.goal_max_turns is None
 
 
+def test_judge_termination_persists_without_goal_turn_budget(kanban_home):
+    """Judge-led cards are explicit; old cards stay bounded by default."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Resolve the issue through safe alternatives",
+            assignee="jack",
+            goal_mode=True,
+            goal_termination="judge",
+            goal_max_turns=1,
+        )
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.goal_mode is True
+    assert task.goal_termination == "judge"
+    assert task.goal_max_turns is None
+
+
+def test_required_skill_preflight_is_profile_scoped_and_nonsemantic(
+    kanban_home, tmp_path, monkeypatch
+):
+    """An absent forced skill is repairable orchestration state, not a task block."""
+    from hermes_cli.kanban_db import _missing_profile_skills
+
+    profile_skills = kanban_home / "profiles" / "jack" / "skills" / "recovery-playbook"
+    profile_skills.mkdir(parents=True)
+    (profile_skills / "SKILL.md").write_text(
+        "---\nname: recovery-playbook\n---\n", encoding="utf-8"
+    )
+
+    assert _missing_profile_skills("jack", ["recovery-playbook"]) == []
+    assert _missing_profile_skills("jack", ["recovery-playbook", "missing-skill"]) == ["missing-skill"]
+
+
 # ---------------------------------------------------------------------------
 # Spawn env
 # ---------------------------------------------------------------------------
