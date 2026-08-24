@@ -865,6 +865,36 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            if (
+                task
+                and task.goal_mode
+                and getattr(task, "goal_termination", "bounded") == "judge"
+            ):
+                # Judge-led workers may report a dependency, but that report
+                # is controller input rather than a self-authorized terminal
+                # transition. The persistent event lets a resumed worker use
+                # recovery history instead of repeating the same path.
+                ok = kb.propose_goal_block(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if not ok:
+                    return tool_error(
+                        f"could not record goal blocker proposal for {tid} "
+                        "(unknown id, stale worker, or task not judge-led)"
+                    )
+                run = kb.latest_run(conn, tid)
+                return _ok(
+                    task_id=tid,
+                    run_id=run.id if run else None,
+                    status="running",
+                    block_kind=kind,
+                    proposed=True,
+                    message="Blocker recorded for controller recovery; keep the card active.",
+                )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
@@ -1409,6 +1439,9 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    goal_termination = str(args.get("goal_termination") or "bounded").strip().lower()
+    if goal_termination not in {"bounded", "judge"}:
+        return tool_error("goal_termination must be 'bounded' or 'judge'")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1455,6 +1488,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_override=model_override,
                 provider_override=provider_override,
                 goal_mode=goal_mode,
+                goal_termination=goal_termination,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
@@ -2274,13 +2308,23 @@ KANBAN_CREATE_SCHEMA = {
                     "work. Defaults to false (classic single-shot worker)."
                 ),
             },
+            "goal_termination": {
+                "type": "string",
+                "enum": ["bounded", "judge"],
+                "description": (
+                    "Goal-loop termination policy. 'judge' keeps productive "
+                    "work going without a goal-turn cap, while suppressing "
+                    "repetition and requiring recovery/terminal verification. "
+                    "'bounded' retains the legacy goal_max_turns behavior."
+                ),
+            },
             "goal_max_turns": {
                 "type": "integer",
                 "description": (
-                    "Turn budget for goal_mode workers. Caps how many "
+                    "Turn budget for bounded goal_mode workers. Caps how many "
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
-                    "true. Defaults to the goal-engine default (20)."
+                    "true. Ignored when goal_termination is 'judge'."
                 ),
             },
             "model": {

@@ -1123,11 +1123,17 @@ class Task:
     # continuation prompt IN THE SAME SESSION and keeps working until the
     # judge agrees, the goal-turn budget is exhausted (→ kanban_block),
     # or the worker explicitly blocks/completes. ``False`` (default) =
-    # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
+    # the classic single-shot worker. ``goal_termination`` controls whether
+    # the loop is legacy-bounded or judge-led persistent.
     goal_mode: bool = False
+    goal_termination: str = "bounded"
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # Durable judge-led controller checkpoint. It is bounded/redacted by the
+    # goals module and allows a replacement worker to retain strategy history
+    # after compression, a process crash, or a dispatcher reassignment.
+    goal_controller_state: Optional[dict] = None
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -1154,6 +1160,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        goal_controller_state: Optional[dict] = None
+        if "goal_controller_state" in keys and row["goal_controller_state"]:
+            try:
+                parsed_state = json.loads(row["goal_controller_state"])
+                if isinstance(parsed_state, dict):
+                    goal_controller_state = parsed_state
+            except Exception:
+                goal_controller_state = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1221,9 +1235,15 @@ class Task:
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
             ),
+            goal_termination=(
+                "judge"
+                if "goal_termination" in keys and str(row["goal_termination"] or "").lower() == "judge"
+                else "bounded"
+            ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
             ),
+            goal_controller_state=goal_controller_state,
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
@@ -1401,9 +1421,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    -- ``bounded`` preserves old cards; ``judge`` has no goal turn cap and
+    -- uses the progress/recovery controller instead.
+    goal_termination     TEXT NOT NULL DEFAULT 'bounded',
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Bounded/redacted progress ledger and recovery state for judge-led cards.
+    goal_controller_state TEXT,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -2648,10 +2673,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "goal_termination" not in cols:
+        # Existing cards deliberately retain bounded semantics.  This is an
+        # additive migration, so NULL/old DB rows never become unlimited.
+        _add_column_if_missing(
+            conn, "tasks", "goal_termination", "goal_termination TEXT NOT NULL DEFAULT 'bounded'"
+        )
+
     if "goal_max_turns" not in cols:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
+        )
+
+    if "goal_controller_state" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "goal_controller_state", "goal_controller_state TEXT"
         )
 
     if "session_id" not in cols:
@@ -3177,6 +3214,7 @@ def create_task(
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
+    goal_termination: str = "bounded",
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
@@ -3223,6 +3261,19 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    goal_termination = str(goal_termination or "bounded").strip().lower()
+    if goal_termination not in {"bounded", "judge"}:
+        raise ValueError("goal_termination must be 'bounded' or 'judge'")
+    if goal_termination == "judge":
+        # Persist null as the explicit contract: judge-led cards do not use a
+        # local goal-turn budget. Worker/tool loop limits remain unchanged.
+        goal_max_turns = None
+        # A controller/worker crash is infrastructure, not semantic proof
+        # that the card is blocked.  Give judge-led workers the required
+        # three restoration attempts before the ordinary circuit breaker may
+        # route the card to triage.  An explicit card override still wins.
+        if max_retries is None:
+            max_retries = 4
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -3497,8 +3548,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_termination, goal_max_turns, goal_controller_state, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3522,7 +3573,9 @@ def create_task(
                         provider_override,
                         reasoning_effort,
                         1 if goal_mode else 0,
+                        "judge" if goal_mode and str(goal_termination).lower() == "judge" else "bounded",
                         int(goal_max_turns) if goal_max_turns is not None else None,
+                        None,
                         session_id,
                     ),
                 )
@@ -6471,6 +6524,177 @@ def block_task(
     return True
 
 
+def propose_goal_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record a judge-led worker's blocker proposal without ending its card.
+
+    A worker is allowed to report a real dependency, but its report is input
+    to the controller rather than a self-authorized terminal transition.  The
+    event survives a worker crash and gives the replacement worker/controller
+    the exact proposal to verify and recover from.
+    """
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, goal_mode, goal_termination "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] not in {"running", "ready"}:
+            return False
+        if not bool(row["goal_mode"]) or str(row["goal_termination"] or "").lower() != "judge":
+            return False
+        if expected_run_id is not None and int(row["current_run_id"] or 0) != int(expected_run_id):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "goal_block_proposed",
+            {"reason": reason[:500], "kind": kind},
+            run_id=int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+        )
+    return True
+
+
+def save_goal_controller_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    state: Optional[dict],
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Checkpoint bounded judge-led progress without changing card status."""
+    payload: Optional[str] = None
+    if state:
+        try:
+            # The goals controller already bounds/redacts entries. Redact at
+            # this second durable boundary too so task history can never turn
+            # a recovery checkpoint into a credential store.
+            from agent.redact import redact_sensitive_text
+
+            encoded = json.dumps(state, ensure_ascii=False)
+            payload = redact_sensitive_text(encoded[:64_000], force=True)
+            # Validate after redaction; an invalid blob is safer to omit than
+            # to make every later task load fail.
+            if not isinstance(json.loads(payload), dict):
+                payload = None
+        except Exception:
+            payload = None
+    with write_txn(conn):
+        sql = (
+            "UPDATE tasks SET goal_controller_state = ? WHERE id = ? "
+            "AND goal_mode = 1 AND goal_termination = 'judge'"
+        )
+        params: list[Any] = [payload, task_id]
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(sql, tuple(params))
+    return bool(cur.rowcount)
+
+
+def park_goal_control_plane_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Release a judge-led card for a controller-health retry, not failure."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, goal_mode, goal_termination FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or not bool(row["goal_mode"])
+            or str(row["goal_termination"] or "").lower() != "judge"
+        ):
+            return False
+        run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'running'",
+            (task_id,),
+        )
+        _end_run(
+            conn,
+            task_id,
+            outcome="control_plane_error",
+            status="control_plane_error",
+            error=reason[:500],
+        )
+        _append_event(
+            conn,
+            task_id,
+            "goal_control_plane_error",
+            {"reason": reason[:500], "retry": "scheduled"},
+            run_id=run_id,
+        )
+    return True
+
+
+def triage_goal_terminal_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    verdict: str,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Route independently verified failure/policy outcomes to triage."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, goal_mode, goal_termination FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] not in {"running", "ready"}
+            or not bool(row["goal_mode"])
+            or str(row["goal_termination"] or "").lower() != "judge"
+        ):
+            return False
+        run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+        if run_id is not None:
+            _end_run(
+                conn,
+                task_id,
+                outcome="terminal_failure",
+                status="terminal_failure",
+                error=reason[:500],
+                metadata={"verdict": verdict},
+            )
+        _append_event(
+            conn,
+            task_id,
+            "goal_terminal_triage",
+            {"verdict": verdict, "reason": reason[:500]},
+            run_id=run_id,
+        )
+    return True
+
+
 
 def redact_review_value(value: Any) -> Any:
     """Redact secrets at the domain boundary for durable review handoffs."""
@@ -8049,6 +8273,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_skill_preflight: list[tuple[str, list[str]]] = field(default_factory=list)
+    """Tasks not spawned because an explicitly requested worker skill is
+    absent from the assignee profile. This is an orchestration repair item,
+    not a semantic task failure and therefore never consumes retry budget."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9209,7 +9437,7 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, goal_termination "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -9235,24 +9463,33 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            # Judge-led cards distinguish orchestration exhaustion from a
+            # semantic human-input block.  They go to triage, never done (and
+            # never silently back into the worker queue), after their bounded
+            # crash/spawn restoration attempts are exhausted.
+            terminal_status = (
+                "triage"
+                if str(row["goal_termination"] or "").lower() == "judge"
+                else "blocked"
+            )
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (terminal_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
                 # cleared; just flip to blocked + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = ?, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (terminal_status, failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
@@ -9276,12 +9513,21 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
+                "terminal_status": terminal_status,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if terminal_status == "triage":
+                _append_event(
+                    conn,
+                    task_id,
+                    "controller_triage",
+                    {"reason": error[:500], "trigger_outcome": outcome},
+                    run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -10181,6 +10427,45 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # A forced skill is an orchestration prerequisite, not work the
+        # worker should discover by crashing.  Keep the card ready, record an
+        # actionable event, and let an operator/profile repair unblock the
+        # next dispatcher pass without consuming semantic task retries.
+        try:
+            task_for_preflight = get_task(conn, row["id"])
+            controller_state = (
+                task_for_preflight.goal_controller_state if task_for_preflight else None
+            ) or {}
+            retry_at = float(controller_state.get("control_plane_retry_at", 0) or 0)
+            if retry_at > time.time():
+                result.respawn_guarded.append((row["id"], "goal controller health retry pending"))
+                continue
+            if retry_at and task_for_preflight is not None:
+                healthy, health_reason = _probe_judge_led_controller(task_for_preflight)
+                if not healthy:
+                    controller_state["control_plane_retry_at"] = (
+                        time.time() + 30
+                    )
+                    save_goal_controller_state(conn, row["id"], controller_state)
+                    result.respawn_guarded.append((row["id"], "goal controller health retry failed"))
+                    continue
+                controller_state.pop("control_plane_retry_at", None)
+                save_goal_controller_state(conn, row["id"], controller_state)
+            requested_skills = task_for_preflight.skills if task_for_preflight else None
+            missing_skills = _missing_profile_skills(row_assignee, requested_skills)
+        except Exception:
+            missing_skills = []
+        if missing_skills:
+            result.skipped_skill_preflight.append((row["id"], missing_skills))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "skill_preflight_failed",
+                        {"assignee": row_assignee, "missing_skills": missing_skills},
+                    )
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -10683,6 +10968,74 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+def _missing_profile_skills(assignee: str, required: Iterable[str]) -> list[str]:
+    """Return explicitly-assigned skills absent from the worker profile.
+
+    A forced ``--skills`` name that cannot load is an orchestration/config
+    error, not evidence that the card itself is blocked.  The dispatcher uses
+    this cheap read-only preflight before claiming/spawning a worker so it can
+    emit a repairable event without burning the task's semantic retry budget.
+    """
+    wanted = {str(name).strip().lower() for name in required if str(name).strip()}
+    if not wanted:
+        return []
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_home = Path(resolve_profile_env(normalize_profile_name(assignee)))
+    except Exception:
+        # Profile existence is checked by the caller.  If its home cannot be
+        # resolved here, defer to the worker rather than falsely declaring a
+        # skill missing.
+        return []
+    available: set[str] = set()
+    # Profiles may deliberately rely on bundled skills in the checkout, so
+    # profile-local ``skills/`` alone is not a valid preflight inventory.
+    # Check both surfaces without loading model-facing skill content.
+    skill_roots = [profile_home / "skills", Path(__file__).resolve().parent.parent / "skills"]
+    for skill_root in skill_roots:
+        try:
+            for skill_md in skill_root.rglob("SKILL.md"):
+                available.add(skill_md.parent.name.strip().lower())
+                # Name front matter is canonical when present. Avoid importing
+                # the full skill loader on every dispatcher tick.
+                try:
+                    for line in skill_md.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+                        match = re.match(r"\s*name\s*:\s*['\"]?([^'\"#\s]+)", line)
+                        if match:
+                            available.add(match.group(1).strip().lower())
+                            break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return sorted(wanted - available)
+
+
+def _probe_judge_led_controller(task: Task) -> tuple[bool, str]:
+    """Probe a parked card's judge before allocating another worker lane.
+
+    The probe is controller-only: it must never run an agent turn merely to
+    discover that the judge/recovery model remains unavailable.
+    """
+    if not task.goal_mode or task.goal_termination != "judge":
+        return True, ""
+    try:
+        from hermes_cli.goals import judge_goal_with_ledger
+
+        state = task.goal_controller_state or {}
+        response = judge_goal_with_ledger(
+            f"{task.title}\n\n{task.body or ''}".strip(),
+            "Controller health probe; do not evaluate card completion.",
+            ledger=state.get("progress_ledger") if isinstance(state, dict) else None,
+        )
+        if response.get("verdict") == "control_plane_error":
+            return False, str(response.get("reason") or "goal controller unavailable")
+        return True, ""
+    except Exception as exc:
+        return False, f"goal controller health probe failed: {type(exc).__name__}"
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -10796,7 +11149,8 @@ def _default_spawn(
     # when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
-        if task.goal_max_turns is not None:
+        env["HERMES_KANBAN_GOAL_TERMINATION"] = task.goal_termination
+        if task.goal_termination != "judge" and task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,

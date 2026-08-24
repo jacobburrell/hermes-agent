@@ -2834,6 +2834,37 @@ class CLICommandsMixin:
             _cprint(f"  {mgr.render_contract()}")
             return
 
+        if lower.startswith("approval "):
+            policy = arg.split(None, 1)[1].strip()
+            try:
+                state = mgr.set_approval_policy(policy)
+            except (RuntimeError, ValueError) as exc:
+                _cprint(f"  /goal approval: {exc}")
+                return
+            _cprint(f"  ✓ Goal completion policy: {state.approval_policy}.")
+            return
+
+        if lower.startswith("approve "):
+            approval_id = arg.split(None, 1)[1].strip()
+            if mgr.approve_completion(approval_id, actor_id="local"):
+                _cprint("  ✓ Goal achieved with owner approval.")
+            else:
+                _cprint("  /goal approve: no matching pending owner approval.")
+            return
+
+        if lower.startswith("reject ") or lower.startswith("deny "):
+            parts = arg.split(None, 2)
+            approval_id = parts[1] if len(parts) > 1 else ""
+            reason = parts[2] if len(parts) > 2 else ""
+            if mgr.deny_completion(approval_id, reason, actor_id="local"):
+                _cprint("  ↻ Completion rejected; goal will continue.")
+                claim = mgr.claim_due_wake()
+                if claim:
+                    self._pending_input.put(claim["prompt"])
+            else:
+                _cprint("  /goal reject: no matching pending owner approval.")
+            return
+
         # /goal draft <objective> → expand plain text into a structured
         # completion contract (outcome / verification / constraints /
         # boundaries / stop_when) and set it as the active goal. Adapted
@@ -2865,7 +2896,8 @@ class CLICommandsMixin:
                 # (#75362): queue the canonical continuation prompt the same
                 # way /goal <text> queues its kickoff, so the loop takes the
                 # next step without the user sending another message.
-                prompt = mgr.next_continuation_prompt()
+                claim = mgr.claim_due_wake()
+                prompt = claim.get("prompt") if claim else None
                 queued = False
                 if prompt:
                     try:
@@ -2881,7 +2913,16 @@ class CLICommandsMixin:
                     )
             return
 
-        if lower in {"clear", "stop", "done"}:
+        if lower == "stop":
+            state = mgr.stop()
+            _cprint("  ■ Goal stopped." if state else f"  {_DIM}No active goal.{_RST}")
+            return
+
+        if lower == "done":
+            _cprint("  /goal done cannot mark a goal successful. Use /goal stop or /goal clear.")
+            return
+
+        if lower == "clear":
             had = mgr.has_goal()
             mgr.clear()
             if had:
@@ -2969,17 +3010,33 @@ class CLICommandsMixin:
         # lines (verify:, constraints:, boundaries:, stop when:) are parsed
         # into a completion contract; the remaining prose is the headline.
         # A plain free-form goal with no such lines behaves exactly as before.
-        from hermes_cli.goals import parse_contract
+        from hermes_cli.goals import parse_contract, parse_goal_start_args
 
-        headline, contract = parse_contract(arg)
-        goal_text = headline or arg
+        start = parse_goal_start_args(arg)
+        if start.get("error"):
+            _cprint(f"  Invalid goal: {start['error']}")
+            return
+
+        headline, contract = parse_contract(start["goal"])
+        goal_text = headline or start["goal"]
         try:
-            state = mgr.set(goal_text, contract=contract if not contract.is_empty() else None)
+            state = mgr.set(
+                goal_text,
+                contract=contract if not contract.is_empty() else None,
+                approval_policy=start["approval_policy"],
+                owner_id="local",
+                termination=start["termination"],
+                interval_seconds=start["interval_seconds"],
+                max_runs=start["max_runs"],
+            )
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
 
-        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
+        cadence = f", every {int(state.interval_seconds)}s" if state.schedule_mode == "interval" else ""
+        approval = ", owner approval required" if state.approval_policy == "owner" else ""
+        budget = "judge-led persistence" if state.termination == "judge" else f"{state.max_turns}-turn budget"
+        _cprint(f"  ⊙ Goal set ({budget}{cadence}{approval}): {state.goal}")
         if state.has_contract():
             _cprint(f"  {_DIM}Completion contract:{_RST}")
             for line in state.contract.render_block().splitlines():
@@ -2987,13 +3044,16 @@ class CLICommandsMixin:
         _cprint(
             f"  {_DIM}After each turn, a judge model checks if the goal is done"
             f"{' against the contract above' if state.has_contract() else ''}. "
-            f"Hermes keeps working until it is, you pause/clear it, or the budget is "
-            f"exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.{_RST}"
+            f"Hermes keeps working until it is, you pause/clear it, or "
+            f"{'a safety/authority boundary stops it' if state.termination == 'judge' else 'the budget is exhausted'}. "
+            f"Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.{_RST}"
         )
         # Kick the loop off immediately so the user doesn't have to send a
         # separate message after setting the goal.
         try:
-            self._pending_input.put(state.goal)
+            claim = mgr.claim_due_wake()
+            if claim:
+                self._pending_input.put(claim["prompt"])
         except Exception:
             pass
 
@@ -3018,12 +3078,13 @@ class CLICommandsMixin:
             contract = None
 
         try:
-            state = mgr.set(objective, contract=contract)
+            state = mgr.set(objective, contract=contract, owner_id="local")
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
 
-        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
+        budget = "judge-led persistence" if state.termination == "judge" else f"{state.max_turns}-turn budget"
+        _cprint(f"  ⊙ Goal set ({budget}): {state.goal}")
         if state.has_contract():
             _cprint(f"  {_DIM}Drafted completion contract:{_RST}")
             for line in state.contract.render_block().splitlines():
@@ -3039,42 +3100,56 @@ class CLICommandsMixin:
                 f"running as a free-form goal. The per-turn judge still applies.{_RST}"
             )
         try:
-            self._pending_input.put(state.goal)
+            claim = mgr.claim_due_wake()
+            if claim:
+                self._pending_input.put(claim["prompt"])
         except Exception:
             pass
 
     def _handle_loop_command(self, cmd: str) -> None:
-        """Dispatch /loop — recurring in-session wakeups (Claude Code parity).
+        """Dispatch ``/loop`` as the compatibility spelling for ``/goal``.
 
-        Forms:
-          /loop [interval] <prompt> [--times N] [--until <cond>]   start a loop
-          /loop status | pause | resume | stop                     controls
+        Existing persisted LoopManager rows remain controllable until cleared,
+        but new loop commands create a scheduled goal so only one controller
+        owns unattended work going forward.
         """
         from cli import _DIM, _RST, _cprint
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        mgr = self._get_loop_manager()
-        if mgr is None:
-            _cprint(f"  {_DIM}Loops unavailable (no active session).{_RST}")
+        goal_mgr = self._get_goal_manager()
+        legacy_mgr = self._get_loop_manager()
+        if goal_mgr is None or legacy_mgr is None:
+            _cprint(f"  {_DIM}Goal scheduling unavailable (no active session).{_RST}")
             return
 
-        from hermes_cli.loops import dispatch_loop_command
+        lower = arg.lower()
+        legacy_state = legacy_mgr.state
+        legacy_control = not arg or lower in {"status", "pause", "resume", "stop", "clear", "cancel"}
+        if legacy_state is not None and not goal_mgr.has_goal() and legacy_control:
+            # Do not strand a pre-migration loop whose state is already on
+            # disk. New invocations below use the goal scheduler.
+            from hermes_cli.loops import dispatch_loop_command
 
-        result = dispatch_loop_command(mgr, arg)
+            result = dispatch_loop_command(legacy_mgr, arg)
+        else:
+            from hermes_cli.goals import dispatch_goal_loop_alias
+
+            result = dispatch_goal_loop_alias(goal_mgr, arg, owner_id="local")
+            if result.get("created") and legacy_state is not None:
+                legacy_mgr.clear()
+
         for line in (result.get("output") or "").splitlines():
             _cprint(f"  {line}")
-        if result.get("created"):
+        claim = result.get("claim") or {}
+        prompt = claim.get("prompt") if isinstance(claim, dict) else ""
+        if prompt:
             try:
-                from hermes_cli.loops import goal_blocks_loop_tick
-
-                if goal_blocks_loop_tick(mgr.session_id):
-                    _cprint(
-                        f"  {_DIM}Note: an active /goal is driving this session — "
-                        f"loop wakeups defer until the goal finishes, pauses, or parks.{_RST}"
-                    )
-            except Exception:
-                pass
+                self._pending_input.put(prompt)
+                _cprint(f"  {_DIM}↻ Scheduled goal starting now…{_RST}")
+            except Exception as exc:
+                logging.debug("goal-backed /loop wake injection failed: %s", exc)
+                goal_mgr.abandon_wake(str(claim.get("claim_id") or ""))
 
     def _handle_subgoal_command(self, cmd: str) -> None:
         """Dispatch /subgoal subcommands.

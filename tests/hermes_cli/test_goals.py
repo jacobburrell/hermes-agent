@@ -374,6 +374,7 @@ class TestStatusLineSubgoalCount:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.live_system_guard_bypass
 class TestWaitBarrier:
     """The /goal wait barrier parks the loop on a live PID and resumes when
     the process exits, without burning turns or calling the judge."""
@@ -413,7 +414,7 @@ class TestWaitBarrier:
             assert decision["continuation_prompt"] is None
             assert mgr.state.turns_used == 0  # no turn consumed while parked
             assert "CI green" in decision["message"]
-            assert mgr.state.status == "active"  # still active, just parked
+            assert mgr.state.status == "waiting"  # durable parked lifecycle state
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -442,6 +443,7 @@ class TestWaitBarrier:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.live_system_guard_bypass
 class TestJudgeDrivenWait:
     """The judge returns a `wait` verdict (given live background-process
     context) and the loop parks automatically — no manual /goal wait."""
@@ -798,3 +800,151 @@ class TestContractAndBackgroundCompose:
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
 
+
+class TestGoalReliabilityLifecycle:
+    def test_wait_deadline_claims_a_durable_wake_without_a_user_turn(self):
+        from hermes_cli.goals import GoalManager, save_goal
+
+        mgr = GoalManager(session_id="durable-wake")
+        mgr.set("ship the fix")
+        mgr.wait_for_seconds(1, reason="cooldown")
+        now = time.time()
+        mgr.state.waiting_until = now - 1
+        mgr.state.next_wake_at = now - 1
+        save_goal(mgr.session_id, mgr.state)
+        claim = mgr.claim_due_wake(now=now)
+
+        assert claim is not None
+        assert claim["prompt"] == "ship the fix"
+        assert mgr.state.status == "active"
+        assert mgr.state.wake_claim_id == claim["claim_id"]
+
+    def test_two_managers_cannot_claim_the_same_durable_wake(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        first = GoalManager(session_id="atomic-wake")
+        first.set("ship the fix")
+        second = GoalManager(session_id="atomic-wake")
+
+        now = time.time()
+        first_claim = first.claim_due_wake(now=now)
+        second_claim = second.claim_due_wake(now=now)
+
+        assert first_claim is not None
+        assert second_claim is None
+
+    def test_judge_led_success_waits_for_owner_approval(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="judge-owner")
+        mgr.set(
+            "ship the fix",
+            termination="judge",
+            approval_policy="owner",
+            owner_id="owner-1",
+        )
+        monkeypatch.setattr(
+            goals,
+            "judge_goal_with_ledger",
+            lambda *args, **kwargs: {
+                "verdict": "achieved",
+                "progress": "advanced",
+                "reason": "tests passed",
+                "next_strategy_constraint": "",
+                "wait_directive": None,
+            },
+        )
+        monkeypatch.setattr(
+            goals,
+            "verify_terminal_goal_decision",
+            lambda *args, **kwargs: {"accept": True, "reason": "verified"},
+        )
+
+        decision = mgr.evaluate_after_turn("Tests passed: 12 passed")
+
+        assert decision["status"] == "awaiting_user"
+        assert mgr.state.status == "awaiting_user"
+        assert mgr.approve_completion(decision["approval_id"], actor_id="owner-1")
+        assert mgr.state.status == "done"
+
+    def test_judge_led_success_does_not_close_over_live_background_work(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="judge-background")
+        mgr.set("ship the fix", termination="judge")
+        monkeypatch.setattr(
+            goals,
+            "judge_goal_with_ledger",
+            lambda *args, **kwargs: {
+                "verdict": "achieved",
+                "progress": "advanced",
+                "reason": "looks complete",
+                "next_strategy_constraint": "",
+                "wait_directive": None,
+            },
+        )
+        monkeypatch.setattr(
+            goals,
+            "verify_terminal_goal_decision",
+            lambda *args, **kwargs: {"accept": True, "reason": "verified"},
+        )
+
+        decision = mgr.evaluate_after_turn(
+            "Tests are running.",
+            background_processes=[{"pid": 4242, "status": "running"}],
+        )
+
+        assert decision["status"] == "waiting"
+        assert mgr.state.status == "waiting"
+        assert mgr.state.status != "done"
+
+    def test_owner_approval_is_capability_bound_and_only_then_marks_done(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="owner-approval")
+        mgr.set("ship the fix", approval_policy="owner", owner_id="owner-1")
+        monkeypatch.setattr(
+            goals,
+            "judge_goal",
+            lambda *args, **kwargs: ("done", "tests passed", False, None, False),
+        )
+
+        decision = mgr.evaluate_after_turn("Tests passed: 12 passed")
+        approval_id = decision["approval_id"]
+        assert mgr.state.status == "awaiting_user"
+        assert not mgr.approve_completion(approval_id, actor_id="other-user")
+        assert mgr.approve_completion(approval_id, actor_id="owner-1")
+        assert mgr.state.status == "done"
+
+    def test_blocked_requires_three_matching_observations(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="three-blockers")
+        mgr.set("ship the fix")
+        monkeypatch.setattr(
+            goals,
+            "judge_goal",
+            lambda *args, **kwargs: ("blocked", "CI provider outage", False, None, False),
+        )
+
+        assert mgr.evaluate_after_turn("blocked")["status"] == "active"
+        assert mgr.evaluate_after_turn("blocked")["status"] == "active"
+        decision = mgr.evaluate_after_turn("blocked")
+        assert decision["status"] == "blocked"
+        assert mgr.state.status == "blocked"
+
+    def test_goal_start_flags_preserve_the_freeform_objective(self):
+        from hermes_cli.goals import parse_goal_start_args
+
+        parsed = parse_goal_start_args(
+            "--require-approval --interval 5m --max-runs 3 ship the release"
+        )
+        assert parsed["error"] is None
+        assert parsed["approval_policy"] == "owner"
+        assert parsed["interval_seconds"] == 300
+        assert parsed["max_runs"] == 3
+        assert parsed["goal"] == "ship the release"
