@@ -844,6 +844,11 @@ class TestGoalReliabilityLifecycle:
             approval_policy="owner",
             owner_id="owner-1",
         )
+        mgr.record_observed_evidence(
+            "pytest",
+            "12 passed",
+            provenance="deterministic_gate",
+        )
         monkeypatch.setattr(
             goals,
             "judge_goal_with_ledger",
@@ -860,13 +865,36 @@ class TestGoalReliabilityLifecycle:
             "verify_terminal_goal_decision",
             lambda *args, **kwargs: {"accept": True, "reason": "verified"},
         )
-
         decision = mgr.evaluate_after_turn("Tests passed: 12 passed")
 
         assert decision["status"] == "awaiting_user"
         assert mgr.state.status == "awaiting_user"
         assert mgr.approve_completion(decision["approval_id"], actor_id="owner-1")
         assert mgr.state.status == "done"
+
+    def test_judge_led_terminal_claim_requires_independent_evidence(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="judge-evidence")
+        mgr.set("ship the fix", termination="judge")
+        verifier = MagicMock(return_value={"accept": True, "reason": "verified"})
+        monkeypatch.setattr(goals, "verify_terminal_goal_decision", verifier)
+        monkeypatch.setattr(
+            goals,
+            "recovery_coach",
+            lambda *args, **kwargs: {
+                "strategies": [
+                    {"family": "run tests", "next_step": "run the acceptance suite", "why_safe": "read-only verification"}
+                ]
+            },
+        )
+
+        decision = mgr._terminal_or_replan({"verdict": "achieved", "reason": "agent says done"})
+
+        assert decision["status"] == "active"
+        assert decision["verdict"] == "replan"
+        verifier.assert_not_called()
 
     def test_judge_led_success_does_not_close_over_live_background_work(self, monkeypatch):
         from hermes_cli import goals
