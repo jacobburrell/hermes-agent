@@ -10965,6 +10965,42 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_goal_mode_worker_overrides(hermes_home: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve a profile's optional stronger-model goal-worker lane.
+
+    The override applies only when a card did not explicitly pin its own
+    model/reasoning. It is therefore a routing default, not an authority to
+    rewrite a task's requested execution contract.
+    """
+    if not hermes_home:
+        return None, None, None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config() or {}
+        finally:
+            reset_hermes_home_override(token)
+        raw = ((cfg.get("kanban") or {}).get("goal_mode_worker") or {})
+        if not isinstance(raw, dict):
+            return None, None, None
+        model = str(raw.get("model") or "").strip() or None
+        provider = str(raw.get("provider") or "").strip() or None
+        reasoning = normalize_reasoning_effort(raw.get("reasoning_effort"))
+        if provider and not model:
+            provider = None
+        return model, provider, reasoning
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not resolve goal-mode model override for HERMES_HOME=%r (%s)",
+            hermes_home,
+            exc,
+        )
+        return None, None, None
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11211,19 +11247,29 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    effective_model = task.model_override
+    effective_provider = task.provider_override
+    effective_reasoning = task.reasoning_effort
+    if task.goal_mode and task.goal_termination == "judge" and not effective_model:
+        routed_model, routed_provider, routed_reasoning = _resolve_goal_mode_worker_overrides(
+            env.get("HERMES_HOME")
+        )
+        effective_model = routed_model
+        effective_provider = routed_provider
+        effective_reasoning = effective_reasoning or routed_reasoning
+    if effective_model:
+        cmd.extend(["-m", effective_model])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
         # profile's configured provider (mixing model X with provider Y is
         # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+        if effective_provider:
+            cmd.extend(["--provider", effective_provider])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
+    if effective_reasoning:
+        cmd.extend(["--reasoning", effective_reasoning])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
