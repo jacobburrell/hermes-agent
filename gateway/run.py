@@ -13420,6 +13420,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # idle case where the subagent finishes with no agent turn running.
         self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
 
+        # Start the durable /goal wakeup watcher first.  Unlike a post-turn
+        # continuation, it can revive a WAIT barrier after a PID exits or a
+        # deadline elapses even if no user ever sends another message.
+        self._spawn_supervised(self._goal_wakeup_watcher, "goal_wakeup_watcher")
+
         # Start background /loop wakeup watcher — scans persisted loops
         # (SessionDB loop:* rows) and injects due wakeup prompts into their
         # originating chats while the session is idle.
@@ -16704,7 +16709,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _is_control = (
             not _goal_arg
             or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-            or _goal_verb in {"wait", "gate"}
+            or _goal_verb in {"wait", "gate", "approval", "approve", "reject", "deny"}
         )
         if _is_control:
             return await self._handle_goal_command(event)
@@ -19235,6 +19240,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+
+        # A needs-input goal remains parked until its owner supplies an
+        # ordinary message.  Reactivate it *before* this turn runs so the
+        # controller can judge the response against the newly supplied
+        # evidence. Explicit completion approval remains token-bound and is
+        # handled by /goal approve, never by arbitrary prose.
+        if not bool(getattr(event, "internal", False)):
+            _goal_input = str(getattr(event, "text", "") or "").strip()
+            if _goal_input and not _goal_input.startswith("/"):
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    await self._run_in_executor_with_context(
+                        lambda: GoalManager(session_id=session_entry.session_id).resume_from_user_input(
+                            _goal_input,
+                            actor_id=str(getattr(source, "user_id", "") or ""),
+                        )
+                    )
+                except Exception:
+                    logger.debug("goal input-resume check failed", exc_info=True)
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -21827,8 +21852,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not decision.get("should_continue"):
             return
 
-        prompt = decision.get("continuation_prompt") or ""
-        if not prompt or source is None:
+        if source is None:
+            return
+
+        # The post-turn judge only arms the durable schedule.  Claim exactly
+        # one wake here for self-paced goals; interval goals remain due for
+        # the watcher.  This prevents a WAIT verdict from requiring another
+        # unrelated user message to ever be reconsidered.
+        try:
+            claim = await self._run_in_executor_with_context(mgr.claim_due_wake)
+        except Exception as exc:
+            logger.debug("goal continuation: wake claim failed: %s", exc)
+            return
+        if not claim:
+            return
+        prompt = claim.get("prompt") or ""
+        if not prompt:
             return
 
         # Enqueue via the adapter's FIFO so a user message already in
@@ -21847,6 +21886,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+            try:
+                mgr.abandon_wake(str(claim.get("claim_id") or ""))
+            except Exception:
+                pass
 
     async def _run_post_turn_hooks(
         self,
@@ -21950,6 +21993,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
+
+    async def _goal_wakeup_watcher(self, interval: float = 5.0) -> None:
+        """Resume due/parked goals without requiring a new user message.
+
+        The durable state belongs to ``GoalManager``; this gateway task only
+        supplies routing, idle checks, and the existing adapter ingress path.
+        That separation keeps restart recovery simple: a new gateway scans the
+        same persisted rows and any abandoned claim becomes eligible after its
+        bounded lease.
+        """
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                from hermes_cli.goals import GoalManager, list_schedulable_goals
+
+                await self._warm_goals_session_db("goal wakeup")
+                now = time.time()
+                for sid, state in list_schedulable_goals():
+                    if now < state.next_wake_at:
+                        continue
+                    route = state.route or {}
+                    platform_name = route.get("platform", "")
+                    chat_id = route.get("chat_id", "")
+                    if not platform_name or not chat_id:
+                        # CLI/TUI goals are driven by their own idle loops.
+                        continue
+                    adapter = next(
+                        (a for p, a in self.adapters.items() if p.value == platform_name),
+                        None,
+                    )
+                    if adapter is None:
+                        continue
+                    source = self._build_process_event_source(
+                        {
+                            "session_key": "",
+                            "platform": platform_name,
+                            "chat_id": chat_id,
+                            "chat_type": route.get("chat_type", ""),
+                            "thread_id": route.get("thread_id", ""),
+                            "user_id": route.get("user_id", ""),
+                            "user_name": route.get("user_name", ""),
+                        }
+                    )
+                    if source is None:
+                        continue
+                    quick_key = self._session_key_for_source(source)
+                    if quick_key in self._running_agents:
+                        continue
+                    mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
+                    claim = await self._run_in_executor_with_context(
+                        lambda: mgr.claim_due_wake(now)
+                    )
+                    if not claim:
+                        continue
+                    try:
+                        await adapter.handle_message(
+                            MessageEvent(
+                                text=claim["prompt"],
+                                message_type=MessageType.TEXT,
+                                source=source,
+                                internal=True,
+                            )
+                        )
+                        logger.info("goal wakeup claimed for session %s", sid)
+                    except Exception as exc:
+                        logger.warning("goal wakeup injection failed for %s: %s", sid, exc)
+                        await self._run_in_executor_with_context(
+                            lambda: mgr.abandon_wake(str(claim.get("claim_id") or ""))
+                        )
+            except Exception as exc:
+                logger.debug("goal wakeup watcher error: %s", exc)
+            await asyncio.sleep(interval)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions.

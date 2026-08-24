@@ -68,12 +68,14 @@ def _make_event(text: str) -> MessageEvent:
 async def test_gateway_loop_create_captures_route(loop_env):
     runner = _make_runner()
     response = await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m check the deploy"))
-    assert "Loop set" in response
-    assert "every 5m" in response
+    assert "compatibility alias" in response
+    assert "Goal set" in response
 
-    state = loops.load_loop("sid-gateway-loop")
+    state = goals.load_goal("sid-gateway-loop")
     assert state is not None
-    assert state.prompt == "check the deploy"
+    assert state.goal == "check the deploy"
+    assert state.schedule_mode == "interval"
+    assert state.interval_seconds == 300
     assert state.route["platform"] == "discord"
     assert state.route["chat_id"] == "chat-loop"
     assert state.route["thread_id"] == "thread-9"
@@ -101,13 +103,16 @@ async def test_gateway_loop_goal_note_when_goal_active(loop_env):
     GoalManager(session_id="sid-gateway-loop").set("finish the migration")
     runner = _make_runner()
     response = await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
-    assert "active /goal" in response
+    assert "compatibility alias" in response
+    state = goals.load_goal("sid-gateway-loop")
+    assert state is not None and state.goal == "poll CI"
+    assert loops.load_loop("sid-gateway-loop") is None
 
 
 @pytest.mark.asyncio
 async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     runner = _make_runner()
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    loops.LoopManager("sid-gateway-loop").set("poll CI", interval_seconds=300)
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
@@ -127,7 +132,7 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
 @pytest.mark.asyncio
 async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
     runner = _make_runner()
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    loops.LoopManager("sid-gateway-loop").set("poll CI", interval_seconds=300)
     entry = _FakeSessionEntry()
     # No tick fired — the ordinary user turn must not consume loop state.
     await GatewayRunner._post_turn_loop_completion(
@@ -161,7 +166,7 @@ def test_streamed_already_sent_none_recovers_text_for_hooks():
 async def test_streamed_already_sent_completes_loop_tick(loop_env):
     """A streamed wakeup must not leave awaiting_response stuck."""
     runner = _make_runner()
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    loops.LoopManager("sid-gateway-loop").set("poll CI", interval_seconds=300)
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
@@ -189,7 +194,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
 @pytest.mark.asyncio
 async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     runner = _make_runner()
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    loops.LoopManager("sid-gateway-loop").set("poll CI", interval_seconds=300)
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
@@ -214,7 +219,7 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 @pytest.mark.asyncio
 async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
     runner = _make_runner()
-    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    loops.LoopManager("sid-gateway-loop").set("poll CI", interval_seconds=300)
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1

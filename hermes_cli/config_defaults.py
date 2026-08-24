@@ -1234,6 +1234,28 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Goal recovery and terminal verification are invoked only by
+        # ``goals.termination: judge``.  They are separate auxiliary roles so
+        # a profile can use a stronger model for creative recovery / terminal
+        # review without paying that cost on every ordinary progress check.
+        "goal_recovery": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 90,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
+        "goal_terminal_verifier": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 90,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
@@ -2063,11 +2085,22 @@ DEFAULT_CONFIG = {
     # fail OPEN (continue) so a flaky judge never wedges progress — the
     # turn budget is the real backstop.
     "goals": {
+        # ``bounded`` is the compatibility default.  ``judge`` removes the
+        # goal-turn cap while retaining repetition, policy, and controller
+        # circuit breakers. Enable it per profile for persistent agents.
+        "termination": "bounded",
         # Max continuation turns before Hermes auto-pauses the goal and
         # asks the user to /goal resume. Protects against judge false
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        # Repetition and stalls are bounded in judge-led mode, not productive
+        # work. Two identical stalled responses force a different strategy;
+        # three stalled turns invoke the recovery coach.
+        "duplicate_failure_limit": 2,
+        "stall_turns_before_replan": 3,
+        "require_recovery_exhaustion": True,
+        "terminal_confirmation": True,
     },
 
 
