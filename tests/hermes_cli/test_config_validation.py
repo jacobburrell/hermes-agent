@@ -127,9 +127,11 @@ class TestPlatformToolsetValidation:
         assert any("hermes-teams" in issue.message for issue in unknown)
         assert any("hermes-google_chat" in issue.message for issue in unknown)
         zero_toolsets = [issue for issue in issues if "zero valid toolsets" in issue.message]
-        assert len(zero_toolsets) == 1
-        assert zero_toolsets[0].severity == "error"
-        assert "will not change" in zero_toolsets[0].hint
+        assert len(zero_toolsets) == 2
+        assert {issue.severity for issue in zero_toolsets} == {"error"}
+        assert any("platform 'teams'" in issue.message for issue in zero_toolsets)
+        assert any("platform 'google_chat'" in issue.message for issue in zero_toolsets)
+        assert all("will not change" in issue.hint for issue in zero_toolsets)
 
     def test_config_check_renders_platform_toolset_issues(self, monkeypatch, capsys):
         config = {"platform_toolsets": {"teams": ["hermes-teams"]}}
