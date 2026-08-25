@@ -686,6 +686,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
@@ -857,6 +858,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
+        self._inflight_deliveries: dict[str, dict] = {}
         self._bridge_log_fh = None
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -2019,15 +2021,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] {bridge_exit}")
                 break
             try:
-                async with self._http_session.get(
-                    f"{_BRIDGE_HTTP_BASE}/messages",
-                    timeout=aiohttp.ClientTimeout(total=30)
+                async with self._http_session.post(
+                    f"{_BRIDGE_HTTP_BASE}/messages-v2/poll",
+                    json={
+                        "consumerId": self._bridge_token[:16],
+                        "renewDeliveries": list(self._inflight_deliveries.values()),
+                    }, timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
                             if event:
+                                receipt = event.metadata.get("_hermesDelivery")
+                                if receipt:
+                                    self._inflight_deliveries[str(receipt.get("id", ""))] = receipt
                                 # Fire-and-forget: a slow bridge /read must not
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
@@ -2036,6 +2044,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._enqueue_text_event(event)
                                 else:
                                     await self.handle_message(event)
+                            elif isinstance(msg_data.get("_hermesDelivery"), dict):
+                                # Policy rejection is terminal, never a retry loop.
+                                await self._ack_delivery_receipts([msg_data["_hermesDelivery"]])
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2106,6 +2117,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            receipts = existing.metadata.setdefault("_hermesDeliveries", [])
+            receipt = event.metadata.get("_hermesDelivery")
+            if receipt and receipt not in receipts:
+                receipts.append(receipt)
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -2304,6 +2319,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
             metadata: Dict[str, Any] = {}
+            if isinstance(data.get("_hermesDelivery"), dict):
+                metadata["_hermesDelivery"] = data["_hermesDelivery"]
+                metadata["_hermesDeliveries"] = [data["_hermesDelivery"]]
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:
@@ -2351,6 +2369,36 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        await super().on_processing_complete(event, outcome)
+        receipts = event.metadata.get("_hermesDeliveries", []) if event.metadata else []
+        if not receipts or not self._http_session:
+            return
+        endpoint = "ack" if outcome == ProcessingOutcome.SUCCESS else "release"
+        payload: Dict[str, Any] = {"deliveries": receipts}
+        if endpoint == "release":
+            payload["consumerId"] = self._bridge_token[:16]
+        try:
+            import aiohttp
+            async with self._http_session.post(
+                f"{_BRIDGE_HTTP_BASE}/messages-v2/{endpoint}", json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ):
+                pass
+        finally:
+            for receipt in receipts:
+                self._inflight_deliveries.pop(str(receipt.get("id", "")), None)
+
+    async def _ack_delivery_receipts(self, receipts: list[dict]) -> None:
+        if not receipts or not self._http_session:
+            return
+        import aiohttp
+        async with self._http_session.post(
+            f"{_BRIDGE_HTTP_BASE}/messages-v2/ack", json={"deliveries": receipts},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ):
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────
