@@ -6214,7 +6214,11 @@ class BasePlatformAdapter(ABC):
                     self._discard_text_debounce(session_key)
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
+                        if event.delivery_receipts:
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.SUCCESS)
                     except Exception as e:
+                        if event.delivery_receipts:
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
@@ -6316,6 +6320,8 @@ class BasePlatformAdapter(ABC):
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
+                        if event.delivery_receipts:
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.SUCCESS)
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
