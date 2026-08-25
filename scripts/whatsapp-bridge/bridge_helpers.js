@@ -733,10 +733,13 @@ const INTERNAL_OUTBOUND_PAYLOAD = /(?:^|\n)\s*(?:traceback \(most recent call la
 /** A forged category must not turn a lifecycle/diagnostic payload into chat. */
 export function isUserVisibleOutboundContent(content) {
   const cleaned = String(content || '').replace(/[\u200B\u200C\u200D\u2060\uFEFF\u180E\u2061-\u2064]/g, '').trim();
+  const undecorated = cleaned.replace(/^[^A-Za-z0-9]*/u, '');
   if (!cleaned) return false;
   if (new Set(['[SILENT]', '[[SILENT]]', '<SILENT>', 'SILENCIO']).has(cleaned.toUpperCase())) return false;
   const productionPatterns = [
     /^\s*(?:traceback|internal diagnostic|internal reasoning fallback|goal persistence|⚕\s*hermes agent)/is,
+    /^\s*(?:model returned empty after tool calls|preflight compression:|hermes gateway starting|recovered reply\b.*gateway restarted during delivery)/is,
+    /^\s*(?:internal|system)\s+(?:status|error|diagnostic|progress|notice)\b/is,
     /^\s*(?:context compression|conversation limit|session (?:reset|restored)|history cleared|background process|model failure|api error|credential depleted|http \d{3} provider)/is,
     /^\s*(?:◐\s*)?session automatically reset\b/is, /^\s*✨\s*session reset\b/is,
     /^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b/is,
@@ -754,5 +757,5 @@ export function isUserVisibleOutboundContent(content) {
     /^\s*(?:openai|anthropic|openrouter|google|xai)\b[\s\S]*(?:error|quota|rate limit|authentication|invalid api key)\b/is,
     /^\s*⚠️\s*the model produced only internal reasoning and no final answer, despite retries/is,
   ];
-  return !INTERNAL_OUTBOUND_PAYLOAD.test(cleaned) && !productionPatterns.some((pattern) => pattern.test(cleaned));
+  return !INTERNAL_OUTBOUND_PAYLOAD.test(cleaned) && !productionPatterns.some((pattern) => pattern.test(cleaned) || pattern.test(undecorated));
 }
