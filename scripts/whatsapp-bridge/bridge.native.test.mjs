@@ -23,9 +23,23 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  shouldSyncWhatsAppHistory,
   trustedOutboundKind,
   isUserVisibleOutboundContent,
 } from './bridge_helpers.js';
+
+// -- bounded history sync -------------------------------------------------
+{
+  // Baileys HistorySyncType: INITIAL_BOOTSTRAP=0, INITIAL_STATUS_V3=1,
+  // FULL=2, RECENT=3, PUSH_NAME=4, NON_BLOCKING_DATA=5, ON_DEMAND=6,
+  // NO_HISTORY=7, MESSAGE_ACCESS_STATUS=8. Only FULL contains the
+  // historical backlog we never want replayed into Hermes.
+  for (const syncType of [0, 1, 3, 4, 5, 6, 7, 8]) {
+    assert.equal(shouldSyncWhatsAppHistory({ syncType }), true, `sync type ${syncType}`);
+  }
+  assert.equal(shouldSyncWhatsAppHistory({ syncType: 2 }), false);
+  console.log('  ✓ history sync restores group keys without enabling FULL history');
+}
 
 // -- linked-device identity normalization ---------------------------------
 {

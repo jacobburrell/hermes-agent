@@ -116,6 +116,17 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(/:\d+@/, '@').replace(/:\d+$/, '');
 }
 
+/**
+ * Baileys 7 disables every history-sync type when no callback is supplied.
+ * Keep FULL history disabled, while allowing the smaller syncs that populate
+ * the identity/session material needed to decrypt current group messages.
+ * Downloaded history is emitted by Baileys on `messaging-history.set`; the
+ * Hermes bridge intentionally consumes only live `messages.upsert` events.
+ */
+export function shouldSyncWhatsAppHistory(message) {
+  return message?.syncType !== 2;
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
