@@ -82,8 +82,19 @@ async def test_batched_receipts_use_one_ack_request(monkeypatch):
 
 def test_whatsapp_debounce_merges_all_receipts(monkeypatch):
     adapter = _make_adapter(); adapter._text_batch_key = lambda _event: "s"; adapter._pending_text_batches = {}; adapter._pending_text_batch_tasks = {}
-    async def noop(_key): pass
-    monkeypatch.setattr("asyncio.create_task", lambda _coro: MagicMock(done=lambda: True, cancel=lambda: None))
+    def close_task(coro):
+        coro.close()
+        return MagicMock(done=lambda: True, cancel=lambda: None)
+    monkeypatch.setattr("asyncio.create_task", close_task)
     first, second = _event({"id": "one", "receipt": "a"}), _event({"id": "two", "receipt": "b"})
     adapter._enqueue_text_event(first); adapter._enqueue_text_event(second)
     assert adapter._pending_text_batches["s"].delivery_receipts == [first.delivery_receipts[0], second.delivery_receipts[0]]
+
+
+@pytest.mark.asyncio
+async def test_queued_event_has_no_premature_terminal_operation():
+    adapter = _make_adapter(); adapter._pending_delivery_terminal_ops = {}; adapter._inflight_deliveries = {"one": {"id": "one", "receipt": "a"}}
+    # Queue ownership is deliberately not a completion boundary.
+    adapter._pending_messages = {"s": _event({"id": "one", "receipt": "a"})}
+    assert not adapter._pending_delivery_terminal_ops
+    assert "one" in adapter._inflight_deliveries
