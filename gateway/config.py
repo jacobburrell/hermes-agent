@@ -1724,6 +1724,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["outbound_policy"] = platform_cfg["outbound_policy"]
                 if plat == Platform.WHATSAPP and "group_audio_policy" in platform_cfg:
                     bridged["group_audio_policy"] = platform_cfg["group_audio_policy"]
+                if plat == Platform.WHATSAPP and "group_session_lanes" in platform_cfg:
+                    bridged["group_session_lanes"] = platform_cfg["group_session_lanes"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
