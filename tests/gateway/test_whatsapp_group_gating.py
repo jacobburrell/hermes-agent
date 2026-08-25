@@ -198,6 +198,7 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
         "  require_mention: true\n"
         "  outbound_policy: user_visible_only\n"
         "  group_audio_policy: private_only\n"
+        "  group_session_lanes: true\n"
         "  free_response_chats:\n"
         f"    - \"{group_id}\"\n"
         f"    - \"{unbound_group_id}\"\n"
@@ -213,6 +214,7 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
     assert extra["free_response_chats"] == [group_id, unbound_group_id]
     assert extra["outbound_policy"] == "user_visible_only"
     assert extra["group_audio_policy"] == "private_only"
+    assert extra["group_session_lanes"] is True
     assert extra["channel_skill_bindings"] == [{"id": group_id, "skills": ["group-sop"]}]
 
     from gateway.platforms.base import resolve_channel_skills
@@ -238,6 +240,26 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
     event = __import__("asyncio").run(adapter._build_message_event(payload))
     assert event is not None
     assert event.auto_skill == ["group-sop"]
+    assert event.source.chat_id == group_id
+    assert event.source.thread_id == "whatsapp-ambient"
+
+    mentioned = {**payload, "messageId": "mentioned", "mentionedIds": ["15551230000@s.whatsapp.net"]}
+    mentioned_event = __import__("asyncio").run(adapter._build_message_event(mentioned))
+    assert mentioned_event.source.chat_id == group_id
+    assert mentioned_event.source.thread_id == "whatsapp-operational"
+
+    replied = {**payload, "messageId": "reply", "quotedParticipant": "15551230000@s.whatsapp.net", "botIds": ["15551230000@s.whatsapp.net"]}
+    replied_event = __import__("asyncio").run(adapter._build_message_event(replied))
+    assert replied_event.source.thread_id == "whatsapp-operational"
+
+    command = {**payload, "messageId": "command", "body": "/status"}
+    command_event = __import__("asyncio").run(adapter._build_message_event(command))
+    assert command_event.source.thread_id == "whatsapp-operational"
+
+    from gateway.session import build_session_key
+    assert build_session_key(event.source, group_sessions_per_user=False) != build_session_key(
+        mentioned_event.source, group_sessions_per_user=False
+    )
 
     unbound_group = {**payload, "chatId": unbound_group_id}
     assert adapter._should_process_message(unbound_group) is True
@@ -257,6 +279,13 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
         "mediaUrls": ["/not-used-before-policy.ogg"],
     }
     assert __import__("asyncio").run(adapter._build_message_event(group_voice)) is None
+
+
+def test_group_session_lanes_are_opt_in():
+    adapter = _make_adapter(require_mention=False, group_policy="open")
+    event = __import__("asyncio").run(adapter._build_message_event(_group_message()))
+    assert event is not None
+    assert event.source.thread_id is None
 
 
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---
