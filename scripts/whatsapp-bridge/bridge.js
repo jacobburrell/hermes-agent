@@ -52,6 +52,7 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   validateBridgeLaunch,
+  trustedOutboundKind,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -134,6 +135,28 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+const STRICT_OUTBOUND_POLICY = process.env.WHATSAPP_OUTBOUND_POLICY === 'user_visible_only';
+const trustedOutboundIds = new Map();
+
+function requireTrustedOutput(req, res, { editing = false } = {}) {
+  if (!STRICT_OUTBOUND_POLICY) return true;
+  const kind = req.body?.outputKind;
+  if (!trustedOutboundKind(kind, { strict: true })) {
+    res.status(403).json({ error: 'A trusted user-visible output category is required' });
+    return false;
+  }
+  if (editing && trustedOutboundIds.get(req.body?.messageId) !== kind) {
+    res.status(403).json({ error: 'Only a previously classified message may be edited' });
+    return false;
+  }
+  return true;
+}
+
+function rememberTrustedOutput(sent, kind) {
+  if (STRICT_OUTBOUND_POLICY && sent?.key?.id && trustedOutboundKind(kind, { strict: true })) {
+    trustedOutboundIds.set(sent.key.id, kind);
+  }
+}
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -801,6 +824,7 @@ app.get('/messages', (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
+  if (!requireTrustedOutput(req, res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -820,6 +844,7 @@ app.post('/send', async (req, res) => {
         messageStore,
       });
       const sent = await sendWithTimeout(chatId, payload, options);
+      rememberTrustedOutput(sent, req.body.outputKind);
       trackSentMessageId(sent);
       messageStore.remember(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
@@ -840,6 +865,7 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
+  if (!requireTrustedOutput(req, res, { editing: true })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -874,6 +900,7 @@ app.post('/edit', async (req, res) => {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
+  if (!requireTrustedOutput(req, res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -963,6 +990,7 @@ app.post('/send-media', async (req, res) => {
     }
 
     const sent = await sendWithTimeout(chatId, msgPayload);
+    rememberTrustedOutput(sent, req.body.outputKind);
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
@@ -975,6 +1003,7 @@ app.post('/send-media', async (req, res) => {
 // approvals need text fallback and explicit confirmation semantics above this
 // low-level transport helper.
 app.post('/send-poll', async (req, res) => {
+  if (!requireTrustedOutput(req, res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -987,6 +1016,7 @@ app.post('/send-poll', async (req, res) => {
   try {
     const payload = buildPollPayload({ question, options, selectableCount });
     const sent = await sendWithTimeout(chatId, payload);
+    rememberTrustedOutput(sent, req.body.outputKind);
     trackSentMessageId(sent);
     rememberSentMessage(sent, payload);
     res.json({ success: true, messageId: sent?.key?.id });
@@ -997,6 +1027,7 @@ app.post('/send-poll', async (req, res) => {
 
 // Send native WhatsApp location pin
 app.post('/send-location', async (req, res) => {
+  if (!requireTrustedOutput(req, res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1009,6 +1040,7 @@ app.post('/send-location', async (req, res) => {
   try {
     const payload = buildLocationPayload({ latitude, longitude, name, address });
     const sent = await sendWithTimeout(chatId, payload);
+    rememberTrustedOutput(sent, req.body.outputKind);
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });

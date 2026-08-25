@@ -28,6 +28,7 @@ async def test_send_location_posts_to_bridge_location_endpoint():
         28.979,
         name="HQ",
         address="Example Street",
+        metadata={"notify": True},
     )
 
     assert result.success
@@ -41,4 +42,3 @@ async def test_send_location_posts_to_bridge_location_endpoint():
         "name": "HQ",
         "address": "Example Street",
     }
-
