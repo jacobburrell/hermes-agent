@@ -2459,6 +2459,11 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Opaque durable-delivery receipts owned by the originating transport.
+    # They survive pending-event coalescing and are terminally settled only
+    # when the merged processing turn completes.
+    delivery_receipts: List[Dict[str, Any]] = field(default_factory=list)
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -2796,6 +2801,9 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        for receipt in event.delivery_receipts:
+            if receipt not in existing.delivery_receipts:
+                existing.delivery_receipts.append(receipt)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)

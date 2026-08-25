@@ -1123,9 +1123,11 @@ app.get('/chat/:id', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  const inbound = inboundSpool.health();
   res.json({
     status: connectionState,
-    queueLength: messageQueue.length,
+    queueLength: inbound.pending,
+    inbound,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
