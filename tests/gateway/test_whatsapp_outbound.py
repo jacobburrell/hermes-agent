@@ -26,20 +26,47 @@ def test_user_visible_whatsapp_output_is_explicitly_classified(content, metadata
     assert classify_whatsapp_outbound(content, metadata) is not None
 
 
-@pytest.mark.parametrize(
-    ("content", "metadata"),
-    [
-        ("⚕ Hermes Agent\nGateway restart complete", {"notify": True}),
-        ("Traceback (most recent call last):\n  File \"gateway.py\", line 8", {"notify": True}),
-        ("Goal persistence resumed for session abc", {"notify": True}),
-        ("Internal diagnostic: " + ("x" * 12_000), {"notify": True}),
-        ("A normal-looking but unclassified send", {}),
-        ("Tool progress: searching", {OUTPUT_KIND_KEY: "final"}),
-        ("Actual answer", {"notify": True, "_interim_send": True}),
-    ],
-)
-def test_internal_or_unknown_whatsapp_output_fails_closed(content, metadata):
+INTERNAL_EVENTS = [
+    "[SILENT]",
+    "No reply: agent is still working",
+    "Memory updated: saved preference",
+    "Self-improvement review completed",
+    "Context compression started",
+    "Conversation limit reached",
+    "Session reset after interruption",
+    "Session restored from history",
+    "History cleared",
+    "Background process started",
+    "Provider error: upstream unavailable",
+    "Model failure: retrying",
+    "API error: invalid response",
+    "Token exhausted",
+    "Credential depleted",
+    "HTTP 503 provider failure",
+    "Internal reasoning fallback engaged",
+    "⚕ Hermes Agent\nGateway restart complete",
+    "Goal persistence resumed for session abc",
+    "Traceback (most recent call last):\n  File \"gateway.py\", line 8",
+    "Internal diagnostic: " + ("x" * 12_000),
+]
+
+
+@pytest.mark.parametrize("content", INTERNAL_EVENTS)
+def test_internal_events_fail_closed_even_with_forged_final_kind(content):
+    metadata = {OUTPUT_KIND_KEY: "final"}
     assert classify_whatsapp_outbound(content, metadata) is None
+    assert classify_whatsapp_outbound(content, metadata) is None
+
+
+@pytest.mark.parametrize("content", ["", "   ", "A normal-looking but unclassified send"])
+def test_blank_or_unknown_text_fails_closed(content):
+    assert classify_whatsapp_outbound(content, {OUTPUT_KIND_KEY: "final"}) is None
+
+
+def test_ordinary_error_explanation_remains_user_visible():
+    assert classify_whatsapp_outbound(
+        "HTTP 429 means the provider asked us to retry later.", {OUTPUT_KIND_KEY: "final"}
+    ) == "final"
 
 
 @pytest.mark.asyncio

@@ -2157,6 +2157,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     msg_type = MessageType.AUDIO
                 else:
                     msg_type = MessageType.DOCUMENT
+            if (
+                data.get("isGroup")
+                and msg_type in {MessageType.VOICE, MessageType.AUDIO}
+                and str(self.config.extra.get("group_audio_policy") or "").lower() == "private_only"
+            ):
+                # A group voice note must never become a model transcript or a
+                # public reply. DMs retain normal explicit transcription.
+                return None
             
             # Determine chat type
             is_group = data.get("isGroup", False)
