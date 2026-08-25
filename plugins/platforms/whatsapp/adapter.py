@@ -859,6 +859,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._inflight_deliveries: dict[str, dict] = {}
+        self._pending_delivery_terminal_ops: dict[str, tuple[str, dict]] = {}
         self._bridge_log_fh = None
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -2021,6 +2022,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] {bridge_exit}")
                 break
             try:
+                await self._flush_delivery_terminal_ops()
                 async with self._http_session.post(
                     f"{_BRIDGE_HTTP_BASE}/messages-v2/poll",
                     json={
@@ -2111,6 +2113,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
+            for receipt in event.delivery_receipts:
+                if receipt not in existing.delivery_receipts:
+                    existing.delivery_receipts.append(receipt)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
@@ -2371,19 +2376,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not receipts or not self._http_session:
             return
         endpoint = "ack" if outcome == ProcessingOutcome.SUCCESS else "release"
-        payload: Dict[str, Any] = {"deliveries": receipts}
-        if endpoint == "release":
-            payload["consumerId"] = self._bridge_token[:16]
-        try:
-            import aiohttp
-            async with self._http_session.post(
-                f"{_BRIDGE_HTTP_BASE}/messages-v2/{endpoint}", json=payload,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ):
-                pass
-        finally:
-            for receipt in receipts:
-                self._inflight_deliveries.pop(str(receipt.get("id", "")), None)
+        for receipt in receipts:
+            self._pending_delivery_terminal_ops[str(receipt.get("id", ""))] = (endpoint, receipt)
+        await self._flush_delivery_terminal_ops()
+
+    async def _flush_delivery_terminal_ops(self) -> None:
+        if not self._http_session:
+            return
+        for receipt_id, (endpoint, receipt) in list(self._pending_delivery_terminal_ops.items()):
+            payload: Dict[str, Any] = {"deliveries": [receipt]}
+            if endpoint == "release":
+                payload["consumerId"] = self._bridge_token[:16]
+            try:
+                import aiohttp
+                async with self._http_session.post(
+                    f"{_BRIDGE_HTTP_BASE}/messages-v2/{endpoint}", json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if 200 <= response.status < 300:
+                        self._pending_delivery_terminal_ops.pop(receipt_id, None)
+                        self._inflight_deliveries.pop(receipt_id, None)
+            except Exception:
+                # Keep the receipt in both maps: subsequent polls renew its
+                # lease and retry the terminal action without duplicate work.
+                continue
 
     async def _ack_delivery_receipts(self, receipts: list[dict]) -> None:
         if not receipts or not self._http_session:
