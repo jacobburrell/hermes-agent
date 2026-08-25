@@ -2033,6 +2033,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
+                            raw_receipt = msg_data.get("_hermesDelivery")
+                            if isinstance(raw_receipt, dict):
+                                self._inflight_deliveries[str(raw_receipt.get("id", ""))] = raw_receipt
                             event = await self._build_message_event(msg_data)
                             if event:
                                 receipt = event.delivery_receipts[0] if event.delivery_receipts else None
@@ -2046,9 +2049,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._enqueue_text_event(event)
                                 else:
                                     await self.handle_message(event)
-                            elif isinstance(msg_data.get("_hermesDelivery"), dict):
+                            elif isinstance(raw_receipt, dict):
                                 # Policy rejection is terminal, never a retry loop.
-                                await self._ack_delivery_receipts([msg_data["_hermesDelivery"]])
+                                self._pending_delivery_terminal_ops[str(raw_receipt.get("id", ""))] = ("ack", raw_receipt)
+                                await self._flush_delivery_terminal_ops()
             except asyncio.CancelledError:
                 break
             except Exception as e:
