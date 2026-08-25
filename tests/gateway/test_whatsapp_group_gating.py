@@ -183,6 +183,35 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
     assert __import__("os").environ["WHATSAPP_GROUP_ALLOWED_USERS"] == "120363001234567890@g.us"
 
 
+def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, tmp_path):
+    """An admitted group bypasses mention gating and keeps generic skills."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    group_id = "120363001234567890@g.us"
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n"
+        "  group_policy: allowlist\n"
+        "  group_allow_from:\n"
+        f"    - \"{group_id}\"\n"
+        "  require_mention: true\n"
+        "  free_response_chats:\n"
+        f"    - \"{group_id}\"\n"
+        "  channel_skill_bindings:\n"
+        f"    - id: \"{group_id}\"\n"
+        "      skills: [\"group-sop\"]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    config = load_gateway_config()
+    extra = config.platforms[Platform.WHATSAPP].extra
+    assert extra["free_response_chats"] == [group_id]
+    assert extra["channel_skill_bindings"] == [{"id": group_id, "skills": ["group-sop"]}]
+
+    from gateway.platforms.base import resolve_channel_skills
+    assert resolve_channel_skills(extra, group_id) == ["group-sop"]
+
+
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---
 
 
@@ -228,5 +257,4 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
 

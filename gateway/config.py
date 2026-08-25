@@ -1713,6 +1713,13 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                # WhatsApp calls the same concept "chats" because its group
+                # identifiers are JIDs rather than channel IDs.  Keep this
+                # user-facing spelling when moving a platform section into
+                # PlatformConfig.extra; without it the adapter silently falls
+                # back to mention-only intake.
+                if plat == Platform.WHATSAPP and "free_response_chats" in platform_cfg:
+                    bridged["free_response_chats"] = platform_cfg["free_response_chats"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
@@ -1735,7 +1742,9 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allow_admin_from"] = platform_cfg["group_allow_admin_from"]
                 if "group_user_allowed_commands" in platform_cfg:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
-                if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
+                # WhatsApp group JIDs are valid binding IDs too.  Keep the
+                # bridge limited to adapters that consume this shared schema.
+                if plat in {Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
