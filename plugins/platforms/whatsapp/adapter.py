@@ -2256,6 +2256,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 user_id=data.get("senderId"),
                 user_name=data.get("senderName"),
             )
+            if data.get("isGroup") and self.config.extra.get("group_session_lanes"):
+                # Ambient observation and explicit operational requests must
+                # never share cached transcript turns. Keep chat_id intact so
+                # same-group context/backfill still has the correct evidence.
+                addressed = bool(data.get("mentionedIds")) or self._message_is_reply_to_bot(data) or str(data.get("body") or "").lstrip().startswith("/")
+                source.thread_id = "whatsapp-operational" if addressed else "whatsapp-ambient"
             
             # Download media URLs to the local cache so agent tools
             # can access them reliably regardless of URL expiration.
