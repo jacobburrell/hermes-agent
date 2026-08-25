@@ -1,5 +1,7 @@
 """Behavior contracts for the fail-closed WhatsApp outbound boundary."""
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -76,10 +78,11 @@ async def test_unclassified_media_never_reaches_whatsapp_bridge(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_final_answer_reaches_whatsapp_bridge_once():
+async def test_final_answer_reaches_whatsapp_bridge_once(monkeypatch):
     adapter = _make_adapter()
     adapter._outbound_policy = "user_visible_only"
     adapter._trusted_outbound_ids = {}
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientTimeout=lambda **_kwargs: None))
     adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
     response = MagicMock(status=200)
     response.json = AsyncMock(return_value={"messageId": "answer-1"})

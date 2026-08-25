@@ -1537,6 +1537,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
+                    if resp.status == 204:
+                        return SendResult(success=True, message_id=None, raw_response={"suppressed": True})
                     if resp.status == 200:
                         data = await resp.json()
                         last_message_id = data.get("messageId")

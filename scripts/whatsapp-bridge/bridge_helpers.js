@@ -727,3 +727,10 @@ export function trustedOutboundKind(kind, { strict = false } = {}) {
   if (!strict) return true;
   return USER_VISIBLE_OUTPUT_KINDS.has(kind);
 }
+
+const INTERNAL_OUTBOUND_PAYLOAD = /(?:^|\n)\s*(?:traceback \(most recent call last\)|file "[^"]+", line \d+|stack trace:|(?:gateway|bridge) (?:restart(?:ing|ed)?|started|stopped|shutdown|health|status|diagnostic|error)|(?:goal|cron) (?:status|continuation|persistence|progress|restart|update)|(?:internal|system) (?:status|error|diagnostic|progress|notice)|hermes(?: agent)? (?:status|diagnostic|restart|update)|(?:tool|thinking|memory|background) (?:progress|status|update)|(?:restarting|reconnected|connection closed|starting gateway)\b)/i;
+
+/** A forged category must not turn a lifecycle/diagnostic payload into chat. */
+export function isUserVisibleOutboundContent(content) {
+  return !INTERNAL_OUTBOUND_PAYLOAD.test(String(content || '').trim());
+}
