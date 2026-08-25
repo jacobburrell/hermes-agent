@@ -2181,6 +2181,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
 
+            # Use the same platform-neutral binding resolver as Slack and
+            # Discord.  This is resolved while constructing the inbound event
+            # (not injected into an existing session), so a bound SOP is
+            # applied on new group sessions without mutating a cached prompt
+            # mid-conversation.
+            from gateway.platforms.base import resolve_channel_skills
+            auto_skill = resolve_channel_skills(self.config.extra, source.chat_id)
+
             return MessageEvent(
                 text=body,
                 message_type=msg_type,
@@ -2194,6 +2202,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_text=reply_to_text,
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
+                auto_skill=auto_skill,
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
