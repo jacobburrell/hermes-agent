@@ -2033,7 +2033,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
                             if event:
-                                receipt = event.metadata.get("_hermesDelivery")
+                                receipt = event.delivery_receipts[0] if event.delivery_receipts else None
                                 if receipt:
                                     self._inflight_deliveries[str(receipt.get("id", ""))] = receipt
                                 # Fire-and-forget: a slow bridge /read must not
@@ -2117,10 +2117,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
-            receipts = existing.metadata.setdefault("_hermesDeliveries", [])
-            receipt = event.metadata.get("_hermesDelivery")
-            if receipt and receipt not in receipts:
-                receipts.append(receipt)
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -2319,9 +2315,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
             metadata: Dict[str, Any] = {}
-            if isinstance(data.get("_hermesDelivery"), dict):
-                metadata["_hermesDelivery"] = data["_hermesDelivery"]
-                metadata["_hermesDeliveries"] = [data["_hermesDelivery"]]
+            delivery_receipts = [data["_hermesDelivery"]] if isinstance(data.get("_hermesDelivery"), dict) else []
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:
@@ -2360,6 +2354,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 media_urls=cached_urls,
                 media_types=media_types,
                 metadata=metadata,
+                delivery_receipts=delivery_receipts,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
                 reply_to_author_id=reply_to_author_id,
@@ -2372,7 +2367,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         await super().on_processing_complete(event, outcome)
-        receipts = event.metadata.get("_hermesDeliveries", []) if event.metadata else []
+        receipts = event.delivery_receipts
         if not receipts or not self._http_session:
             return
         endpoint = "ack" if outcome == ProcessingOutcome.SUCCESS else "release"
