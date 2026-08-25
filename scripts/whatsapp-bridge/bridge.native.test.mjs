@@ -23,6 +23,7 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   trustedOutboundKind,
+  isUserVisibleOutboundContent,
 } from './bridge_helpers.js';
 
 // -- strict outbound policy ----------------------------------------------
@@ -32,6 +33,9 @@ import {
   assert.equal(trustedOutboundKind('internal', { strict: true }), false);
   assert.equal(trustedOutboundKind(undefined, { strict: true }), false);
   assert.equal(trustedOutboundKind(undefined, { strict: false }), true);
+  assert.equal(isUserVisibleOutboundContent('Here is why HTTP 429 means retry later.'), true);
+  assert.equal(isUserVisibleOutboundContent('Gateway restart complete'), false);
+  assert.equal(isUserVisibleOutboundContent('Traceback (most recent call last):'), false);
   console.log('  ✓ strict bridge output policy rejects unknown categories');
 }
 

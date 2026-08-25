@@ -22,9 +22,12 @@ STRICT_POLICY = "user_visible_only"
 # traceback, lifecycle notice, or raw internal payload cannot reach WhatsApp.
 _INTERNAL_PAYLOAD_RE = re.compile(
     r"(?:^|\n)\s*(?:traceback \(most recent call last\)|file \"[^\"]+\", line \d+|"
-    r"stack trace:|gateway (?:restart|started|stopped|shutdown)|"
-    r"goal (?:status|continuation|persistence)|internal (?:status|error|diagnostic)|"
-    r"hermes(?: agent)? (?:status|diagnostic)|tool progress:)",
+    r"stack trace:|(?:gateway|bridge) (?:restart(?:ing|ed)?|started|stopped|shutdown|"
+    r"health|status|diagnostic|error)|(?:goal|cron) (?:status|continuation|persistence|"
+    r"progress|restart|update)|(?:internal|system) (?:status|error|diagnostic|"
+    r"progress|notice)|hermes(?: agent)? (?:status|diagnostic|restart|update)|"
+    r"(?:tool|thinking|memory|background) (?:progress|status|update)|"
+    r"(?:restarting|reconnected|connection closed|starting gateway)\b)",
     re.IGNORECASE,
 )
 
