@@ -6245,7 +6245,11 @@ class BasePlatformAdapter(ABC):
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    if event.delivery_receipts:
+                        await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.SUCCESS)
                 except Exception as e:
+                    if event.delivery_receipts:
+                        await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
@@ -6298,7 +6302,11 @@ class BasePlatformAdapter(ABC):
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        if event.delivery_receipts:
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.SUCCESS)
                     except Exception as e:
+                        if event.delivery_receipts:
+                            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
