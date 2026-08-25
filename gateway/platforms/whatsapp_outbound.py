@@ -27,7 +27,14 @@ _INTERNAL_PAYLOAD_RE = re.compile(
     r"progress|restart|update)|(?:internal|system) (?:status|error|diagnostic|"
     r"progress|notice)|hermes(?: agent)? (?:status|diagnostic|restart|update)|"
     r"(?:tool|thinking|memory|background) (?:progress|status|update)|"
-    r"(?:restarting|reconnected|connection closed|starting gateway)\b)",
+    r"(?:restarting|reconnected|connection closed|starting gateway)|"
+    r"\[silent\]|no reply:|memory updated\b|self-improvement review\b|"
+    r"(?:context|conversation) (?:compression|limit|reset|restored|history cleared)\b|"
+    r"session (?:reset|restored|interrupted|history cleared)\b|history cleared\b|"
+    r"background (?:process|task|job)\b|(?:provider|model|api) (?:error|failure|unavailable)\b|"
+    r"(?:token|credential) (?:exhausted|depleted|expired)\b|"
+    r"http (?:4\d\d|5\d\d) (?:provider|api|model) (?:error|failure)\b|"
+    r"internal reasoning (?:fallback|error|unavailable)\b)",
     re.IGNORECASE,
 )
 

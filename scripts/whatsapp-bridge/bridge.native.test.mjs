@@ -33,9 +33,23 @@ import {
   assert.equal(trustedOutboundKind('internal', { strict: true }), false);
   assert.equal(trustedOutboundKind(undefined, { strict: true }), false);
   assert.equal(trustedOutboundKind(undefined, { strict: false }), true);
+  const internalEvents = [
+    '[SILENT]', 'No reply: agent working', 'Memory updated',
+    'Self-improvement review', 'Context compression started',
+    'Conversation limit reached', 'Session reset after interruption',
+    'Session restored from history', 'History cleared', 'Background process started',
+    'Provider error: unavailable', 'Model failure: retrying', 'API error: bad response',
+    'Token exhausted', 'Credential depleted', 'HTTP 503 provider failure',
+    'Internal reasoning fallback', 'Gateway restart complete',
+    'Goal persistence resumed', 'Traceback (most recent call last):',
+  ];
+  for (const event of internalEvents) {
+    assert.equal(trustedOutboundKind('final', { strict: true }), true);
+    assert.equal(isUserVisibleOutboundContent(event), false, event);
+    assert.equal(isUserVisibleOutboundContent(event), false, `${event} repeated`);
+  }
   assert.equal(isUserVisibleOutboundContent('Here is why HTTP 429 means retry later.'), true);
-  assert.equal(isUserVisibleOutboundContent('Gateway restart complete'), false);
-  assert.equal(isUserVisibleOutboundContent('Traceback (most recent call last):'), false);
+  assert.equal(isUserVisibleOutboundContent('Here is the final answer.'), true);
   console.log('  ✓ strict bridge output policy rejects unknown categories');
 }
 
