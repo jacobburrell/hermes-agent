@@ -53,6 +53,7 @@ import {
   pollUpdateForAggregation,
   validateBridgeLaunch,
   trustedOutboundKind,
+  isUserVisibleOutboundContent,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -138,11 +139,12 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 const STRICT_OUTBOUND_POLICY = process.env.WHATSAPP_OUTBOUND_POLICY === 'user_visible_only';
 const trustedOutboundIds = new Map();
 
-function requireTrustedOutput(req, res, { editing = false } = {}) {
+function requireTrustedOutput(req, res, { editing = false, content = '' } = {}) {
   if (!STRICT_OUTBOUND_POLICY) return true;
   const kind = req.body?.outputKind;
-  if (!trustedOutboundKind(kind, { strict: true })) {
-    res.status(403).json({ error: 'A trusted user-visible output category is required' });
+  if (!trustedOutboundKind(kind, { strict: true }) || !isUserVisibleOutboundContent(content)) {
+    // Deliberate visibility suppression is idempotent success, never a retryable error.
+    res.status(204).end();
     return false;
   }
   if (editing && trustedOutboundIds.get(req.body?.messageId) !== kind) {
@@ -824,7 +826,7 @@ app.get('/messages', (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
-  if (!requireTrustedOutput(req, res)) return;
+  if (!requireTrustedOutput(req, res, { content: req.body?.message })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -865,7 +867,7 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
-  if (!requireTrustedOutput(req, res, { editing: true })) return;
+  if (!requireTrustedOutput(req, res, { editing: true, content: req.body?.message })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -900,7 +902,7 @@ app.post('/edit', async (req, res) => {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
-  if (!requireTrustedOutput(req, res)) return;
+  if (!requireTrustedOutput(req, res, { content: req.body?.caption })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1003,7 +1005,7 @@ app.post('/send-media', async (req, res) => {
 // approvals need text fallback and explicit confirmation semantics above this
 // low-level transport helper.
 app.post('/send-poll', async (req, res) => {
-  if (!requireTrustedOutput(req, res)) return;
+  if (!requireTrustedOutput(req, res, { content: req.body?.question })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1027,7 +1029,7 @@ app.post('/send-poll', async (req, res) => {
 
 // Send native WhatsApp location pin
 app.post('/send-location', async (req, res) => {
-  if (!requireTrustedOutput(req, res)) return;
+  if (!requireTrustedOutput(req, res, { content: `${req.body?.name || ''}\n${req.body?.address || ''}` })) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
