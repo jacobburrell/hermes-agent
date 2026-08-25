@@ -1720,6 +1720,8 @@ def load_gateway_config() -> GatewayConfig:
                 # back to mention-only intake.
                 if plat == Platform.WHATSAPP and "free_response_chats" in platform_cfg:
                     bridged["free_response_chats"] = platform_cfg["free_response_chats"]
+                if plat == Platform.WHATSAPP and "outbound_policy" in platform_cfg:
+                    bridged["outbound_policy"] = platform_cfg["outbound_policy"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:

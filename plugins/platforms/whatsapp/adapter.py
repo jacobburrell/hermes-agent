@@ -847,6 +847,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             allow_raw = None
         self._allow_from = self._coerce_allow_list(allow_raw)
         self._group_policy = str(config.extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
+        self._outbound_policy = str(config.extra.get("outbound_policy") or "").strip().lower()
+        self._trusted_outbound_ids: Dict[str, str] = {}
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
         read_receipts = config.extra.get("send_read_receipts", False)
         self._send_read_receipts = (
@@ -884,6 +886,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+    def _strict_outbound_policy(self) -> bool:
+        """Strict delivery is opt-in per profile; stock WhatsApp stays unchanged."""
+        return getattr(self, "_outbound_policy", "") == "user_visible_only"
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -1225,6 +1231,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            if self._outbound_policy:
+                bridge_env["WHATSAPP_OUTBOUND_POLICY"] = self._outbound_policy
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -1492,6 +1500,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
 
+        from gateway.platforms.whatsapp_outbound import (
+            classify_whatsapp_outbound,
+            suppress_whatsapp_outbound,
+        )
+        output_kind = classify_whatsapp_outbound(content, metadata)
+        if self._strict_outbound_policy() and output_kind is None:
+            suppress_whatsapp_outbound(content, metadata, reason="unclassified or internal text")
+            return SendResult(success=True, message_id=None)
+
         chat_id = to_whatsapp_jid(chat_id)
 
         try:
@@ -1508,6 +1525,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "chatId": chat_id,
                     "message": chunk,
                 }
+                if self._strict_outbound_policy():
+                    payload["outputKind"] = output_kind
                 if reply_to and idx == 0:
                     # Only reply-to on the first text chunk, even if the bridge
                     # response omits a parseable message id.
@@ -1523,6 +1542,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         last_message_id = data.get("messageId")
                         if last_message_id:
                             sent_message_ids.append(str(last_message_id))
+                            if self._strict_outbound_policy():
+                                self._trusted_outbound_ids[str(last_message_id)] = str(output_kind)
                     else:
                         error = await resp.text()
                         return SendResult(success=False, error=error)
@@ -1547,6 +1568,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
         if not self._running or not self._http_session:
@@ -1554,6 +1576,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        from gateway.platforms.whatsapp_outbound import (
+            classify_whatsapp_outbound,
+            suppress_whatsapp_outbound,
+        )
+        # A streaming draft is not a user-visible final answer on WhatsApp.
+        # Only a caller explicitly finalizing an already visible answer may
+        # edit it, and even then diagnostic payloads are blocked.
+        edit_metadata = dict(metadata or {})
+        del finalize  # A caller flag is not provenance for strict delivery.
+        output_kind = classify_whatsapp_outbound(content, edit_metadata)
+        known_kind = getattr(self, "_trusted_outbound_ids", {}).get(message_id)
+        if self._strict_outbound_policy() and (output_kind is None or known_kind != output_kind):
+            suppress_whatsapp_outbound(content, edit_metadata, reason="unclassified or internal edit")
+            return SendResult(success=True, message_id=message_id)
         try:
             import aiohttp
             async with self._http_session.post(
@@ -1562,6 +1598,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "chatId": to_whatsapp_jid(chat_id),
                     "messageId": message_id,
                     "message": content,
+                    **({"outputKind": output_kind} if self._strict_outbound_policy() else {}),
                 },
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
@@ -1580,6 +1617,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         media_type: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
         if not self._running or not self._http_session:
@@ -1587,6 +1625,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        from gateway.platforms.whatsapp_outbound import (
+            classify_whatsapp_outbound,
+            suppress_whatsapp_outbound,
+        )
+        output_kind = classify_whatsapp_outbound(caption, metadata, media=True)
+        if self._strict_outbound_policy() and output_kind is None:
+            suppress_whatsapp_outbound(caption, metadata, reason="unclassified or internal media")
+            return SendResult(success=True, message_id=None)
         try:
             import aiohttp
 
@@ -1602,6 +1648,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 payload["caption"] = caption
             if file_name:
                 payload["fileName"] = file_name
+            if self._strict_outbound_policy():
+                payload["outputKind"] = output_kind
 
             async with self._http_session.post(
                 f"{_BRIDGE_HTTP_BASE}/send-media",
@@ -1629,6 +1677,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         options: list[str],
         *,
         selectable_count: int = 1,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp poll via the Baileys bridge.
 
@@ -1641,6 +1690,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        from gateway.platforms.whatsapp_outbound import (
+            classify_whatsapp_outbound,
+            suppress_whatsapp_outbound,
+        )
+        output_kind = classify_whatsapp_outbound(question, metadata)
+        if self._strict_outbound_policy() and output_kind is None:
+            suppress_whatsapp_outbound(question, metadata, reason="unclassified or internal poll")
+            return SendResult(success=True, message_id=None)
         try:
             import aiohttp
 
@@ -1650,6 +1707,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "options": list(options or []),
                 "selectableCount": selectable_count,
             }
+            if self._strict_outbound_policy():
+                payload["outputKind"] = output_kind
             async with self._http_session.post(
                 f"{_BRIDGE_HTTP_BASE}/send-poll",
                 json=payload,
@@ -1686,11 +1745,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
         if 2 <= len(clean_choices) <= 12:
+            poll_metadata = dict(metadata or {})
+            poll_metadata["_whatsapp_output_kind"] = "clarify"
             result = await self.send_poll(
                 chat_id,
                 str(question or "").strip(),
                 clean_choices,
                 selectable_count=1,
+                metadata=poll_metadata,
             )
             if result.success:
                 return result
@@ -1705,7 +1767,63 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             choices=choices,
             clarify_id=clarify_id,
             session_key=session_key,
-            metadata=metadata,
+            metadata={**(metadata or {}), "_whatsapp_output_kind": "clarify"},
+        )
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Send the textual approval fallback as an approved user prompt.
+
+        The personal-account bridge has no interactive-button callback path,
+        so the existing typed approval commands remain the reliable contract.
+        Marking this at the adapter boundary keeps the generic gateway's
+        interim/status marker from accidentally suppressing a real prompt.
+        """
+        from gateway.run import _format_exec_approval_fallback
+
+        text = _format_exec_approval_fallback(
+            command,
+            description,
+            self.typed_command_prefix,
+            allow_permanent=allow_permanent,
+            allow_session=allow_session,
+            smart_denied=smart_denied,
+        )
+        return await self.send(
+            chat_id,
+            text,
+            metadata={**(metadata or {}), "_whatsapp_output_kind": "approval"},
+        )
+
+    async def send_update_prompt(
+        self,
+        chat_id: str,
+        prompt: str,
+        default: str = "",
+        session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an update decision prompt without exposing update status text."""
+        del session_key
+        default_hint = f" (default: {default})" if default else ""
+        text = (
+            f"{prompt}{default_hint}\n\n"
+            f"Reply `{self.typed_command_prefix}approve` (yes) or "
+            f"`{self.typed_command_prefix}deny` (no), or type your answer directly."
+        )
+        return await self.send(
+            chat_id,
+            text,
+            metadata={**(metadata or {}), "_whatsapp_output_kind": "approval"},
         )
 
     async def send_location(
@@ -1725,6 +1843,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        from gateway.platforms.whatsapp_outbound import (
+            classify_whatsapp_outbound,
+            suppress_whatsapp_outbound,
+        )
+        location_label = " ".join(part for part in (name, address) if part)
+        output_kind = classify_whatsapp_outbound(location_label, metadata, media=True)
+        if self._strict_outbound_policy() and output_kind is None:
+            suppress_whatsapp_outbound(location_label, metadata, reason="unclassified or internal location")
+            return SendResult(success=True, message_id=None)
         try:
             import aiohttp
 
@@ -1737,6 +1864,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 payload["name"] = name
             if address:
                 payload["address"] = address
+            if self._strict_outbound_policy():
+                payload["outputKind"] = output_kind
             async with self._http_session.post(
                 f"{_BRIDGE_HTTP_BASE}/send-location",
                 json=payload,
@@ -1764,14 +1893,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     ) -> SendResult:
         """Download image URL to cache, send natively via bridge.
 
-        ``metadata`` is accepted to honor the base-class contract — the
-        batch sender ``send_multiple_images`` passes it through to every
-        send path. The bridge media call doesn't use it, matching the
-        sibling overrides (send_video / send_voice / send_document).
+        ``metadata`` carries the final-delivery classification through the
+        native media path as well as the ordinary text send path.
         """
         try:
             local_path = await cache_image_from_url(image_url)
-            return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
+            return await self._send_media_to_bridge(chat_id, local_path, "image", caption, metadata=metadata)
         except Exception:
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
 
@@ -1784,7 +1911,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file natively via bridge."""
-        return await self._send_media_to_bridge(chat_id, image_path, "image", caption)
+        return await self._send_media_to_bridge(
+            chat_id, image_path, "image", caption, metadata=kwargs.get("metadata")
+        )
 
     async def send_video(
         self,
@@ -1795,7 +1924,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video natively via bridge — plays inline in WhatsApp."""
-        return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
+        return await self._send_media_to_bridge(
+            chat_id, video_path, "video", caption, metadata=kwargs.get("metadata")
+        )
 
     async def send_voice(
         self,
@@ -1806,7 +1937,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an audio file as a WhatsApp voice message via bridge."""
-        return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
+        return await self._send_media_to_bridge(
+            chat_id, audio_path, "audio", caption, metadata=kwargs.get("metadata")
+        )
 
     async def send_document(
         self,
@@ -1821,6 +1954,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return await self._send_media_to_bridge(
             chat_id, file_path, "document", caption,
             file_name or os.path.basename(file_path),
+            metadata=kwargs.get("metadata"),
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
