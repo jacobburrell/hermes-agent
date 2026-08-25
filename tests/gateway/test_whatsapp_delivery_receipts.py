@@ -68,6 +68,18 @@ async def test_terminal_retry_flushes_after_network_error(monkeypatch):
     assert not adapter._pending_delivery_terminal_ops and not adapter._inflight_deliveries
 
 
+@pytest.mark.asyncio
+async def test_batched_receipts_use_one_ack_request(monkeypatch):
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientTimeout=lambda **_kwargs: None))
+    adapter = _make_adapter(); adapter._http_session = MagicMock(); adapter._bridge_token = "consumer"
+    adapter._inflight_deliveries = {str(i): {"id": str(i), "receipt": str(i)} for i in range(2)}
+    adapter._pending_delivery_terminal_ops = {str(i): ("ack", {"id": str(i), "receipt": str(i)}) for i in range(2)}
+    adapter._http_session.post = MagicMock(return_value=_AsyncCM(MagicMock(status=200)))
+    await adapter._flush_delivery_terminal_ops()
+    assert adapter._http_session.post.call_count == 1
+    assert len(adapter._http_session.post.call_args.kwargs["json"]["deliveries"]) == 2
+
+
 def test_whatsapp_debounce_merges_all_receipts(monkeypatch):
     adapter = _make_adapter(); adapter._text_batch_key = lambda _event: "s"; adapter._pending_text_batches = {}; adapter._pending_text_batch_tasks = {}
     async def noop(_key): pass
