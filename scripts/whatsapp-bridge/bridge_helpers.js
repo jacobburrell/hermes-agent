@@ -719,3 +719,11 @@ export function createVersionResolver(fetchVersionFn, {
     return cachedVersion;
   };
 }
+
+export const USER_VISIBLE_OUTPUT_KINDS = new Set(['final', 'clarify', 'approval', 'command']);
+
+/** Fail closed for a profile that explicitly enables user-visible-only output. */
+export function trustedOutboundKind(kind, { strict = false } = {}) {
+  if (!strict) return true;
+  return USER_VISIBLE_OUTPUT_KINDS.has(kind);
+}

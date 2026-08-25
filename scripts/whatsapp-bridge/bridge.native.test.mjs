@@ -22,7 +22,18 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  trustedOutboundKind,
 } from './bridge_helpers.js';
+
+// -- strict outbound policy ----------------------------------------------
+{
+  assert.equal(trustedOutboundKind('final', { strict: true }), true);
+  assert.equal(trustedOutboundKind('approval', { strict: true }), true);
+  assert.equal(trustedOutboundKind('internal', { strict: true }), false);
+  assert.equal(trustedOutboundKind(undefined, { strict: true }), false);
+  assert.equal(trustedOutboundKind(undefined, { strict: false }), true);
+  console.log('  ✓ strict bridge output policy rejects unknown categories');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

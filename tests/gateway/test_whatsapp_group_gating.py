@@ -196,6 +196,7 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
         f"    - \"{group_id}\"\n"
         f"    - \"{unbound_group_id}\"\n"
         "  require_mention: true\n"
+        "  outbound_policy: user_visible_only\n"
         "  free_response_chats:\n"
         f"    - \"{group_id}\"\n"
         f"    - \"{unbound_group_id}\"\n"
@@ -208,7 +209,8 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
 
     config = load_gateway_config()
     extra = config.platforms[Platform.WHATSAPP].extra
-    assert extra["free_response_chats"] == [group_id]
+    assert extra["free_response_chats"] == [group_id, unbound_group_id]
+    assert extra["outbound_policy"] == "user_visible_only"
     assert extra["channel_skill_bindings"] == [{"id": group_id, "skills": ["group-sop"]}]
 
     from gateway.platforms.base import resolve_channel_skills
