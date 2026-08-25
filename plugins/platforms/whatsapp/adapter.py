@@ -2383,8 +2383,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _flush_delivery_terminal_ops(self) -> None:
         if not self._http_session:
             return
-        for receipt_id, (endpoint, receipt) in list(self._pending_delivery_terminal_ops.items()):
-            payload: Dict[str, Any] = {"deliveries": [receipt]}
+        batches: Dict[str, list[tuple[str, dict]]] = {}
+        for receipt_id, entry in self._pending_delivery_terminal_ops.items():
+            batches.setdefault(entry[0], []).append((receipt_id, entry[1]))
+        for endpoint, entries in batches.items():
+            payload: Dict[str, Any] = {"deliveries": [receipt for _, receipt in entries]}
             if endpoint == "release":
                 payload["consumerId"] = self._bridge_token[:16]
             try:
@@ -2394,8 +2397,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:
                     if 200 <= response.status < 300:
-                        self._pending_delivery_terminal_ops.pop(receipt_id, None)
-                        self._inflight_deliveries.pop(receipt_id, None)
+                        for receipt_id, _receipt in entries:
+                            self._pending_delivery_terminal_ops.pop(receipt_id, None)
+                            self._inflight_deliveries.pop(receipt_id, None)
             except Exception:
                 # Keep the receipt in both maps: subsequent polls renew its
                 # lease and retry the terminal action without duplicate work.
