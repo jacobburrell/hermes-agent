@@ -2261,7 +2261,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # Ambient observation and explicit operational requests must
                 # never share cached transcript turns. Keep chat_id intact so
                 # same-group context/backfill still has the correct evidence.
-                addressed = bool(data.get("mentionedIds")) or self._message_is_reply_to_bot(data) or str(data.get("body") or "").lstrip().startswith("/")
+                addressed = (
+                    self._message_mentions_bot(data)
+                    or self._message_is_reply_to_bot(data)
+                    or self._message_matches_mention_patterns(data)
+                    or str(data.get("body") or "").lstrip().startswith("/")
+                )
                 source.thread_id = "whatsapp-operational" if addressed else "whatsapp-ambient"
             
             # Download media URLs to the local cache so agent tools
