@@ -20,23 +20,20 @@ STRICT_POLICY = "user_visible_only"
 # These are structural diagnostics rather than ordinary user prose.  Keep the
 # check narrow: an answer explaining a normal error remains possible, while a
 # traceback, lifecycle notice, or raw internal payload cannot reach WhatsApp.
-_INTERNAL_PAYLOAD_RE = re.compile(
-    r"(?:^|\n)\s*(?:traceback \(most recent call last\)|file \"[^\"]+\", line \d+|"
-    r"stack trace:|(?:gateway|bridge) (?:restart(?:ing|ed)?|started|stopped|shutdown|"
-    r"health|status|diagnostic|error)|(?:goal|cron) (?:status|continuation|persistence|"
-    r"progress|restart|update)|(?:internal|system) (?:status|error|diagnostic|"
-    r"progress|notice)|hermes(?: agent)? (?:status|diagnostic|restart|update)|"
-    r"(?:tool|thinking|memory|background) (?:progress|status|update)|"
-    r"(?:restarting|reconnected|connection closed|starting gateway)|"
-    r"\[silent\]|no reply:|memory updated\b|self-improvement review\b|"
-    r"(?:context|conversation) (?:compression|limit|reset|restored|history cleared)\b|"
-    r"session (?:reset|restored|interrupted|history cleared)\b|history cleared\b|"
-    r"background (?:process|task|job)\b|(?:provider|model|api) (?:error|failure|unavailable)\b|"
-    r"(?:token|credential) (?:exhausted|depleted|expired)\b|"
-    r"http (?:4\d\d|5\d\d) (?:provider|api|model) (?:error|failure)\b|"
-    r"internal reasoning (?:fallback|error|unavailable)\b)",
-    re.IGNORECASE,
-)
+_INVISIBLE = re.compile(r"[\u200B\u200C\u200D\u2060\uFEFF\u180E\u2061-\u2064]")
+_SILENT = {"[SILENT]", "[[SILENT]]", "<SILENT>", "SILENCIO"}
+_INTERNAL_PAYLOAD_PATTERNS = tuple(re.compile(p, re.I | re.S) for p in (
+    r"^\s*(?:◐\s*)?session automatically reset\b", r"^\s*✨\s*session reset\b",
+    r"^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b",
+    r"^\s*(?:⚠️?\s*)?no reply\s*:", r"^\s*(?:request payload too large|context length exceeded)\b[\s\S]*(?:cannot compress further|max compression attempts)",
+    r"^\s*(?:💾\s*)?self-improvement review\s*:", r"^\s*(?:preflight |compressing |compacting )?context\b[\s\S]*\b(?:queued|compress(?:ing|ed)|cannot compress further|max compression attempts)\b",
+    r"^\s*(?:session restored successfully|conversation history cleared|use /resume|adjust reset timing|operation interrupted|interrupted during api call|interrupting current task)\b",
+    r"^\s*\[important:\s*background process", r"^\s*\[background process\s+proc_[a-z0-9_-]+\s+(?:finished|completed|is still running)\]",
+    r"^\s*◆\s*(?:model|provider|context)\s*:", r"^\s*(?:provider|model)\s+(?:error|diagnostic|quota|authentication|rate limit|retry budget exhausted)\b",
+    r"^\s*(?:all\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b", r"^\s*token exhaustion\b",
+    r"^\s*(?:openai|anthropic|openrouter|google|xai)\b[\s\S]*(?:error|quota|rate limit|authentication|invalid api key)\b",
+    r"^\s*⚠️\s*the model produced only internal reasoning and no final answer, despite retries(?: and fallback)?\.\s*its last reasoning",
+))
 
 
 def classify_whatsapp_outbound(
@@ -59,10 +56,10 @@ def classify_whatsapp_outbound(
         kind = "final"
     if kind not in USER_VISIBLE_KINDS:
         return None
-    text = str(content or "").strip()
+    text = _INVISIBLE.sub("", str(content or "")).strip()
     if not text and not media:
         return None
-    if text and _INTERNAL_PAYLOAD_RE.search(text):
+    if text and (text.upper() in _SILENT or any(pattern.search(text) for pattern in _INTERNAL_PAYLOAD_PATTERNS)):
         return None
     return str(kind)
 

@@ -732,5 +732,22 @@ const INTERNAL_OUTBOUND_PAYLOAD = /(?:^|\n)\s*(?:traceback \(most recent call la
 
 /** A forged category must not turn a lifecycle/diagnostic payload into chat. */
 export function isUserVisibleOutboundContent(content) {
-  return !INTERNAL_OUTBOUND_PAYLOAD.test(String(content || '').trim());
+  const cleaned = String(content || '').replace(/[\u200B\u200C\u200D\u2060\uFEFF\u180E\u2061-\u2064]/g, '').trim();
+  if (!cleaned) return false;
+  if (new Set(['[SILENT]', '[[SILENT]]', '<SILENT>', 'SILENCIO']).has(cleaned.toUpperCase())) return false;
+  const productionPatterns = [
+    /^\s*(?:◐\s*)?session automatically reset\b/is, /^\s*✨\s*session reset\b/is,
+    /^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b/is,
+    /^\s*(?:⚠️?\s*)?no reply\s*:/is,
+    /^\s*(?:request payload too large|context length exceeded)\b[\s\S]*(?:cannot compress further|max compression attempts)/is,
+    /^\s*(?:💾\s*)?self-improvement review\s*:/is,
+    /^\s*(?:preflight |compressing |compacting )?context\b[\s\S]*\b(?:queued|compress(?:ing|ed)|cannot compress further|max compression attempts)\b/is,
+    /^\s*(?:session restored successfully|conversation history cleared|use \/resume|adjust reset timing|operation interrupted|interrupted during api call|interrupting current task)\b/is,
+    /^\s*\[important:\s*background process/is, /^\s*\[background process\s+proc_[a-z0-9_-]+\s+(?:finished|completed|is still running)\]/is,
+    /^\s*(?:provider|model)\s+(?:error|diagnostic|quota|authentication|rate limit|retry budget exhausted)\b/is,
+    /^\s*(?:all\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b/is, /^\s*token exhaustion\b/is,
+    /^\s*(?:openai|anthropic|openrouter|google|xai)\b[\s\S]*(?:error|quota|rate limit|authentication|invalid api key)\b/is,
+    /^\s*⚠️\s*the model produced only internal reasoning and no final answer, despite retries/is,
+  ];
+  return !INTERNAL_OUTBOUND_PAYLOAD.test(cleaned) && !productionPatterns.some((pattern) => pattern.test(cleaned));
 }
