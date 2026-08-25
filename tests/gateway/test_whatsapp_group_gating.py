@@ -199,6 +199,7 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
         "  outbound_policy: user_visible_only\n"
         "  group_audio_policy: private_only\n"
         "  group_session_lanes: true\n"
+        "  mention_patterns: ['@?Jack\\s+Assistant']\n"
         "  free_response_chats:\n"
         f"    - \"{group_id}\"\n"
         f"    - \"{unbound_group_id}\"\n"
@@ -243,10 +244,28 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
     assert event.source.chat_id == group_id
     assert event.source.thread_id == "whatsapp-ambient"
 
-    mentioned = {**payload, "messageId": "mentioned", "mentionedIds": ["15551230000@s.whatsapp.net"]}
+    mentioned = {
+        **payload,
+        "messageId": "mentioned",
+        "mentionedIds": ["15551230000@s.whatsapp.net"],
+        "botIds": ["15551230000@s.whatsapp.net"],
+    }
     mentioned_event = __import__("asyncio").run(adapter._build_message_event(mentioned))
     assert mentioned_event.source.chat_id == group_id
     assert mentioned_event.source.thread_id == "whatsapp-operational"
+
+    other_mention = {
+        **payload,
+        "messageId": "other-mention",
+        "mentionedIds": ["15559990000@s.whatsapp.net"],
+        "botIds": ["15551230000@s.whatsapp.net"],
+    }
+    other_mention_event = __import__("asyncio").run(adapter._build_message_event(other_mention))
+    assert other_mention_event.source.thread_id == "whatsapp-ambient"
+
+    textual_mention = {**payload, "messageId": "textual", "body": "Jack Assistant register this"}
+    textual_mention_event = __import__("asyncio").run(adapter._build_message_event(textual_mention))
+    assert textual_mention_event.source.thread_id == "whatsapp-operational"
 
     replied = {**payload, "messageId": "reply", "quotedParticipant": "15551230000@s.whatsapp.net", "botIds": ["15551230000@s.whatsapp.net"]}
     replied_event = __import__("asyncio").run(adapter._build_message_event(replied))
