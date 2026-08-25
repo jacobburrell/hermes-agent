@@ -24,6 +24,8 @@ _INVISIBLE = re.compile(r"[\u200B\u200C\u200D\u2060\uFEFF\u180E\u2061-\u2064]")
 _SILENT = {"[SILENT]", "[[SILENT]]", "<SILENT>", "SILENCIO"}
 _INTERNAL_PAYLOAD_PATTERNS = tuple(re.compile(p, re.I | re.S) for p in (
     r"^\s*(?:traceback|internal diagnostic|internal reasoning fallback|goal persistence|⚕\s*hermes agent)",
+    r"^\s*(?:model returned empty after tool calls|preflight compression:|hermes gateway starting|recovered reply\b.*gateway restarted during delivery)",
+    r"^\s*(?:internal|system)\s+(?:status|error|diagnostic|progress|notice)\b",
     r"^\s*(?:context compression|conversation limit|session (?:reset|restored)|history cleared|background process|model failure|api error|credential depleted|http \d{3} provider)",
     r"^\s*(?:◐\s*)?session automatically reset\b", r"^\s*✨\s*session reset\b",
     r"^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b",
@@ -64,7 +66,8 @@ def classify_whatsapp_outbound(
     text = _INVISIBLE.sub("", str(content or "")).strip()
     if not text and not media:
         return None
-    if text and (text.upper() in _SILENT or any(pattern.search(text) for pattern in _INTERNAL_PAYLOAD_PATTERNS)):
+    undecorated = re.sub(r"^[^A-Za-z0-9]*", "", text)
+    if text and (text.upper() in _SILENT or any(pattern.search(text) or pattern.search(undecorated) for pattern in _INTERNAL_PAYLOAD_PATTERNS)):
         return None
     return str(kind)
 
