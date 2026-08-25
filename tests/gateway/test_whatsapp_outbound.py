@@ -58,9 +58,15 @@ def test_internal_events_fail_closed_even_with_forged_final_kind(content):
     assert classify_whatsapp_outbound(content, metadata) is None
 
 
-@pytest.mark.parametrize("content", ["", "   ", "A normal-looking but unclassified send"])
-def test_blank_or_unknown_text_fails_closed(content):
+@pytest.mark.parametrize("content", ["", "   ", "\u200b"])
+def test_blank_or_invisible_text_fails_closed(content):
     assert classify_whatsapp_outbound(content, {OUTPUT_KIND_KEY: "final"}) is None
+
+
+def test_normal_text_requires_a_user_visible_category():
+    content = "A normal-looking answer"
+    assert classify_whatsapp_outbound(content, {}) is None
+    assert classify_whatsapp_outbound(content, {OUTPUT_KIND_KEY: "final"}) == "final"
 
 
 def test_ordinary_error_explanation_remains_user_visible():
