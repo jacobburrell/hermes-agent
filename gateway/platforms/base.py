@@ -2801,9 +2801,11 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        merged_receipts = [*existing.delivery_receipts]
         for receipt in event.delivery_receipts:
-            if receipt not in existing.delivery_receipts:
-                existing.delivery_receipts.append(receipt)
+            if receipt not in merged_receipts:
+                merged_receipts.append(receipt)
+        existing.delivery_receipts[:] = merged_receipts
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2845,6 +2847,10 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
+    if existing:
+        # Replacement is the only fallthrough merge path (e.g. a queued
+        # voice event after plain text); move every lease to its survivor.
+        event.delivery_receipts = merged_receipts
     pending_messages[session_key] = event
 
 
