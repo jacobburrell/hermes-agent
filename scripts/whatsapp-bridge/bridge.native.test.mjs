@@ -20,11 +20,27 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   trustedOutboundKind,
   isUserVisibleOutboundContent,
 } from './bridge_helpers.js';
+
+// -- linked-device identity normalization ---------------------------------
+{
+  assert.equal(
+    normalizeWhatsAppId('116342762025117:14@lid'),
+    '116342762025117@lid',
+  );
+  assert.equal(
+    normalizeWhatsAppId('15550001111:3@s.whatsapp.net'),
+    '15550001111@s.whatsapp.net',
+  );
+  assert.equal(normalizeWhatsAppId('15550001111@s.whatsapp.net'), '15550001111@s.whatsapp.net');
+  assert.equal(normalizeWhatsAppId('116342762025117:14'), '116342762025117');
+  console.log('  ✓ linked-device suffixes normalize for group mentions and replies');
+}
 
 // -- strict outbound policy ----------------------------------------------
 {
