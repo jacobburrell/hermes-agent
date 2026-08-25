@@ -198,6 +198,7 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
         "  require_mention: true\n"
         "  free_response_chats:\n"
         f"    - \"{group_id}\"\n"
+        f"    - \"{unbound_group_id}\"\n"
         "  channel_skill_bindings:\n"
         f"    - id: \"{group_id}\"\n"
         "      skills: [\"group-sop\"]\n",
