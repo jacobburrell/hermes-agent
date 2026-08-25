@@ -1234,8 +1234,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
-            if self._outbound_policy:
-                bridge_env["WHATSAPP_OUTBOUND_POLICY"] = self._outbound_policy
+            outbound_policy = getattr(self, "_outbound_policy", "")
+            if outbound_policy:
+                bridge_env["WHATSAPP_OUTBOUND_POLICY"] = outbound_policy
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
