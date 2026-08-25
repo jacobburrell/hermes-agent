@@ -37,6 +37,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createDurableInboundSpool } from './inbound_spool.js';
 import {
   buildPollPayload,
   createAuthenticatedBridgeApp,
@@ -302,9 +303,11 @@ let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
 
-// Message queue for polling
-const messageQueue = [];
-const MAX_QUEUE_SIZE = 100;
+// Durable leases replace the destructive in-memory polling queue.
+const inboundSpool = createDurableInboundSpool({
+  rootDir: path.join(SESSION_DIR, 'inbound-spool'),
+  maxPending: 100,
+});
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -410,10 +413,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
-  if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
-  }
+  inboundSpool.enqueue(event);
 }
 
 function rememberSentId(id) {
@@ -795,7 +795,7 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
-      messageQueue.push(event);
+      inboundSpool.enqueue(event);
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
@@ -804,11 +804,8 @@ async function startSocket() {
         bodyLength: event.body.length,
         hasMedia: event.hasMedia,
         mediaType: event.mediaType,
-        queueLength: messageQueue.length,
+        queueLength: inboundSpool.pendingCount(),
       });
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
-      }
     }
   });
 }
@@ -820,9 +817,16 @@ const app = createAuthenticatedBridgeApp(express, BRIDGE_AUTH_TOKEN);
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
-  res.json(msgs);
+  // Compatibility only; the managed Python adapter uses /messages-v2.
+  res.json(inboundSpool.pollLegacy({ limit: 100 }));
 });
+
+app.post('/messages-v2/poll', (req, res) => {
+  try { res.json(inboundSpool.poll(req.body || {})); }
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+app.post('/messages-v2/ack', (req, res) => res.json(inboundSpool.acknowledge(req.body?.deliveries)));
+app.post('/messages-v2/release', (req, res) => res.json(inboundSpool.release(req.body?.deliveries, req.body?.consumerId)));
 
 // Send a message
 app.post('/send', async (req, res) => {
