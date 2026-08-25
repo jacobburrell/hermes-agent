@@ -110,7 +110,10 @@ export const MIME_MAP = {
 
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  // Baileys qualifies linked-device identities as ``user:device@server``.
+  // Mentions and quoted participants normally omit the device suffix, so
+  // preserve the server while removing only the numeric device component.
+  return String(value).replace(/:\d+@/, '@').replace(/:\d+$/, '');
 }
 
 export function getMessageContent(msg) {
