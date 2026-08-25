@@ -1,17 +1,80 @@
+import asyncio
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.config import Platform
 from gateway.platforms.base import (
-    MessageEvent, MessageType, ProcessingOutcome, merge_pending_message_event,
+    MessageEvent, MessageType, ProcessingOutcome, SendResult,
+    merge_pending_message_event,
 )
+from gateway.session import SessionSource, build_session_key
 from tests.gateway.test_whatsapp_formatting import _AsyncCM, _make_adapter
 
 
 def _event(receipt, kind=MessageType.TEXT):
     return MessageEvent(text="x", message_type=kind, delivery_receipts=[receipt])
+
+
+def _routed_event(text="x", *, receipt_id="one"):
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="120363000000000000@g.us",
+            chat_type="group",
+            user_id="15550000000@s.whatsapp.net",
+        ),
+        message_id=f"message-{receipt_id}",
+        delivery_receipts=[{"id": receipt_id, "receipt": f"token-{receipt_id}"}],
+    )
+
+
+def _branch_adapter(monkeypatch):
+    """Build a WhatsApp adapter that exercises BasePlatformAdapter branches."""
+    monkeypatch.setitem(
+        sys.modules,
+        "aiohttp",
+        SimpleNamespace(ClientTimeout=lambda **_kwargs: None),
+    )
+    adapter = _make_adapter()
+    adapter._bridge_token = "consumer-token"
+    adapter._session_tasks = {}
+    adapter._expected_cancelled_tasks = set()
+    adapter._pending_delivery_terminal_ops = {}
+    adapter._inflight_deliveries = {}
+    adapter._busy_text_mode = ""
+    adapter._busy_session_handler = None
+    adapter._text_debounce = {}
+    adapter._text_debounce_tasks = {}
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="response")
+    )
+    adapter._http_session = MagicMock()
+    adapter._http_session.post = MagicMock(
+        return_value=_AsyncCM(MagicMock(status=200))
+    )
+    return adapter
+
+
+def _mark_active(adapter, event):
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get(
+            "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=adapter.config.extra.get(
+            "thread_sessions_per_user", False
+        ),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    receipt = event.delivery_receipts[0]
+    adapter._inflight_deliveries[receipt["id"]] = receipt
+    return session_key
 
 
 @pytest.mark.parametrize("kind", [MessageType.TEXT, MessageType.PHOTO, MessageType.VOICE])
@@ -92,9 +155,118 @@ def test_whatsapp_debounce_merges_all_receipts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_queued_event_has_no_premature_terminal_operation():
-    adapter = _make_adapter(); adapter._pending_delivery_terminal_ops = {}; adapter._inflight_deliveries = {"one": {"id": "one", "receipt": "a"}}
-    # Queue ownership is deliberately not a completion boundary.
-    adapter._pending_messages = {"s": _event({"id": "one", "receipt": "a"})}
-    assert not adapter._pending_delivery_terminal_ops
+@pytest.mark.parametrize("command", ["/status", "/stop"])
+async def test_active_session_commands_ack_receipt_once(monkeypatch, command):
+    adapter = _branch_adapter(monkeypatch)
+    event = _routed_event(command)
+    _mark_active(adapter, event)
+    if command == "/stop":
+        adapter._dispatch_active_session_command = AsyncMock(return_value=None)
+
+    await adapter.handle_message(event)
+
+    if command == "/stop":
+        adapter._dispatch_active_session_command.assert_awaited_once()
+    else:
+        adapter._message_handler.assert_awaited_once_with(event)
+    assert adapter._http_session.post.call_count == 1
+    assert adapter._http_session.post.call_args.args[0].endswith("/ack")
+    assert adapter._pending_delivery_terminal_ops == {}
+    assert adapter._inflight_deliveries == {}
+
+
+@pytest.mark.asyncio
+async def test_active_session_clarify_reply_acks_receipt_once(monkeypatch):
+    adapter = _branch_adapter(monkeypatch)
+    event = _routed_event("the second choice")
+    _mark_active(adapter, event)
+
+    with patch(
+        "tools.clarify_gateway.get_pending_for_session",
+        return_value=object(),
+    ):
+        await adapter.handle_message(event)
+
+    adapter._message_handler.assert_awaited_once_with(event)
+    assert adapter._http_session.post.call_count == 1
+    assert adapter._http_session.post.call_args.args[0].endswith("/ack")
+    assert adapter._inflight_deliveries == {}
+
+
+@pytest.mark.asyncio
+async def test_active_session_busy_consumed_event_acks_receipt_once(monkeypatch):
+    adapter = _branch_adapter(monkeypatch)
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _routed_event("follow up")
+    session_key = _mark_active(adapter, event)
+
+    with patch("tools.clarify_gateway.get_pending_for_session", return_value=None):
+        await adapter.handle_message(event)
+
+    adapter._busy_session_handler.assert_awaited_once_with(event, session_key)
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._http_session.post.call_count == 1
+    assert adapter._http_session.post.call_args.args[0].endswith("/ack")
+    assert adapter._inflight_deliveries == {}
+
+
+@pytest.mark.asyncio
+async def test_active_session_queued_event_has_no_premature_terminal_operation(monkeypatch):
+    adapter = _branch_adapter(monkeypatch)
+    event = _routed_event("queued follow up")
+    session_key = _mark_active(adapter, event)
+
+    with patch("tools.clarify_gateway.get_pending_for_session", return_value=None):
+        await adapter.handle_message(event)
+
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._http_session.post.call_count == 0
+    assert adapter._pending_messages[session_key] is event
+    assert adapter._pending_delivery_terminal_ops == {}
     assert "one" in adapter._inflight_deliveries
+
+
+@pytest.mark.asyncio
+async def test_policy_rejected_poll_delivery_is_never_dispatched_and_retries_ack(
+    monkeypatch,
+):
+    adapter = _branch_adapter(monkeypatch)
+    raw_receipt = {"id": "rejected", "receipt": "lease-token"}
+    rejected = {
+        "messageId": "forbidden-group-message",
+        "chatId": "120363999999999999@g.us",
+        "isGroup": True,
+        "text": "not admitted",
+        "_hermesDelivery": raw_receipt,
+    }
+    poll_response = MagicMock(status=200)
+    poll_response.json = AsyncMock(return_value=[rejected])
+    adapter._http_session.post = MagicMock(
+        side_effect=[_AsyncCM(poll_response), OSError("ack unavailable")]
+    )
+    adapter._build_message_event = AsyncMock(return_value=None)
+    adapter.handle_message = AsyncMock()
+
+    async def stop_after_cycle(_delay):
+        adapter._running = False
+
+    monkeypatch.setattr(
+        "plugins.platforms.whatsapp.adapter.asyncio.sleep", stop_after_cycle
+    )
+
+    await adapter._poll_messages()
+
+    adapter._build_message_event.assert_awaited_once_with(rejected)
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._pending_delivery_terminal_ops["rejected"] == (
+        "ack",
+        raw_receipt,
+    )
+    assert adapter._inflight_deliveries["rejected"] == raw_receipt
+
+    adapter._http_session.post = MagicMock(
+        return_value=_AsyncCM(MagicMock(status=200))
+    )
+    await adapter._flush_delivery_terminal_ops()
+    assert adapter._pending_delivery_terminal_ops == {}
+    assert adapter._inflight_deliveries == {}
