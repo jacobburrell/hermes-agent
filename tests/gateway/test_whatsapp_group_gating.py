@@ -184,15 +184,17 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
 
 
 def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, tmp_path):
-    """An admitted group bypasses mention gating and keeps generic skills."""
+    """The loaded WhatsApp config reaches intake and the real event builder."""
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     group_id = "120363001234567890@g.us"
+    unbound_group_id = "999999999999@g.us"
     (hermes_home / "config.yaml").write_text(
         "whatsapp:\n"
         "  group_policy: allowlist\n"
         "  group_allow_from:\n"
         f"    - \"{group_id}\"\n"
+        f"    - \"{unbound_group_id}\"\n"
         "  require_mention: true\n"
         "  free_response_chats:\n"
         f"    - \"{group_id}\"\n"
@@ -210,6 +212,36 @@ def test_config_bridges_whatsapp_free_response_and_channel_skills(monkeypatch, t
 
     from gateway.platforms.base import resolve_channel_skills
     assert resolve_channel_skills(extra, group_id) == ["group-sop"]
+
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+    adapter = WhatsAppAdapter(config.platforms[Platform.WHATSAPP])
+    payload = {
+        "messageId": "group-message",
+        "chatId": group_id,
+        "senderId": "15551230000@s.whatsapp.net",
+        "senderName": "Member",
+        "chatName": "Test group",
+        "isGroup": True,
+        "body": "ordinary unmentioned message",
+        "hasMedia": False,
+        "mediaUrls": [],
+        "mentionedIds": [],
+        "quotedParticipant": "",
+        "botIds": [],
+    }
+    assert adapter._should_process_message(payload) is True
+    event = __import__("asyncio").run(adapter._build_message_event(payload))
+    assert event is not None
+    assert event.auto_skill == ["group-sop"]
+
+    unbound_group = {**payload, "chatId": unbound_group_id}
+    assert adapter._should_process_message(unbound_group) is True
+    unbound_event = __import__("asyncio").run(adapter._build_message_event(unbound_group))
+    assert unbound_event is not None
+    assert unbound_event.auto_skill is None
+
+    unapproved_group = {**payload, "chatId": "111111111111@g.us"}
+    assert adapter._should_process_message(unapproved_group) is False
 
 
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---
@@ -257,4 +289,3 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
