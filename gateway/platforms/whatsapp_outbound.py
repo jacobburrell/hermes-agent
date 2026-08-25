@@ -23,6 +23,8 @@ STRICT_POLICY = "user_visible_only"
 _INVISIBLE = re.compile(r"[\u200B\u200C\u200D\u2060\uFEFF\u180E\u2061-\u2064]")
 _SILENT = {"[SILENT]", "[[SILENT]]", "<SILENT>", "SILENCIO"}
 _INTERNAL_PAYLOAD_PATTERNS = tuple(re.compile(p, re.I | re.S) for p in (
+    r"^\s*(?:traceback|internal diagnostic|internal reasoning fallback|goal persistence|⚕\s*hermes agent)",
+    r"^\s*(?:context compression|conversation limit|session (?:reset|restored)|history cleared|background process|model failure|api error|credential depleted|http \d{3} provider)",
     r"^\s*(?:◐\s*)?session automatically reset\b", r"^\s*✨\s*session reset\b",
     r"^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b",
     r"^\s*(?:⚠️?\s*)?no reply\s*:", r"^\s*(?:request payload too large|context length exceeded)\b[\s\S]*(?:cannot compress further|max compression attempts)",
@@ -30,7 +32,10 @@ _INTERNAL_PAYLOAD_PATTERNS = tuple(re.compile(p, re.I | re.S) for p in (
     r"^\s*(?:session restored successfully|conversation history cleared|use /resume|adjust reset timing|operation interrupted|interrupted during api call|interrupting current task)\b",
     r"^\s*\[important:\s*background process", r"^\s*\[background process\s+proc_[a-z0-9_-]+\s+(?:finished|completed|is still running)\]",
     r"^\s*◆\s*(?:model|provider|context)\s*:", r"^\s*(?:provider|model)\s+(?:error|diagnostic|quota|authentication|rate limit|retry budget exhausted)\b",
-    r"^\s*(?:all\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b", r"^\s*token exhaustion\b",
+    r"^\s*(?:api\s+)?(?:call|request)\s+failed\b", r"^\s*(?:unhandled|uncaught)\s+(?:gateway\s+)?(?:exception|error)\b",
+    r"^\s*http\s+\d{3}:\s*provider\b", r"^\s*(?:memory|user profile)\s+(?:updated|saved)\b",
+    r"^\s*self-improvement review completed\b", r"^\s*empty after tools\b",
+    r"^\s*(?:all\s+)?(?:api\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b", r"^\s*token exhaustion\b",
     r"^\s*(?:openai|anthropic|openrouter|google|xai)\b[\s\S]*(?:error|quota|rate limit|authentication|invalid api key)\b",
     r"^\s*⚠️\s*the model produced only internal reasoning and no final answer, despite retries(?: and fallback)?\.\s*its last reasoning",
 ))

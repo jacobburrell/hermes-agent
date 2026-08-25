@@ -736,6 +736,8 @@ export function isUserVisibleOutboundContent(content) {
   if (!cleaned) return false;
   if (new Set(['[SILENT]', '[[SILENT]]', '<SILENT>', 'SILENCIO']).has(cleaned.toUpperCase())) return false;
   const productionPatterns = [
+    /^\s*(?:traceback|internal diagnostic|internal reasoning fallback|goal persistence|⚕\s*hermes agent)/is,
+    /^\s*(?:context compression|conversation limit|session (?:reset|restored)|history cleared|background process|model failure|api error|credential depleted|http \d{3} provider)/is,
     /^\s*(?:◐\s*)?session automatically reset\b/is, /^\s*✨\s*session reset\b/is,
     /^\s*(?:⚠️?\s*)?(?:gateway|bridge) (?:is )?(?:starting|restarting|shutting down|draining|stopping|restarted|restart(?:ed)?|is back)\b/is,
     /^\s*(?:⚠️?\s*)?no reply\s*:/is,
@@ -745,7 +747,10 @@ export function isUserVisibleOutboundContent(content) {
     /^\s*(?:session restored successfully|conversation history cleared|use \/resume|adjust reset timing|operation interrupted|interrupted during api call|interrupting current task)\b/is,
     /^\s*\[important:\s*background process/is, /^\s*\[background process\s+proc_[a-z0-9_-]+\s+(?:finished|completed|is still running)\]/is,
     /^\s*(?:provider|model)\s+(?:error|diagnostic|quota|authentication|rate limit|retry budget exhausted)\b/is,
-    /^\s*(?:all\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b/is, /^\s*token exhaustion\b/is,
+    /^\s*(?:api\s+)?(?:call|request)\s+failed\b/is, /^\s*(?:unhandled|uncaught)\s+(?:gateway\s+)?(?:exception|error)\b/is,
+    /^\s*http\s+\d{3}:\s*provider\b/is, /^\s*(?:memory|user profile)\s+(?:updated|saved)\b/is,
+    /^\s*self-improvement review completed\b/is, /^\s*empty after tools\b/is,
+    /^\s*(?:all\s+)?(?:api\s+)?(?:provider\s+)?(?:credentials?|tokens?)\s+(?:are\s+)?exhausted\b/is, /^\s*token exhaustion\b/is,
     /^\s*(?:openai|anthropic|openrouter|google|xai)\b[\s\S]*(?:error|quota|rate limit|authentication|invalid api key)\b/is,
     /^\s*⚠️\s*the model produced only internal reasoning and no final answer, despite retries/is,
   ];
