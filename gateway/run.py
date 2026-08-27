@@ -9874,6 +9874,139 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         modes = getattr(self, "_busy_text_modes_by_profile", None)
         return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
 
+    def _busy_ack_config_for_source(
+        self,
+        source: SessionSource,
+    ) -> tuple[dict, bool]:
+        """Return live routed-profile config plus whether a valid read exists.
+
+        A torn YAML write keeps that profile's last known-good snapshot. The
+        cache is keyed by the resolved config path so multiplexed profiles can
+        never reuse each other's policy.
+        """
+        try:
+            if getattr(
+                getattr(self, "config", None), "multiplex_profiles", False
+            ) is True:
+                config_path = (
+                    self._resolve_profile_home_for_source(source) / "config.yaml"
+                )
+            else:
+                config_path = _gateway_config_home() / "config.yaml"
+        except Exception:
+            logger.warning(
+                "Failed to resolve routed profile config for busy-ack policy",
+                exc_info=True,
+            )
+            return {}, False
+
+        cache_key = str(config_path)
+        last_known_good = self.__dict__.setdefault(
+            "_busy_ack_config_lkg_by_path",
+            {},
+        )
+        read_error: Exception | None = None
+        try:
+            # The existing raw helper intentionally collapses missing files and
+            # non-mapping YAML to {}. This policy must distinguish those states
+            # from a real empty mapping, so parse through the canonical gateway
+            # owner and require a mapping before it can become last-known-good.
+            from utils import fast_safe_load
+
+            with open(config_path, encoding="utf-8") as config_file:
+                loaded = fast_safe_load(config_file)
+            if not isinstance(loaded, dict):
+                raise TypeError(
+                    "top-level YAML must be a mapping, got "
+                    f"{type(loaded).__name__}"
+                )
+            config = loaded
+        except Exception as exc:
+            config = {}
+            read_error = exc
+
+        managed_config: dict = {}
+        try:
+            from hermes_cli import managed_scope
+
+            managed_config = managed_scope.apply_managed_overlay({})
+            config = managed_scope.apply_managed_overlay(config)
+        except Exception:
+            pass
+
+        try:
+            from hermes_cli.config import _expand_env_vars
+
+            expanded = _expand_env_vars(config)
+            if isinstance(expanded, dict):
+                config = expanded
+        except Exception:
+            pass
+
+        from gateway.display_config import resolve_display_setting
+
+        managed_explicit = resolve_display_setting(
+            managed_config,
+            _platform_config_key(source.platform),
+            "busy_ack_enabled",
+            fallback=None,
+            chat_type=getattr(source, "chat_type", None),
+            include_defaults=False,
+        )
+        has_valid_policy_source = read_error is None or managed_explicit is not None
+        if not has_valid_policy_source:
+            cached = last_known_good.get(cache_key)
+            if isinstance(cached, dict):
+                logger.debug(
+                    "Busy-ack config refresh failed for %s; keeping "
+                    "last-known-good policy: %s",
+                    config_path,
+                    read_error,
+                )
+                return cached, True
+            logger.warning(
+                "Busy-ack config refresh failed for %s before any valid read: %s",
+                config_path,
+                read_error,
+            )
+            return {}, False
+
+        # Cache only an actual user mapping or an explicit managed policy.
+        last_known_good[cache_key] = config
+        return config, True
+
+    def _busy_ack_enabled_for_source(self, source: SessionSource) -> bool:
+        """Resolve the live busy-ack gate for the source's owning profile.
+
+        Explicit routed-profile YAML resolves chat type, then platform, then
+        global scope. The startup env bridge remains the backwards-compatible
+        fallback before the built-in true default. WhatsApp fails closed when
+        its routed config cannot be read and no last-known-good snapshot exists.
+        """
+        config, has_valid_config = self._busy_ack_config_for_source(source)
+        platform_key = _platform_config_key(source.platform)
+
+        from gateway.display_config import resolve_display_setting
+
+        explicit = resolve_display_setting(
+            config,
+            platform_key,
+            "busy_ack_enabled",
+            fallback=None,
+            chat_type=getattr(source, "chat_type", None),
+            include_defaults=False,
+        )
+        if explicit is not None:
+            return bool(explicit)
+
+        if not has_valid_config and platform_key in {"whatsapp", "whatsapp_cloud"}:
+            return False
+
+        return is_truthy_value(
+            os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED"),
+            default=True,
+        )
+
     @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
@@ -10371,11 +10504,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled(effective_mode):
+            queue_during_drain = self._queue_during_drain_enabled(effective_mode)
+            if queue_during_drain:
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+
+            # Queue/refusal semantics happen above; this gate suppresses only
+            # the outbound drain notice and observes live routed-profile YAML.
+            if not self._busy_ack_enabled_for_source(event.source):
+                logger.debug("Busy drain notice suppressed for session %s", session_key)
+                return True
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -10635,14 +10775,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
-        busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        if not self._busy_ack_enabled_for_source(event.source):
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
-        # Debounce before consulting config-heavy display settings. Rapid
-        # follow-ups should be processed but should not trigger another config
-        # read just to discover that no ack will be sent.
+        # Debounce before consulting the remaining config-heavy display
+        # settings. Rapid follow-ups still resolve the live ack gate above so
+        # an edited YAML mute takes effect without a gateway restart.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = _busy_state.turn.busy_ack_ts if _busy_state else 0
