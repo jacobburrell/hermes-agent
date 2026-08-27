@@ -1436,6 +1436,9 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Suppress only the visible busy-session acknowledgment when false;
+        # queue/steer/interrupt state transitions still happen normally.
+        "busy_ack_enabled": True,
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
