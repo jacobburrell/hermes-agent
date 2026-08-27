@@ -48,6 +48,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
     "long_running_notifications": True,
+    # Whether the gateway emits a visible acknowledgement when a message is
+    # queued, steered, or interrupts an already-active session.
+    "busy_ack_enabled": True,
     "busy_ack_detail": True,
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
     # acknowledgment after successfully injecting the user's mid-turn message.
@@ -198,6 +201,7 @@ def resolve_display_setting(
     fallback: Any = None,
     *,
     chat_type: str | None = None,
+    include_defaults: bool = True,
 ) -> Any:
     """Resolve a display setting with per-platform override support.
 
@@ -216,6 +220,10 @@ def resolve_display_setting(
         Optional source chat type (e.g. ``"dm"``, ``"group"``,
         ``"channel"``, ``"thread"``).  When provided, chat-type overrides
         under ``display.platforms.<platform>.chat_types`` take precedence.
+    include_defaults : bool
+        When false, stop after explicit chat-type, platform, legacy, and
+        global user settings. This lets callers insert a compatibility source
+        (such as an existing environment bridge) before built-in defaults.
 
     Returns
     -------
@@ -258,6 +266,9 @@ def resolve_display_setting(
         if val is not None:
             return _normalise(setting, val)
 
+    if not include_defaults:
+        return fallback
+
     # 4. Built-in platform default
     plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
     if plat_defaults:
@@ -295,6 +306,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "streaming",
         "interim_assistant_messages",
         "long_running_notifications",
+        "busy_ack_enabled",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",

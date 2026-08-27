@@ -153,6 +153,50 @@ class TestChatTypeOverrides:
             == 120
         )
 
+    def test_busy_ack_precedence_and_explicit_only_resolution(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "busy_ack_enabled": True,
+                "platforms": {
+                    "whatsapp": {
+                        "busy_ack_enabled": False,
+                        "chat_types": {
+                            "group": {"busy_ack_enabled": "true"},
+                        },
+                    },
+                },
+            }
+        }
+
+        assert resolve_display_setting(
+            config,
+            "whatsapp",
+            "busy_ack_enabled",
+            chat_type="group",
+            include_defaults=False,
+        ) is True
+        assert resolve_display_setting(
+            config,
+            "whatsapp",
+            "busy_ack_enabled",
+            chat_type="dm",
+            include_defaults=False,
+        ) is False
+        assert resolve_display_setting(
+            {},
+            "whatsapp",
+            "busy_ack_enabled",
+            fallback=None,
+            include_defaults=False,
+        ) is None
+        assert resolve_display_setting(
+            {},
+            "whatsapp",
+            "busy_ack_enabled",
+        ) is True
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
@@ -428,5 +472,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 
