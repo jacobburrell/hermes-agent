@@ -46,6 +46,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
     "long_running_notifications": True,
+    # Whether a message received while a session is active gets a visible
+    # queue/steer/redirect/interrupt acknowledgement. State mutation is
+    # independent of this presentation-only gate.
+    "busy_ack_enabled": True,
     "busy_ack_detail": True,
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
     # acknowledgment after successfully injecting the user's mid-turn message.
@@ -254,6 +258,81 @@ def resolve_display_setting(
     return fallback
 
 
+def resolve_busy_ack_enabled(
+    user_config: dict,
+    platform_key: str,
+    *,
+    chat_type: str | None = None,
+    legacy_env: Any = None,
+) -> bool:
+    """Resolve the busy-session acknowledgement visibility policy.
+
+    This is intentionally scoped to ``busy_ack_enabled`` rather than adding
+    chat-type behavior to every display setting. Resolution order is:
+
+    1. ``display.platforms.<platform>.chat_types.<chat_type>``
+    2. ``display.platforms.<platform>``
+    3. global ``display``
+    4. the legacy process environment bridge
+    5. the built-in default
+
+    Invalid explicit values are ignored so the next lower-precedence source
+    remains authoritative.
+    """
+    explicit = resolve_busy_ack_override(
+        user_config,
+        platform_key,
+        chat_type=chat_type,
+    )
+    if explicit is not None:
+        return explicit
+
+    parsed_legacy = _normalise_busy_ack_value(legacy_env)
+    if parsed_legacy is not None:
+        return parsed_legacy
+    return bool(_GLOBAL_DEFAULTS["busy_ack_enabled"])
+
+
+def resolve_busy_ack_override(
+    user_config: dict,
+    platform_key: str,
+    *,
+    chat_type: str | None = None,
+) -> bool | None:
+    """Resolve only explicit busy-ack YAML scopes, excluding fallbacks."""
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+
+    candidates: list[Any] = []
+    platforms = display_cfg.get("platforms")
+    platform_cfg = (
+        platforms.get(platform_key)
+        if isinstance(platforms, dict)
+        else None
+    )
+    if isinstance(platform_cfg, dict):
+        chat_key = _normalise_busy_ack_chat_type(chat_type)
+        chat_types = platform_cfg.get("chat_types")
+        chat_cfg = (
+            chat_types.get(chat_key)
+            if chat_key and isinstance(chat_types, dict)
+            else None
+        )
+        if isinstance(chat_cfg, dict) and "busy_ack_enabled" in chat_cfg:
+            candidates.append(chat_cfg.get("busy_ack_enabled"))
+        if "busy_ack_enabled" in platform_cfg:
+            candidates.append(platform_cfg.get("busy_ack_enabled"))
+
+    if "busy_ack_enabled" in display_cfg:
+        candidates.append(display_cfg.get("busy_ack_enabled"))
+    for candidate in candidates:
+        parsed = _normalise_busy_ack_value(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -276,6 +355,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "streaming",
         "interim_assistant_messages",
         "long_running_notifications",
+        "busy_ack_enabled",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
@@ -314,3 +394,25 @@ def _normalise(setting: str, value: Any) -> Any:
         except (TypeError, ValueError):
             return 0
     return value
+
+
+def _normalise_busy_ack_value(value: Any) -> bool | None:
+    """Return a bool for supported YAML/env spellings, else ``None``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalised = value.strip().lower()
+        if normalised in {"true", "1", "yes", "on"}:
+            return True
+        if normalised in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _normalise_busy_ack_chat_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if not key:
+        return None
+    return {"direct": "dm", "private": "dm"}.get(key, key)
