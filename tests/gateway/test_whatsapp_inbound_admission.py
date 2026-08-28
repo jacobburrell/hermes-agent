@@ -169,6 +169,17 @@ async def test_conflicting_album_reply_anchors_are_deliberately_unthreaded():
     assert event.metadata["whatsapp_album_conflicting_reply_anchors"] is True
 
 
+def test_observed_context_global_lru_evicts_inactive_chats():
+    adapter = _adapter()
+    adapter._observed_group_context_global_keys = 1
+    first = adapter.build_source("one@g.us", "One", "group", "member", "Member")
+    second = adapter.build_source("two@g.us", "Two", "group", "member", "Member")
+    adapter._observe_group_event(MessageEvent("one", source=first))
+    adapter._observe_group_event(MessageEvent("two", source=second))
+    assert len(adapter._observed_group_context) == 1
+    assert next(iter(adapter._observed_group_context)).endswith(":two@g.us")
+
+
 def test_observed_context_neutralizes_reserved_headers_and_newlines():
     adapter = _adapter()
     source = adapter.build_source("group@g.us", "Group", "group", "member", "Evil\nName")

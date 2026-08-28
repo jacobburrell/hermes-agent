@@ -23,7 +23,7 @@ import re
 import signal
 import subprocess
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -494,6 +494,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._observed_group_context_limit = self._bounded_int_extra("observed_group_context_limit", 20, 1, 100)
         self._observed_group_context_bytes = self._bounded_int_extra("observed_group_context_bytes", 8192, 256, 65536)
         self._observed_group_context_ttl_seconds = self._bounded_int_extra("observed_group_context_ttl_seconds", 900, 1, 86400)
+        self._observed_group_context_global_keys = self._bounded_int_extra("observed_group_context_global_keys", 128, 1, 2048)
+        self._observed_group_context_global_bytes = self._bounded_int_extra("observed_group_context_global_bytes", 131072, 1024, 1048576)
+        self._observed_group_context_lru: OrderedDict[str, None] = OrderedDict()
         self._pending_album_batches: Dict[str, list[tuple[MessageEvent, str]]] = {}
         self._pending_album_tasks: Dict[str, asyncio.Task] = {}
         self._pending_album_hard_tasks: Dict[str, asyncio.Task] = {}
@@ -1513,7 +1516,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             text = f"{text}\n[attachment]".strip()
         if not text:
             return
-        entries = self._observed_group_context[self._observed_context_key(event)]
+        key = self._observed_context_key(event)
+        entries = self._observed_group_context[key]
         now = time.monotonic()
         while entries and now - entries[0][0] > self._observed_group_context_ttl_seconds:
             entries.popleft()
@@ -1522,11 +1526,33 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             entries.popleft()
         while sum(len(item.encode("utf-8")) for _, item in entries) > self._observed_group_context_bytes:
             entries.popleft()
+        self._observed_group_context_lru[key] = None
+        self._observed_group_context_lru.move_to_end(key)
+        self._sweep_observed_group_context(now)
+
+    def _sweep_observed_group_context(self, now: Optional[float] = None) -> None:
+        """Bound inactive chat observation buffers globally as well as locally."""
+        now = time.monotonic() if now is None else now
+        for key, entries in list(self._observed_group_context.items()):
+            while entries and now - entries[0][0] > self._observed_group_context_ttl_seconds:
+                entries.popleft()
+            if not entries:
+                self._observed_group_context.pop(key, None)
+                self._observed_group_context_lru.pop(key, None)
+        def total_bytes() -> int:
+            return sum(len(item.encode("utf-8")) for entries in self._observed_group_context.values() for _, item in entries)
+        while self._observed_group_context_lru and (
+            len(self._observed_group_context_lru) > self._observed_group_context_global_keys
+            or total_bytes() > self._observed_group_context_global_bytes
+        ):
+            stale, _ = self._observed_group_context_lru.popitem(last=False)
+            self._observed_group_context.pop(stale, None)
 
     def _attach_observed_group_context(self, event: MessageEvent) -> None:
         if event.source.chat_type != "group":
             return
         entries = self._observed_group_context.pop(self._observed_context_key(event), None)
+        self._observed_group_context_lru.pop(self._observed_context_key(event), None)
         if entries:
             now = time.monotonic()
             retained = [item for seen, item in entries if now - seen <= self._observed_group_context_ttl_seconds]
