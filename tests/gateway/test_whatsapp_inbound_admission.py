@@ -245,11 +245,22 @@ async def test_whatsapp_runner_handoff_keeps_observed_context_provider_only(monk
     runner = _runner_bootstrap(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": [], "tools": [], "history_offset": 0, "last_prompt_tokens": 0})
     source = adapter_source = _adapter().build_source("group@g.us", "Group", "group", "member", "Member")
-    event = MessageEvent("addressed WhatsApp request", source=source, metadata={"observed_group_context": "[Member] ambient WhatsApp"})
-    await runner._handle_message_with_agent(event, adapter_source, "agent:main:telegram:group:-1001:12345", 1)
+    from gateway.session import build_session_key
+    session_key = build_session_key(source)
+    entry = runner.session_store.get_or_create_session.return_value
+    entry.session_key = session_key
+    entry.platform = Platform.WHATSAPP
+    entry.chat_type = "group"
+    from gateway.message_timestamps import render_user_content_with_timestamp
+    from hermes_time import get_timezone
+    event = MessageEvent(
+        render_user_content_with_timestamp("addressed request", 1787936400, tz=get_timezone()),
+        source=source, metadata={"observed_group_context": "[Member] ambient WhatsApp"},
+    )
+    await runner._handle_message_with_agent(event, adapter_source, session_key, 1)
     assert "ambient WhatsApp" not in runner.hooks.emit.await_args_list[0].args[1].get("message", "")
     assert "ambient WhatsApp" in runner._run_agent.await_args.kwargs["message"]
-    assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed WhatsApp request"
+    assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed request"
 
 
 def test_observed_sidecar_persistence_strips_timestamp_from_addressed_text():
@@ -320,7 +331,7 @@ async def test_ingress_later_slash_promotes_album_and_reads_each_item():
 @pytest.mark.asyncio
 async def test_ingress_later_mention_pattern_promotes_album():
     adapter = _adapter()
-    adapter._mention_patterns = [__import__("re").compile(r"wake", __import__("re").I)]
+    adapter._mention_patterns = [__import__("re").compile(r"^\s*wake\b", __import__("re").I)]
     adapter._send_read_receipt = AsyncMock()
     handled = AsyncMock()
     adapter.handle_message = handled
