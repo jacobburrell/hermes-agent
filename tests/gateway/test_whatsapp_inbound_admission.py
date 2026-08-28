@@ -58,7 +58,8 @@ async def test_observed_chatter_is_adapter_only_and_attaches_to_next_addressed_t
     addressed = await adapter._build_message_event(
         _data("please help", mentionedIds=["bot@s.whatsapp.net"]), admission="operate"
     )
-    assert "first" in addressed.channel_context and "second" in addressed.channel_context
+    adapter._attach_observed_group_context(addressed)
+    assert "first" in addressed.metadata["observed_group_context"] and "second" in addressed.metadata["observed_group_context"]
     assert addressed.text == "please help"
     assert adapter._observed_group_context == {}
 
@@ -76,7 +77,7 @@ async def test_real_adapter_admission_never_sends_observe_to_base_handler():
     await adapter._process_inbound_data(_data("help", mentionedIds=["bot@s.whatsapp.net"]))
     await asyncio.sleep(0.02)
     handled.assert_awaited_once()
-    assert handled.await_args.args[0].channel_context.endswith("[Member] ambient")
+    assert handled.await_args.args[0].metadata["observed_group_context"].endswith("[Member] ambient")
 
 
 @pytest.mark.asyncio
@@ -108,12 +109,30 @@ async def test_media_without_album_id_only_coalesces_when_reply_anchor_matches()
     handled = AsyncMock()
     adapter.handle_message = handled
     source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
-    first = MessageEvent("one", MessageType.PHOTO, source=source, reply_to_message_id="anchor",
-                         raw_message={"mediaUrls": []})
-    second = MessageEvent("two", MessageType.PHOTO, source=source, reply_to_message_id="anchor",
-                          raw_message={"mediaUrls": []})
+    raw = {"isGroup": True, "chatId": "group@g.us", "mediaUrls": [], "botIds": ["bot"], "mentionedIds": ["bot"]}
+    first = MessageEvent("one", MessageType.PHOTO, source=source, reply_to_message_id="anchor", raw_message=raw)
+    second = MessageEvent("two", MessageType.PHOTO, source=source, reply_to_message_id="anchor", raw_message=raw)
     adapter._enqueue_group_media_event(first, "operate")
     adapter._enqueue_group_media_event(second, "operate")
     await asyncio.sleep(0.42)
     handled.assert_awaited_once()
     assert handled.await_args.args[0].text == "one\ntwo"
+
+
+@pytest.mark.asyncio
+async def test_unanchored_photo_burst_is_one_operational_envelope():
+    adapter = _adapter()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    for number in range(7):
+        adapter._enqueue_group_media_event(
+            MessageEvent(
+                str(number), MessageType.PHOTO, source=source,
+                raw_message={"isGroup": True, "chatId": "group@g.us", "botIds": ["bot"], "mentionedIds": ["bot"]},
+            ),
+            "operate",
+        )
+    await asyncio.sleep(0.42)
+    handled.assert_awaited_once()
+    assert handled.await_args.args[0].text == "\n".join(map(str, range(7)))

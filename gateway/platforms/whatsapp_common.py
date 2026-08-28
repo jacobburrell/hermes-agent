@@ -390,12 +390,7 @@ class WhatsAppBehaviorMixin:
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         """Compatibility predicate for callers that only understand drop/process."""
         disposition = self._classify_inbound_message(data)
-        # Preserve the legacy boolean API for external callers.  The adapter
-        # itself uses the three-way classifier and therefore does not dispatch
-        # this compatibility-only ``True`` for observe traffic.
-        return disposition == "operate" or (
-            disposition == "observe" and not self._whatsapp_require_mention()
-        )
+        return disposition == "operate"
 
     def _classify_inbound_message(self, data: Dict[str, Any]) -> str:
         """Classify inbound WhatsApp traffic before it can reach gateway state.
@@ -412,6 +407,11 @@ class WhatsAppBehaviorMixin:
             return "operate"
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
+            return "operate"
+        # Explicit ``require_mention: false`` remains the documented legacy
+        # free-response opt-in.  Absence is deliberately different: it is
+        # observation-only, so upgrades never become default-open.
+        if "require_mention" in self.config.extra and not self._whatsapp_require_mention():
             return "operate"
         body = str(data.get("body") or "").strip()
         if body.startswith("/") or self._message_is_reply_to_bot(data):

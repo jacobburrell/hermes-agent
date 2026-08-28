@@ -496,6 +496,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_album_batches: Dict[str, list[tuple[MessageEvent, str]]] = {}
         self._pending_album_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_album_hard_tasks: Dict[str, asyncio.Task] = {}
         self._pending_album_started: Dict[str, float] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
@@ -1502,7 +1503,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         entries = self._observed_group_context.pop(self._observed_context_key(event), None)
         if entries:
-            event.channel_context = "Recent group context (not requests to Hermes):\n" + "\n".join(entries)
+            event.metadata["observed_group_context"] = "\n".join(entries)
 
     def _album_batch_key(self, event: MessageEvent) -> Optional[str]:
         raw = event.raw_message or {}
@@ -1511,26 +1512,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         base = f"{profile}:{event.source.chat_id}:{event.source.user_id}"
         if album_id:
             return f"{base}:album:{album_id}"
-        # WhatsApp sometimes omits an album id.  Only infer a burst when the
-        # sender explicitly anchored every item to the same replied-to message.
-        if event.reply_to_message_id:
-            return f"{base}:reply:{event.reply_to_message_id}"
-        return None
+        # Some bridge variants omit album IDs.  Scope the bounded fallback to
+        # the same sender/chat/profile and reply anchor (including None), so
+        # normal unanchored photo albums still arrive as one envelope.
+        return f"{base}:reply:{event.reply_to_message_id or '-'}"
 
     def _enqueue_group_media_event(self, event: MessageEvent, disposition: str) -> None:
         key = self._album_batch_key(event)
-        if key is None:
-            if disposition == "observe":
-                self._observe_group_event(event)
-            else:
-                asyncio.create_task(self.handle_message(event))
-            return
         self._pending_album_batches.setdefault(key, []).append((event, disposition))
-        self._pending_album_started.setdefault(key, time.monotonic())
+        started = self._pending_album_started.setdefault(key, time.monotonic())
+        if key not in self._pending_album_hard_tasks:
+            # This task is intentionally never cancelled by later media.
+            self._pending_album_hard_tasks[key] = asyncio.create_task(
+                self._flush_group_media_batch(key, 1.0)
+            )
         prior = self._pending_album_tasks.get(key)
         if prior and not prior.done():
             prior.cancel()
-        elapsed = time.monotonic() - self._pending_album_started[key]
+        elapsed = time.monotonic() - started
         self._pending_album_tasks[key] = asyncio.create_task(
             self._flush_group_media_batch(key, max(0.0, min(0.35, 1.0 - elapsed)))
         )
@@ -1543,10 +1542,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not items:
                 return
             self._pending_album_started.pop(key, None)
+            hard = self._pending_album_hard_tasks.get(key)
+            if hard and hard is not current:
+                hard.cancel()
+            self._pending_album_hard_tasks.pop(key, None)
             # A mention/reply on any item promotes the entire album.  Thus a
             # caption on a later photo cannot strand earlier attachments in
             # observation-only context.
-            if not any(disposition == "operate" for _, disposition in items):
+            merged_raw = dict(items[0][0].raw_message or {})
+            merged_raw["body"] = "\n".join(
+                str((event.raw_message or {}).get("body") or "") for event, _ in items
+            )
+            merged_raw["mentionedIds"] = [
+                mention for event, _ in items
+                for mention in ((event.raw_message or {}).get("mentionedIds") or [])
+            ]
+            merged_raw["quotedParticipant"] = next(
+                (str((event.raw_message or {}).get("quotedParticipant") or "") for event, _ in items
+                 if (event.raw_message or {}).get("quotedParticipant")), ""
+            )
+            disposition = self._classify_inbound_message(merged_raw)
+            if disposition != "operate":
                 for event, _ in items:
                     self._observe_group_event(event)
                 return
@@ -1556,6 +1572,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     event.text = f"{event.text}\n{extra.text}" if event.text else extra.text
                 event.media_urls.extend(extra.media_urls)
                 event.media_types.extend(extra.media_types)
+            self._attach_observed_group_context(event)
             await self.handle_message(event)
         finally:
             if self._pending_album_tasks.get(key) is current:

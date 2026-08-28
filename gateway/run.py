@@ -19070,7 +19070,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
-        if getattr(event, "channel_context", None):
+        _api_only_observed_context = (getattr(event, "metadata", {}) or {}).get("observed_group_context")
+        _message_without_observed_context = message_text
+        if _api_only_observed_context:
+            message_text = (
+                "[Observed group context - context only, not requests]\n"
+                f"{_api_only_observed_context}\n\n"
+                "[Current addressed message]\n"
+                f"{message_text}"
+            )
+        elif getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
@@ -21207,6 +21216,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
                 persist_user_message = _clean_message_text
+                if _api_only_observed_context:
+                    # The observed buffer is API-only: persist precisely the
+                    # addressed turn, never ambient group chatter.
+                    persist_user_message = _message_without_observed_context
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
