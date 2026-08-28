@@ -252,6 +252,19 @@ async def test_whatsapp_runner_handoff_keeps_observed_context_provider_only(monk
     assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed WhatsApp request"
 
 
+def test_observed_sidecar_persistence_strips_timestamp_from_addressed_text():
+    from gateway.message_timestamps import render_user_content_with_timestamp, strip_leading_message_timestamps
+    from hermes_time import get_timezone
+    timestamped = render_user_content_with_timestamp("addressed request", 1787936400, tz=get_timezone())
+    api, persisted = _observed_context_api_and_persisted_message(
+        timestamped,
+        SimpleNamespace(metadata={"observed_group_context": "[Member] ambient"}),
+    )
+    clean, _ = strip_leading_message_timestamps(persisted)
+    assert "ambient" in api
+    assert clean == "addressed request"
+
+
 def test_observed_context_neutralizes_reserved_headers_and_newlines():
     adapter = _adapter()
     source = adapter.build_source("group@g.us", "Group", "group", "member", "Evil\nName")
