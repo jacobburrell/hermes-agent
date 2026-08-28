@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from typing import Optional
 
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 1_000
+_SCHEMA_LOCK = threading.Lock()
 
 
 class ReservationState(str, Enum):
@@ -62,6 +64,8 @@ def _owner_alive(pid: object, started_at: object) -> bool:
         pid_int = int(pid)
     except (TypeError, ValueError):
         return False
+    if pid_int <= 0:
+        return False
     try:
         from gateway.status import _pid_exists, get_process_start_time
 
@@ -91,24 +95,29 @@ class TerminalNoticeLedger:
         try:
             from hermes_state import apply_wal_with_fallback
 
-            apply_wal_with_fallback(conn, db_label="state.db (runtime notices)")
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS terminal_notice_deliveries (
-                    session_key TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    code TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    state_applied INTEGER NOT NULL DEFAULT 0,
-                    content TEXT NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    owner_pid INTEGER,
-                    owner_started_at INTEGER,
-                    owner_token TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (session_key, run_id, code)
-                )"""
-            )
+            # Journal-mode initialization and first-use DDL both acquire
+            # SQLite file locks. Serialize them inside one process so two
+            # runners racing on a fresh profile cannot fail before the ledger's
+            # transactional reservation logic gets a chance to arbitrate.
+            with _SCHEMA_LOCK:
+                apply_wal_with_fallback(conn, db_label="state.db (runtime notices)")
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS terminal_notice_deliveries (
+                        session_key TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        code TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        state_applied INTEGER NOT NULL DEFAULT 0,
+                        content TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        owner_pid INTEGER,
+                        owner_started_at INTEGER,
+                        owner_token TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (session_key, run_id, code)
+                    )"""
+                )
             return conn
         except Exception:
             conn.close()

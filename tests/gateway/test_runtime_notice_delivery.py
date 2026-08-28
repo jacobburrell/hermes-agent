@@ -355,3 +355,81 @@ async def test_runtime_notice_logs_exclude_bodies_and_chat_ids(
     assert "private provider body" not in log_text
     assert "request-secret" not in log_text
     assert "provider.rate_limit" in log_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_text", [None, "display: [\n", "- not\n- mapping\n"])
+async def test_terminal_delivery_is_enabled_before_any_valid_config_read(
+    tmp_path: Path, config_text: str | None
+) -> None:
+    if config_text is not None:
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+    adapter = _Adapter()
+
+    outcome = await deliver_human_runtime_notice(
+        runner=_Runner(adapter),
+        source=SimpleNamespace(chat_id="chat", thread_id=None),
+        envelope=_envelope(run_id=f"invalid-{config_text!r}"),
+        profile_home=tmp_path,
+        config_store=RuntimeNoticeConfigStore(),
+    )
+
+    assert outcome is DeliveryOutcome.SENT
+    assert len(adapter.calls) == 1
+
+
+def test_profile_config_last_good_isolated_by_profile_path(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "config.yaml").write_text(
+        "display:\n  runtime_notices: false\n", encoding="utf-8"
+    )
+    (second / "config.yaml").write_text(
+        "display:\n  runtime_notices: true\n", encoding="utf-8"
+    )
+    store = RuntimeNoticeConfigStore()
+
+    assert store.load(first).config["display"]["runtime_notices"] is False
+    assert store.load(second).config["display"]["runtime_notices"] is True
+    (first / "config.yaml").write_text("display: [\n", encoding="utf-8")
+
+    assert store.load(first).config["display"]["runtime_notices"] is False
+    assert store.load(second).config["display"]["runtime_notices"] is True
+
+
+def test_dead_inflight_owner_becomes_ambiguous_without_retry(tmp_path: Path) -> None:
+    ledger = TerminalNoticeLedger(tmp_path)
+    reservation = ledger.reserve(
+        session_key="session",
+        run_id="crashed-run",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    assert ledger.mark_in_flight(
+        "session", "crashed-run", "provider.timeout", reservation.owner_token
+    )
+    conn = ledger._connect()
+    try:
+        conn.execute(
+            """UPDATE terminal_notice_deliveries
+               SET owner_pid=-1, owner_started_at=-1
+               WHERE session_key='session' AND run_id='crashed-run'"""
+        )
+    finally:
+        conn.close()
+
+    after_restart = TerminalNoticeLedger(tmp_path).reserve(
+        session_key="session",
+        run_id="crashed-run",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+
+    assert after_restart.outcome is ReserveOutcome.ALREADY_DELIVERED
+    assert ledger.get_state("session", "crashed-run", "provider.timeout") == (
+        ReservationState.AMBIGUOUS.value
+    )

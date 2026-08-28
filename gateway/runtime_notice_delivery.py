@@ -342,6 +342,18 @@ def _adapter_guarantees_no_delivery(adapter: Any, result: Any) -> bool:
         return False
 
 
+async def _best_effort_post_call_transition(method: Any, *args: Any) -> None:
+    """Never turn a completed/ambiguous transport call into a resend path."""
+
+    try:
+        await asyncio.to_thread(method, *args)
+    except Exception:
+        logger.error(
+            "runtime notice ledger post-call transition failed",
+            exc_info=True,
+        )
+
+
 async def deliver_human_runtime_notice(
     *,
     runner: Any,
@@ -440,7 +452,7 @@ async def deliver_human_runtime_notice(
     try:
         result = await adapter.send(source.chat_id, content, metadata=metadata)
     except BaseException:
-        await asyncio.to_thread(
+        await _best_effort_post_call_transition(
             ledger.mark_ambiguous,
             envelope.session_key,
             envelope.run_id,
@@ -457,7 +469,7 @@ async def deliver_human_runtime_notice(
         return DeliveryOutcome.AMBIGUOUS
 
     if bool(getattr(result, "success", False)):
-        await asyncio.to_thread(
+        await _best_effort_post_call_transition(
             ledger.mark_sent,
             envelope.session_key,
             envelope.run_id,
@@ -466,7 +478,7 @@ async def deliver_human_runtime_notice(
         )
         outcome = DeliveryOutcome.SENT
     elif _adapter_guarantees_no_delivery(adapter, result):
-        await asyncio.to_thread(
+        await _best_effort_post_call_transition(
             ledger.release_definite_failure,
             envelope.session_key,
             envelope.run_id,
@@ -475,7 +487,7 @@ async def deliver_human_runtime_notice(
         )
         outcome = DeliveryOutcome.FAILED
     else:
-        await asyncio.to_thread(
+        await _best_effort_post_call_transition(
             ledger.mark_ambiguous,
             envelope.session_key,
             envelope.run_id,

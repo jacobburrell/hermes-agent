@@ -1390,6 +1390,19 @@ DEFAULT_CONFIG = {
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
         "busy_steer_ack_enabled": True,
+        # Gateway-only typed runtime notices. Per-kind values can be overridden
+        # at display.platforms.<platform> and its chat_types.<type> child.
+        # terminal_failure is an always-on safety rail: explicit false values
+        # are ignored with a warning so a provider outage never looks like a
+        # silently dropped turn.
+        "runtime_notices": True,
+        "runtime_notice_kinds": {
+            "busy_ack": True,
+            "runtime_progress": True,
+            "runtime_lifecycle": True,
+            "operator_notice": True,
+            "terminal_failure": True,
+        },
         # Classic CLI multiline fallbacks beyond Alt+Enter.
         # Default true matches Claude Code / Codex / OpenCode: Ctrl+J inserts
         # a newline, a trailing backslash followed by Enter continues the draft,

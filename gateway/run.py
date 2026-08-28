@@ -21315,6 +21315,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            _typed_terminal_notice = None
+            try:
+                from agent.runtime_notices import AgentRuntimeNotice, NoticeKind
+
+                _candidate_notice = agent_result.get("runtime_notice")
+                _platform_value = str(
+                    getattr(source.platform, "value", source.platform) or ""
+                ).strip().lower()
+                if (
+                    isinstance(_candidate_notice, AgentRuntimeNotice)
+                    and _candidate_notice.kind is NoticeKind.TERMINAL_FAILURE
+                    and _platform_value not in _GATEWAY_RAW_TEXT_PLATFORMS
+                ):
+                    from gateway.runtime_notice_delivery import (
+                        canonical_human_terminal_content,
+                    )
+
+                    _typed_terminal_notice = _candidate_notice
+                    # Every human surface receives fixed actionable copy. The
+                    # raw provider response remains intact for CLI/API/webhook
+                    # callers and server-side diagnostics.
+                    response = canonical_human_terminal_content(_candidate_notice)
+            except Exception:
+                logger.error(
+                    "runtime notice preparation failed: platform=%s",
+                    _platform_name,
+                    exc_info=True,
+                )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -21849,6 +21877,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if (
                 not _streaming_tts_done
+                and _typed_terminal_notice is None
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -21894,6 +21923,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event._streamed_final_response = str(response or "")
                 except Exception:
                     pass
+                return None
+
+            if _typed_terminal_notice is not None:
+                from gateway.runtime_notice_delivery import (
+                    GatewayNoticeEnvelope,
+                    RuntimeNoticeConfigStore,
+                    deliver_human_runtime_notice,
+                    notice_run_id,
+                )
+
+                _notice_home = self._runtime_notice_profile_home_for_source(source)
+                if _notice_home is None:
+                    # An unserved profile must never borrow primary policy or
+                    # ledger state. The normal adapter lookup is also
+                    # fail-closed for this source, so there is no safe target.
+                    logger.error(
+                        "runtime notice delivery failed: platform=%s reason=unserved_profile",
+                        _platform_name,
+                    )
+                    return None
+                _notice_store = getattr(self, "_runtime_notice_config_store", None)
+                if _notice_store is None:
+                    _notice_store = RuntimeNoticeConfigStore()
+                    self._runtime_notice_config_store = _notice_store
+                _envelope = GatewayNoticeEnvelope(
+                    notice=_typed_terminal_notice,
+                    session_key=session_key,
+                    run_id=notice_run_id(event, session_key),
+                    platform=_platform_name,
+                    chat_type=str(getattr(source, "chat_type", "") or ""),
+                )
+                try:
+                    await deliver_human_runtime_notice(
+                        runner=self,
+                        source=source,
+                        envelope=_envelope,
+                        profile_home=_notice_home,
+                        config_store=_notice_store,
+                    )
+                except Exception:
+                    # Delivery has not reached the adapter when the helper
+                    # raises: all post-call failures are converted to
+                    # AMBIGUOUS internally. Let Base deliver the same canonical
+                    # copy through its existing final-response rail.
+                    logger.error(
+                        "runtime notice pre-wire delivery failed: platform=%s",
+                        _platform_name,
+                        exc_info=True,
+                    )
+                    return response
                 return None
 
             return response
@@ -29167,6 +29246,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
             return get_hermes_home()
+
+    def _runtime_notice_profile_home_for_source(
+        self, source: SessionSource
+    ) -> Optional["Path"]:
+        """Resolve a notice policy/ledger home without primary-profile bleed.
+
+        The general runtime resolver intentionally falls back for some legacy
+        callers. Runtime notices cannot: an unknown or unserved stamped profile
+        must never read or write the primary profile's policy/ledger.
+        """
+
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        requested = str(getattr(source, "profile", "") or "").strip()
+        if not requested:
+            return _gateway_config_home()
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            try:
+                homes = dict(_multiplex_profile_homes(self.config))
+            except Exception:
+                logger.warning(
+                    "runtime notice profile resolution failed: source=multiplex",
+                    exc_info=True,
+                )
+                return None
+            home = homes.get(requested)
+            return Path(home) if home is not None else None
+        try:
+            if not profile_exists(requested):
+                return None
+            return Path(get_profile_dir(requested))
+        except Exception:
+            return None
 
     async def _run_agent_inner(
         self,

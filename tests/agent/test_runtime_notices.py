@@ -10,6 +10,7 @@ from agent.runtime_notices import (
     NoticeKind,
     provider_terminal_notice,
 )
+from agent.error_classifier import ClassifiedError, FailoverReason
 
 
 def test_notice_kinds_are_stable_wire_values() -> None:
@@ -109,3 +110,46 @@ def test_notice_requires_enum_kind_and_nonempty_stable_code() -> None:
         )
     with pytest.raises(ValueError, match="non-empty stable string"):
         AgentRuntimeNotice(kind=NoticeKind.OPERATOR_NOTICE, code=" ", message="x")
+
+
+def test_billing_result_builder_emits_typed_terminal_notice() -> None:
+    from agent.conversation_loop import _billing_failure_result
+
+    classified = ClassifiedError(
+        reason=FailoverReason.billing,
+        retryable=False,
+    )
+    result = _billing_failure_result(
+        classified=classified,
+        summary="private provider balance body",
+        messages=[],
+        api_call_count=3,
+        provider="example",
+        base_url="https://example.invalid",
+        model="model-a",
+        guidance="add credits",
+    )
+
+    notice = result["runtime_notice"]
+    assert notice.kind is NoticeKind.TERMINAL_FAILURE
+    assert notice.code == "provider.billing"
+    assert notice.failure_category is FailureCategory.BILLING
+    assert notice.message == result["final_response"]
+
+
+def test_content_policy_result_builder_emits_typed_terminal_notice() -> None:
+    from agent.conversation_loop import _content_policy_blocked_result
+
+    result = _content_policy_blocked_result(
+        [],
+        1,
+        final_response="raw policy detail",
+        error_detail="private refusal",
+        provider="example",
+        model="model-a",
+    )
+
+    notice = result["runtime_notice"]
+    assert notice.code == "provider.content_policy_blocked"
+    assert notice.failure_category is FailureCategory.CONTENT_POLICY
+    assert notice.retryable is False

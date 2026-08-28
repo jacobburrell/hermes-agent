@@ -96,6 +96,7 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
+from agent.runtime_notices import provider_terminal_notice
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -779,6 +780,31 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
     return f"Billing or credits exhausted: {summary}"
 
 
+def _provider_terminal_result(
+    result: dict,
+    *,
+    reason: str,
+    retryable: bool,
+    provider: str,
+    model: str,
+) -> dict:
+    """Attach the typed provider terminal descriptor at the producer.
+
+    Gateway surfaces consume this immutable object. CLI/TUI/raw API callers
+    keep the existing result fields and text unchanged.
+    """
+
+    result["runtime_notice"] = provider_terminal_notice(
+        reason=reason,
+        message=str(result.get("final_response") or ""),
+        retryable=retryable,
+        provider=provider,
+        model=model,
+        diagnostic=str(result.get("error") or ""),
+    )
+    return result
+
+
 def _billing_failure_result(
     *,
     classified,
@@ -808,25 +834,31 @@ def _billing_failure_result(
     final = _billing_terminal_label(summary, unverified)
     if guidance:
         final += f"\n\n{guidance}"
-    return {
-        "final_response": final,
-        "messages": messages,
-        "api_calls": api_call_count,
-        "completed": False,
-        "failed": True,
-        "error": summary,
-        "failure_reason": classified.reason.value,
-        # The classifier's own retry verdict — carried so UI surfaces
-        # (agent/error_surface.py) show Retry only when a re-run can differ,
-        # instead of re-deriving retryability from a second taxonomy.
-        "failure_retryable": bool(classified.retryable),
-        # The billing verdict may rest on an ambiguous body (#82154) — carry
-        # that through the structured result, not just the prose.
-        "billing_unverified": unverified,
-        "billing_block": _billing_block_dict(
-            provider, base_url, model, guidance, unverified=unverified
-        ),
-    }
+    return _provider_terminal_result(
+        {
+            "final_response": final,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "failed": True,
+            "error": summary,
+            "failure_reason": classified.reason.value,
+            # The classifier's own retry verdict — carried so UI surfaces
+            # (agent/error_surface.py) show Retry only when a re-run can differ,
+            # instead of re-deriving retryability from a second taxonomy.
+            "failure_retryable": bool(classified.retryable),
+            # The billing verdict may rest on an ambiguous body (#82154) — carry
+            # that through the structured result, not just the prose.
+            "billing_unverified": unverified,
+            "billing_block": _billing_block_dict(
+                provider, base_url, model, guidance, unverified=unverified
+            ),
+        },
+        reason=classified.reason.value,
+        retryable=bool(classified.retryable),
+        provider=provider,
+        model=model,
+    )
 
 
 def _print_billing_or_entitlement_guidance(
@@ -1445,6 +1477,8 @@ def _content_policy_blocked_result(
     *,
     final_response: str,
     error_detail: str,
+    provider: str = "",
+    model: str = "",
 ) -> Dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
@@ -1454,14 +1488,22 @@ def _content_policy_blocked_result(
     turn carrying the user-facing message and a ``content_policy_blocked:``
     prefixed error — so they funnel through this one builder.
     """
-    return {
-        "final_response": final_response,
-        "messages": messages,
-        "api_calls": api_call_count,
-        "completed": False,
-        "failed": True,
-        "error": f"content_policy_blocked: {error_detail}",
-    }
+    return _provider_terminal_result(
+        {
+            "final_response": final_response,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "failed": True,
+            "error": f"content_policy_blocked: {error_detail}",
+            "failure_reason": FailoverReason.content_policy_blocked.value,
+            "failure_retryable": False,
+        },
+        reason=FailoverReason.content_policy_blocked.value,
+        retryable=False,
+        provider=provider,
+        model=model,
+    )
 
 
 def _compression_deferred_result(
@@ -2948,11 +2990,12 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
-                        # No fallback available — surface buffered context
-                        # so user sees the rate-limit message that led here.
-                        agent._flush_status_buffer()
+                        # No fallback available. The typed terminal result is
+                        # the only human-chat failure rail; keep buffered retry
+                        # detail local so it cannot precede the final bubble.
+                        agent._clear_status_buffer()
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _provider_terminal_result({
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
                                 "No fallback provider available. "
@@ -2964,7 +3007,11 @@ def run_conversation(
                             "completed": False,
                             "failed": True,
                             "error": _nous_msg,
-                        }
+                            "failure_reason": FailoverReason.rate_limit.value,
+                            "failure_retryable": True,
+                        }, reason=FailoverReason.rate_limit.value,
+                            retryable=True, provider="nous",
+                            model=str(agent.model or ""))
                 except ImportError:
                     pass
                 except Exception:
@@ -3511,18 +3558,26 @@ def run_conversation(
                             break
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
-                        agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Max retries ({max_retries}) "
+                            "exceeded for invalid responses. Giving up.",
+                            force=True,
+                        )
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
-                        return {
+                        return _provider_terminal_result({
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
                             "error": _final_response,
-                            "failed": True  # Mark as failure for filtering
-                        }
+                            "failed": True,
+                            "failure_reason": "invalid_response",
+                            "failure_retryable": False,
+                        }, reason="invalid_response", retryable=False,
+                            provider=str(agent.provider or ""),
+                            model=str(agent.model or ""))
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
@@ -3700,8 +3755,10 @@ def run_conversation(
                         agent.log_prefix, agent.model, agent.provider,
                         _refusal_log or "(no text)",
                     )
-                    agent._emit_status(
-                        "⚠️ The model declined to respond to this request (safety refusal)."
+                    agent._vprint(
+                        f"{agent.log_prefix}The model declined to respond "
+                        "to this request (safety refusal).",
+                        force=True,
                     )
 
                     _refusal_detail = (
@@ -3723,6 +3780,8 @@ def run_conversation(
                         api_call_count,
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
+                        provider=str(agent.provider or ""),
+                        model=str(agent.model or ""),
                     )
 
                 if finish_reason == "length":
@@ -6231,21 +6290,9 @@ def run_conversation(
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
                     _nonretryable_summary = agent._summarize_api_error(api_error)
-                    if classified.reason == FailoverReason.content_policy_blocked:
-                        agent._emit_status(
-                            f"❌ Provider safety filter blocked this request: "
-                            f"{_nonretryable_summary}"
-                        )
-                    elif classified.reason == FailoverReason.ssl_cert_verification:
-                        agent._emit_status(
-                            f"❌ TLS certificate verification failed: "
-                            f"{_nonretryable_summary}"
-                        )
-                    else:
-                        agent._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{_nonretryable_summary}"
-                        )
+                    # The structured result below is the sole human-chat
+                    # terminal rail. Keep the detailed failure local instead
+                    # of duplicating it through the legacy status callback.
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
@@ -6378,6 +6425,8 @@ def run_conversation(
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
+                            provider=_provider,
+                            model=_model,
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
@@ -6393,14 +6442,18 @@ def run_conversation(
                             base_url=_base,
                             model=_model,
                         )
-                    return {
+                    return _provider_terminal_result({
                         "final_response": _nonretryable_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
-                    }
+                        "failure_reason": classified.reason.value,
+                        "failure_retryable": bool(classified.retryable),
+                    }, reason=classified.reason.value,
+                        retryable=bool(classified.retryable),
+                        provider=_provider, model=_model)
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
@@ -6436,14 +6489,6 @@ def run_conversation(
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
-                        if classified.billing_unverified:
-                            # Ambiguous body (#82154) — hedge the terminal line.
-                            agent._emit_status(
-                                "❌ Provider reported usage/credit exhaustion "
-                                f"(unverified — may be a content-filter rejection) — {_final_summary}"
-                            )
-                        else:
-                            agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
@@ -6459,10 +6504,6 @@ def run_conversation(
                             model=_model,
                             unverified=classified.billing_unverified,
                         )
-                    elif is_rate_limited:
-                        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
-                    else:
-                        agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                     agent._vprint(f"{agent.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                     # Detect SSE stream-drop pattern (e.g. "Network
@@ -6604,7 +6645,7 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
-                    return {
+                    return _provider_terminal_result({
                         "final_response": _final_response,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -6626,7 +6667,9 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
-                    }
+                    }, reason=classified.reason.value,
+                        retryable=bool(classified.retryable),
+                        provider=_provider, model=_model)
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
