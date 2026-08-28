@@ -1608,6 +1608,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 }
                 for candidate in ordered_items
             ]
+            addressed_anchors = {
+                candidate.reply_to_message_id for candidate in ordered_items
+                if candidate.reply_to_is_own_message and candidate.reply_to_message_id
+            }
+            if len(addressed_anchors) > 1:
+                # A merged album cannot safely reply to two different bot
+                # messages. Retain evidence but deliberately send unthreaded.
+                event.reply_to_message_id = None
+                event.reply_to_text = None
+                event.reply_to_author_id = None
+                event.reply_to_is_own_message = False
+                event.metadata["whatsapp_album_conflicting_reply_anchors"] = True
             all_urls = [url for candidate in ordered_items for url in candidate.media_urls]
             all_types = [kind for candidate in ordered_items for kind in candidate.media_types]
             captions = [candidate.text for candidate in ordered_items if candidate.text]

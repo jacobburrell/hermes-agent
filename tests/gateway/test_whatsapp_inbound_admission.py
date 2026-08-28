@@ -139,6 +139,36 @@ async def test_unanchored_photo_burst_is_one_operational_envelope():
     assert handled.await_args.args[0].text == "\n".join(map(str, range(7)))
 
 
+@pytest.mark.asyncio
+async def test_drop_never_builds_caches_reads_or_dispatches():
+    adapter = _adapter()
+    adapter._build_message_event = AsyncMock()
+    adapter._send_read_receipt = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    await adapter._process_inbound_data(_data(chatId="not-approved@g.us"))
+    adapter._build_message_event.assert_not_awaited()
+    adapter._send_read_receipt.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conflicting_album_reply_anchors_are_deliberately_unthreaded():
+    adapter = _adapter()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    raw = {"isGroup": True, "chatId": "group@g.us", "albumId": "same-album", "botIds": ["bot"], "mentionedIds": ["bot"]}
+    for anchor in ("bot-one", "bot-two"):
+        adapter._enqueue_group_media_event(
+            MessageEvent("caption", MessageType.PHOTO, source=source, raw_message=raw,
+                         reply_to_message_id=anchor, reply_to_is_own_message=True), "operate"
+        )
+    await asyncio.sleep(0.42)
+    event = handled.await_args.args[0]
+    assert event.reply_to_message_id is None
+    assert event.metadata["whatsapp_album_conflicting_reply_anchors"] is True
+
+
 def test_observed_context_neutralizes_reserved_headers_and_newlines():
     adapter = _adapter()
     source = adapter.build_source("group@g.us", "Group", "group", "member", "Evil\nName")
