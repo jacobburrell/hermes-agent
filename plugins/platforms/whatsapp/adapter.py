@@ -403,6 +403,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     - group_policy: "open" | "allowlist" | "disabled" | "pairing" — which groups are processed (default: "pairing")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
     - send_read_receipts: Mark accepted inbound WhatsApp messages as read
+    - observed_group_context_limit: Per-group observed entries (default: 20)
+    - observed_group_context_bytes: Per-group observed bytes (default: 8192)
+    - observed_group_context_ttl_seconds: Observed context lifetime (default: 900)
+    - observed_group_context_global_keys: Maximum inactive group buffers (default: 128)
+    - observed_group_context_global_bytes: Maximum bytes across group buffers (default: 131072)
 
     Behavior (gating, mention parsing, markdown conversion, chunking) is
     provided by ``WhatsAppBehaviorMixin`` so the Cloud API adapter can
