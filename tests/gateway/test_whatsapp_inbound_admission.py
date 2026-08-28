@@ -306,6 +306,22 @@ async def test_ingress_later_mention_pattern_promotes_album():
     handled.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_album_item_audit_retains_ordered_media_reply_and_receipt_fields():
+    adapter = _adapter()
+    handled = AsyncMock(); adapter.handle_message = handled
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    raw = {"isGroup": True, "chatId": "group@g.us", "albumId": "audit", "botIds": ["bot"], "mentionedIds": ["bot"], "readReceiptKey": {"id": "r"}}
+    event = MessageEvent("caption", MessageType.PHOTO, source=source, raw_message=raw,
+                         message_id="m", media_urls=["/cache/p.jpg"], media_types=["image/jpeg"],
+                         reply_to_message_id="botmsg", reply_to_text="quoted", reply_to_author_id="bot", reply_to_is_own_message=True)
+    adapter._enqueue_group_media_event(event, "operate")
+    await asyncio.sleep(0.42)
+    item = handled.await_args.args[0].metadata["whatsapp_album_items"][0]
+    assert item["media_urls"] == ["/cache/p.jpg"] and item["reply_to_text"] == "quoted"
+    assert item["read_receipt_key"] == {"id": "r"}
+
+
 def test_observed_sidecar_is_api_only_and_does_not_rewrite_addressed_text():
     addressed = "@bot reconcile the invoice"
     event = SimpleNamespace(metadata={"observed_group_context": "[Member] ambient payment discussion"})
