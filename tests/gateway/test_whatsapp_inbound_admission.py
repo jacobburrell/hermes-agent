@@ -276,6 +276,23 @@ async def test_later_operational_album_item_promotes_merged_caption():
     handled.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_ingress_later_slash_promotes_album_and_reads_each_item():
+    adapter = _adapter()
+    adapter._send_read_receipt = AsyncMock()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    first = _data("ambient", hasMedia=True, mediaType="image", albumId="ingress", readReceiptKey={"id": "one"})
+    second = _data("/help", hasMedia=True, mediaType="image", albumId="ingress", readReceiptKey={"id": "two"})
+    await adapter._process_inbound_data(first)
+    await adapter._process_inbound_data(second)
+    await asyncio.sleep(0.42)
+    handled.assert_awaited_once()
+    assert adapter._send_read_receipt.await_count == 2
+    items = handled.await_args.args[0].metadata["whatsapp_album_items"]
+    assert [item["read_receipt_key"]["id"] for item in items] == ["one", "two"]
+
+
 def test_observed_sidecar_is_api_only_and_does_not_rewrite_addressed_text():
     addressed = "@bot reconcile the invoice"
     event = SimpleNamespace(metadata={"observed_group_context": "[Member] ambient payment discussion"})
