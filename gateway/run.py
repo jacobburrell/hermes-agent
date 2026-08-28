@@ -12666,6 +12666,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata={"gateway_resume_pending_replay": True},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -19515,10 +19516,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(metadata, dict)
             else ""
         )
+        is_synthetic_resume_replay = bool(
+            getattr(event, "internal", False)
+            and isinstance(metadata, dict)
+            and metadata.get("gateway_resume_pending_replay") is True
+        )
+        # A real message arriving while resume_pending is still set is a NEW
+        # turn, even when it lacks a provider message id. Only the scheduler's
+        # marked internal replay may reuse the interrupted turn's tombstone.
         setattr(
             event,
             "_runtime_notice_run_id",
-            explicit_notice_turn_id or recovered_notice_turn_id or token,
+            explicit_notice_turn_id
+            or (recovered_notice_turn_id if is_synthetic_resume_replay else None)
+            or token,
         )
         return True
 

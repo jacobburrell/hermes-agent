@@ -309,7 +309,7 @@ async def test_two_runners_recover_no_message_id_turn_and_dedupe(
     ) is None
     assert first_store.recover_interrupted_turns() == 1
 
-    # A fresh runner receives a reconstructed object for the same logical
+    # A fresh runner receives the scheduler's synthetic replay for the same
     # no-message-id turn. Its default adapter-arrival timestamp is different;
     # the persisted session recovery id, not timestamp equality, suppresses a
     # second terminal send.
@@ -318,7 +318,15 @@ async def test_two_runners_recover_no_message_id_turn_and_dedupe(
     second_store = SessionStore(sessions_dir, second.config)
     second_store._db = None
     second.session_store = second_store
-    reconstructed = _event(message_id=None)
+    second._run_startup_resume_event = AsyncMock()
+    with patch("gateway.restart_loop_guard.check_and_record", return_value=False):
+        assert second._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    reconstructed = second._run_startup_resume_event.await_args.args[1]
+    assert reconstructed.internal is True
+    assert reconstructed.text == ""
+    assert reconstructed.metadata["gateway_resume_pending_replay"] is True
+    second._release_running_agent_state(SESSION_KEY)
     assert reconstructed.timestamp != first_event.timestamp
     assert await second._handle_message_with_agent(
         reconstructed, reconstructed.source, SESSION_KEY, 1
@@ -327,6 +335,47 @@ async def test_two_runners_recover_no_message_id_turn_and_dedupe(
     expected = canonical_human_terminal_content(_agent_result()["runtime_notice"])
     assert len(first_adapter.calls_with_content(expected)) == 1
     assert second_adapter.calls_with_content(expected) == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_resume_then_real_no_id_message_gets_fresh_terminal_run(
+    monkeypatch, tmp_path
+) -> None:
+    home = tmp_path / "profile"
+    sessions_dir = home / "sessions"
+    first_adapter = TransportSpy()
+    first = _runner(monkeypatch, home, first_adapter)
+    first_store = SessionStore(sessions_dir, first.config)
+    first_store._db = None
+    first_store.get_or_create_session(_source())
+    first.session_store = first_store
+    interrupted = _event(message_id=None)
+    assert await first._handle_message_with_agent(
+        interrupted, interrupted.source, SESSION_KEY, 1
+    ) is None
+    interrupted_run_id = interrupted._runtime_notice_run_id
+    assert first_store.recover_interrupted_turns() == 1
+
+    # Startup cannot schedule the synthetic replay while the adapter is down.
+    # A later real human event is a new logical turn even though the session is
+    # still resume-pending, so it must not inherit the interrupted tombstone.
+    resumed = _runner(monkeypatch, home, None)
+    resumed_store = SessionStore(sessions_dir, resumed.config)
+    resumed_store._db = None
+    resumed.session_store = resumed_store
+    with patch("gateway.restart_loop_guard.check_and_record", return_value=False):
+        assert resumed._schedule_resume_pending_sessions() == 0
+
+    resumed_adapter = TransportSpy()
+    resumed.adapters = {Platform.WHATSAPP: resumed_adapter}
+    real_event = _event(message_id=None)
+    assert await resumed._handle_message_with_agent(
+        real_event, real_event.source, SESSION_KEY, 1
+    ) is None
+
+    expected = canonical_human_terminal_content(_agent_result()["runtime_notice"])
+    assert real_event._runtime_notice_run_id != interrupted_run_id
+    assert len(resumed_adapter.calls_with_content(expected)) == 1
 
 
 @pytest.mark.asyncio
