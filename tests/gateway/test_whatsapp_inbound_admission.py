@@ -293,6 +293,19 @@ async def test_ingress_later_slash_promotes_album_and_reads_each_item():
     assert [item["read_receipt_key"]["id"] for item in items] == ["one", "two"]
 
 
+@pytest.mark.asyncio
+async def test_ingress_later_mention_pattern_promotes_album():
+    adapter = _adapter()
+    adapter._mention_patterns = [__import__("re").compile(r"wake", __import__("re").I)]
+    adapter._send_read_receipt = AsyncMock()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    await adapter._process_inbound_data(_data("ambient", hasMedia=True, mediaType="image", albumId="pattern"))
+    await adapter._process_inbound_data(_data("wake now", hasMedia=True, mediaType="image", albumId="pattern"))
+    await asyncio.sleep(0.42)
+    handled.assert_awaited_once()
+
+
 def test_observed_sidecar_is_api_only_and_does_not_rewrite_addressed_text():
     addressed = "@bot reconcile the invoice"
     event = SimpleNamespace(metadata={"observed_group_context": "[Member] ambient payment discussion"})
