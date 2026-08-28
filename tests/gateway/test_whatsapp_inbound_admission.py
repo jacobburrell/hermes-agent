@@ -10,6 +10,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import _observed_context_api_and_persisted_message
+from tests.gateway.test_internal_notification_marker_82888 import _bootstrap as _runner_bootstrap, _source as _runner_source
 
 
 def _adapter():
@@ -201,6 +202,17 @@ def test_observed_context_global_lru_evicts_inactive_chats():
     adapter._observe_group_event(MessageEvent("two", source=second))
     assert len(adapter._observed_group_context) == 1
     assert next(iter(adapter._observed_group_context)).endswith(":two@g.us")
+
+
+@pytest.mark.asyncio
+async def test_runner_handoff_keeps_observed_context_provider_only(monkeypatch, tmp_path):
+    runner = _runner_bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": [], "tools": [], "history_offset": 0, "last_prompt_tokens": 0})
+    event = MessageEvent("addressed request", source=_runner_source(), metadata={"observed_group_context": "[Member] ambient"})
+    await runner._handle_message_with_agent(event, _runner_source(), "agent:main:telegram:group:-1001:12345", 1)
+    assert "ambient" not in runner.hooks.emit.await_args_list[0].args[1].get("message", "")
+    assert "ambient" in runner._run_agent.await_args.kwargs["message"]
+    assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed request"
 
 
 def test_observed_context_neutralizes_reserved_headers_and_newlines():
