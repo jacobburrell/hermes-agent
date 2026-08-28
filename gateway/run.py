@@ -21247,7 +21247,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _observed_persisted_message is not None:
                     # The observed buffer is API-only: persist precisely the
                     # addressed turn, never ambient group chatter.
-                    persist_user_message = _observed_persisted_message
+                    persist_user_message, _ = _strip_msg_ts(
+                        _observed_persisted_message, tz=_evt_tz
+                    )
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
