@@ -218,6 +218,17 @@ def test_observed_context_global_lru_evicts_inactive_chats():
     assert next(iter(adapter._observed_group_context)).endswith(":two@g.us")
 
 
+def test_observed_context_global_ttl_and_byte_sweep():
+    adapter = _adapter()
+    adapter._observed_group_context_global_bytes = 20
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    adapter._observe_group_event(MessageEvent("x" * 80, source=source))
+    assert not adapter._observed_group_context
+    adapter._observe_group_event(MessageEvent("short", source=source))
+    adapter._sweep_observed_group_context(now=__import__("time").monotonic() + adapter._observed_group_context_ttl_seconds + 1)
+    assert not adapter._observed_group_context
+
+
 @pytest.mark.asyncio
 async def test_runner_handoff_keeps_observed_context_provider_only(monkeypatch, tmp_path):
     runner = _runner_bootstrap(monkeypatch, tmp_path)

@@ -183,6 +183,21 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
     assert __import__("os").environ["WHATSAPP_GROUP_ALLOWED_USERS"] == "120363001234567890@g.us"
 
 
+def test_config_bridges_whatsapp_observed_context_bounds(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"; home.mkdir()
+    (home / "config.yaml").write_text(
+        "whatsapp:\n  observed_group_context_limit: 3\n  observed_group_context_bytes: 512\n"
+        "  observed_group_context_ttl_seconds: 60\n  observed_group_context_global_keys: 4\n  observed_group_context_global_bytes: 2048\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = load_gateway_config()
+    extra = config.platforms[Platform.WHATSAPP].extra
+    assert {key: extra[key] for key in (
+        "observed_group_context_limit", "observed_group_context_bytes", "observed_group_context_ttl_seconds",
+        "observed_group_context_global_keys", "observed_group_context_global_bytes",
+    )} == {"observed_group_context_limit": 3, "observed_group_context_bytes": 512, "observed_group_context_ttl_seconds": 60, "observed_group_context_global_keys": 4, "observed_group_context_global_bytes": 2048}
+
+
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---
 
 
@@ -228,5 +243,4 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
 
