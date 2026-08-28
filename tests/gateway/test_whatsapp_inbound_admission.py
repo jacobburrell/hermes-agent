@@ -9,7 +9,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import _wrap_current_message_with_observed_context
+from gateway.run import _observed_context_api_and_persisted_message
 
 
 def _adapter():
@@ -141,14 +141,15 @@ async def test_unanchored_photo_burst_is_one_operational_envelope():
 
 def test_observed_sidecar_is_api_only_and_does_not_rewrite_addressed_text():
     addressed = "@bot reconcile the invoice"
-    api = _wrap_current_message_with_observed_context(
-        addressed, "[Member] ambient payment discussion"
+    event = SimpleNamespace(metadata={"observed_group_context": "[Member] ambient payment discussion"})
+    api, persisted = _observed_context_api_and_persisted_message(
+        addressed, event
     )
     assert api.endswith(addressed)
     assert "ambient payment discussion" in api
     # The event's persisted content is the separate addressed string, not the
     # API-only envelope passed to the provider.
-    assert addressed not in ("[Member] ambient payment discussion",)
+    assert persisted == addressed
 
 
 @pytest.mark.asyncio
