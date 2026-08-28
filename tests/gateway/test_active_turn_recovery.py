@@ -78,9 +78,11 @@ def test_active_turn_fields_round_trip_and_legacy_payload_defaults(tmp_path):
     restored = SessionEntry.from_dict(payload)
     assert restored.active_turn_token == token
     assert restored.active_turn_started_at is not None
+    assert restored.resume_notice_turn_id is None
 
     payload.pop("active_turn_token")
     payload.pop("active_turn_started_at")
+    payload.pop("resume_notice_turn_id")
     legacy = SessionEntry.from_dict(payload)
     assert legacy.active_turn_token is None
     assert legacy.active_turn_started_at is None
@@ -124,6 +126,7 @@ def test_active_turn_clear_is_compare_and_swap(tmp_path):
     current = _entry_for(store, source)
     assert current.active_turn_token is None
     assert current.active_turn_started_at is None
+    assert current.resume_notice_turn_id is None
 
 
 def test_mark_and_clear_use_single_entry_persistence(tmp_path):
@@ -281,7 +284,7 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
     assert recovered.last_resume_marked_at > datetime.now() - timedelta(seconds=5)
     assert recovered.active_turn_token is None
     assert recovered.active_turn_started_at is None
-    assert token
+    assert recovered.resume_notice_turn_id == token
 
 
 def test_suspended_active_turn_is_cleared_without_resume(tmp_path):

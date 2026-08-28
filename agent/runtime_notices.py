@@ -10,6 +10,7 @@ CLI/TUI consumers, and the messaging gateway.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -76,10 +77,14 @@ _STABLE_PROVIDER_REASONS = frozenset(
         "content_policy_blocked",
         "format_error",
         "invalid_response",
-        "output_truncated",
         "unknown",
     }
 )
+
+_STABLE_CODE_RE = re.compile(
+    r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}\Z"
+)
+_MAX_STABLE_CODE_LENGTH = 80
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +109,12 @@ class AgentRuntimeNotice:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, NoticeKind):
             raise TypeError("kind must be a NoticeKind")
-        if not isinstance(self.code, str) or not self.code.strip():
-            raise ValueError("notice code must be a non-empty stable string")
+        if (
+            not isinstance(self.code, str)
+            or len(self.code) > _MAX_STABLE_CODE_LENGTH
+            or _STABLE_CODE_RE.fullmatch(self.code) is None
+        ):
+            raise ValueError("notice code must be a bounded stable identifier")
         if self.kind is NoticeKind.TERMINAL_FAILURE and self.failure_category is None:
             raise ValueError("terminal_failure notices require failure_category")
 

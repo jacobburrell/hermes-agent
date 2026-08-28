@@ -27,6 +27,7 @@ from typing import Optional
 
 
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+_DEAD_OWNER_GRACE_SECONDS = 5 * 60
 _MAX_ROWS = 1_000
 _SCHEMA_LOCK = threading.Lock()
 
@@ -41,6 +42,7 @@ class ReservationState(str, Enum):
 class ReserveOutcome(str, Enum):
     ACQUIRED = "acquired"
     ALREADY_DELIVERED = "already_delivered"
+    CAPACITY_EXHAUSTED = "capacity_exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +147,7 @@ class TerminalNoticeLedger:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._prune_locked(conn, now)
             row = conn.execute(
                 """SELECT state, owner_pid, owner_started_at
                    FROM terminal_notice_deliveries
@@ -201,6 +204,14 @@ class TerminalNoticeLedger:
                     ),
                 )
             else:
+                row_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM terminal_notice_deliveries"
+                    ).fetchone()[0]
+                )
+                if row_count >= _MAX_ROWS:
+                    conn.commit()
+                    return Reservation(ReserveOutcome.CAPACITY_EXHAUSTED)
                 conn.execute(
                     """INSERT INTO terminal_notice_deliveries
                        (session_key, run_id, code, state, state_applied, content,
@@ -221,7 +232,6 @@ class TerminalNoticeLedger:
                         now,
                     ),
                 )
-            self._prune_locked(conn, now)
             conn.commit()
             return Reservation(ReserveOutcome.ACQUIRED, token)
         except Exception:
@@ -379,6 +389,32 @@ class TerminalNoticeLedger:
 
     @staticmethod
     def _prune_locked(conn: sqlite3.Connection, now: float) -> None:
+        stale_active = conn.execute(
+            """SELECT rowid, state, owner_pid, owner_started_at
+               FROM terminal_notice_deliveries
+               WHERE updated_at < ? AND state IN (?, ?)""",
+            (
+                now - _DEAD_OWNER_GRACE_SECONDS,
+                ReservationState.RESERVED.value,
+                ReservationState.IN_FLIGHT.value,
+            ),
+        ).fetchall()
+        for rowid, state, owner_pid, owner_started_at in stale_active:
+            if _owner_alive(owner_pid, owner_started_at):
+                continue
+            if state == ReservationState.RESERVED.value:
+                conn.execute(
+                    "DELETE FROM terminal_notice_deliveries WHERE rowid=?",
+                    (rowid,),
+                )
+            else:
+                # A dead in-flight owner may have lost the platform ACK. Keep a
+                # protected tombstone; never convert it into a resend path.
+                conn.execute(
+                    """UPDATE terminal_notice_deliveries
+                       SET state=?, updated_at=? WHERE rowid=?""",
+                    (ReservationState.AMBIGUOUS.value, now, rowid),
+                )
         conn.execute(
             """DELETE FROM terminal_notice_deliveries
                WHERE updated_at < ? AND state IN (?, ?)""",
@@ -388,23 +424,9 @@ class TerminalNoticeLedger:
                 ReservationState.AMBIGUOUS.value,
             ),
         )
-        row_count = conn.execute(
-            "SELECT COUNT(*) FROM terminal_notice_deliveries"
-        ).fetchone()[0]
-        excess = max(int(row_count) - _MAX_ROWS, 0)
-        if excess:
-            conn.execute(
-                """DELETE FROM terminal_notice_deliveries WHERE rowid IN (
-                       SELECT rowid FROM terminal_notice_deliveries
-                       WHERE state IN (?, ?)
-                       ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (
-                    ReservationState.SENT.value,
-                    ReservationState.AMBIGUOUS.value,
-                    int(excess),
-                ),
-            )
+        # Capacity is enforced at admission. Never evict a SENT/AMBIGUOUS
+        # tombstone younger than the retention window merely to make room: that
+        # would turn an operational cap into a replay bug after restart.
 
 
 __all__ = [

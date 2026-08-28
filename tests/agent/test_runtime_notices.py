@@ -91,6 +91,16 @@ def test_unknown_reason_collapses_to_bounded_code_and_category() -> None:
     assert notice.failure_category is FailureCategory.PROVIDER
 
 
+def test_output_truncation_is_not_claimed_by_provider_terminal_vertical() -> None:
+    notice = provider_terminal_notice(
+        reason="output_truncated",
+        message="first response truncated",
+        retryable=False,
+    )
+
+    assert notice.code == "provider.unknown"
+
+
 def test_terminal_failure_requires_category() -> None:
     with pytest.raises(ValueError, match="require failure_category"):
         AgentRuntimeNotice(
@@ -100,7 +110,7 @@ def test_terminal_failure_requires_category() -> None:
         )
 
 
-def test_notice_requires_enum_kind_and_nonempty_stable_code() -> None:
+def test_notice_requires_enum_kind_and_bounded_stable_code() -> None:
     with pytest.raises(TypeError, match="NoticeKind"):
         AgentRuntimeNotice(
             kind="terminal_failure",  # type: ignore[arg-type]
@@ -108,8 +118,21 @@ def test_notice_requires_enum_kind_and_nonempty_stable_code() -> None:
             message="failed",
             failure_category=FailureCategory.PROVIDER,
         )
-    with pytest.raises(ValueError, match="non-empty stable string"):
+    with pytest.raises(ValueError, match="bounded stable identifier"):
         AgentRuntimeNotice(kind=NoticeKind.OPERATOR_NOTICE, code=" ", message="x")
+    for code in ("provider.ERROR", "provider.rate-limit", "provider.x\nsecret"):
+        with pytest.raises(ValueError, match="bounded stable identifier"):
+            AgentRuntimeNotice(
+                kind=NoticeKind.OPERATOR_NOTICE,
+                code=code,
+                message="x",
+            )
+    with pytest.raises(ValueError, match="bounded stable identifier"):
+        AgentRuntimeNotice(
+            kind=NoticeKind.OPERATOR_NOTICE,
+            code=f"provider.{'x' * 80}",
+            message="x",
+        )
 
 
 def test_billing_result_builder_emits_typed_terminal_notice() -> None:

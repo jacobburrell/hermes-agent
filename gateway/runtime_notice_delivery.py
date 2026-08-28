@@ -17,13 +17,10 @@ import copy
 import hashlib
 import logging
 import threading
-import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
-
-import yaml
 
 from agent.runtime_notices import AgentRuntimeNotice, FailureCategory, NoticeKind
 from gateway.runtime_notice_ledger import (
@@ -162,15 +159,21 @@ class RuntimeNoticeConfigStore:
 
     def load(self, profile_home: Path) -> LoadedNoticeConfig:
         path = Path(profile_home) / "config.yaml"
-        user, user_valid = self._read_mapping(path)
+        user, user_valid, user_present = self._read_mapping(path)
         managed, managed_valid, managed_present = self._read_managed_mapping()
 
-        # A valid managed mapping can be the sole policy source. A malformed
-        # managed file cannot erase the prior combined policy.
-        current_valid = user_valid or (managed_present and managed_valid)
-        if managed_present and not managed_valid:
-            current_valid = False
         key = str(path.resolve(strict=False))
+        # Missing user config is a valid absent layer when an administrator
+        # supplies a managed mapping. A present malformed/non-mapping user
+        # layer, or malformed managed layer, must retain the prior COMBINED
+        # policy rather than rebuilding from the other valid layer alone.
+        invalid_user_layer = user_present and not user_valid
+        invalid_managed_layer = managed_present and not managed_valid
+        current_valid = (
+            not invalid_user_layer
+            and not invalid_managed_layer
+            and (user_valid or (managed_present and managed_valid))
+        )
         if not current_valid:
             with self._lock:
                 previous = copy.deepcopy(self._last_good.get(key))
@@ -185,10 +188,10 @@ class RuntimeNoticeConfigStore:
 
                 merged = _expand_env_vars(merged)
                 merged = _deep_merge(merged, _expand_env_vars(managed))
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "runtime notice config overlay failed: source=managed",
-                    exc_info=True,
+                    "runtime notice config overlay failed: source=managed error_class=%s",
+                    type(exc).__name__[:80],
                 )
                 with self._lock:
                     previous = copy.deepcopy(self._last_good.get(key))
@@ -207,21 +210,19 @@ class RuntimeNoticeConfigStore:
         return LoadedNoticeConfig(merged, True)
 
     @staticmethod
-    def _read_mapping(path: Path) -> tuple[dict, bool]:
+    def _read_mapping(path: Path) -> tuple[dict, bool, bool]:
         try:
-            if not path.is_file():
-                return {}, False
-            with path.open(encoding="utf-8") as handle:
-                parsed = yaml.safe_load(handle)
-            if not isinstance(parsed, dict):
-                return {}, False
-            return parsed, True
-        except Exception:
+            from hermes_cli.config import read_user_config_raw
+
+            present = path.is_file()
+            parsed, valid = read_user_config_raw(path, return_validity=True)
+            return parsed, valid, present
+        except Exception as exc:
             logger.warning(
-                "runtime notice config read failed: source=user",
-                exc_info=True,
+                "runtime notice config read failed: source=user error_class=%s",
+                type(exc).__name__[:80],
             )
-            return {}, False
+            return {}, False, path.is_file()
 
     @staticmethod
     def _read_managed_mapping() -> tuple[dict, bool, bool]:
@@ -234,15 +235,14 @@ class RuntimeNoticeConfigStore:
             path = Path(managed_dir) / "config.yaml"
             if not path.is_file():
                 return {}, True, False
-            with path.open(encoding="utf-8") as handle:
-                parsed = yaml.safe_load(handle)
-            if not isinstance(parsed, dict):
-                return {}, False, True
-            return parsed, True, True
-        except Exception:
+            from hermes_cli.config import read_user_config_raw
+
+            parsed, valid = read_user_config_raw(path, return_validity=True)
+            return parsed, valid, True
+        except Exception as exc:
             logger.warning(
-                "runtime notice config read failed: source=managed",
-                exc_info=True,
+                "runtime notice config read failed: source=managed error_class=%s",
+                type(exc).__name__[:80],
             )
             return {}, False, True
 
@@ -305,23 +305,34 @@ def canonical_human_terminal_content(notice: AgentRuntimeNotice) -> str:
 
 
 def notice_run_id(event: Any, session_key: str) -> str:
-    """Return a stable run id for platform redelivery of one inbound event."""
+    """Return a genuinely durable identity for one logical inbound turn.
 
-    existing = str(getattr(event, "_runtime_notice_run_id", "") or "")
-    if existing:
-        return existing
+    Provider message ids are the strongest identity. Events without one must
+    already carry the persisted admission/session turn id installed by the
+    runner. ``MessageEvent.timestamp`` is deliberately ignored: its default is
+    local arrival time and changes when an adapter reconstructs the event.
+    """
+
     message_id = str(getattr(event, "message_id", "") or "").strip()
     if message_id:
-        value = hashlib.sha256(
+        return hashlib.sha256(
             f"{session_key}|{message_id}".encode("utf-8", "replace")
         ).hexdigest()[:32]
-    else:
-        value = uuid.uuid4().hex
-    try:
-        event._runtime_notice_run_id = value
-    except Exception:
-        pass
-    return value
+
+    existing = str(getattr(event, "_runtime_notice_run_id", "") or "").strip()
+    if existing:
+        return existing
+    metadata = getattr(event, "metadata", None)
+    durable_hint = (
+        str(metadata.get("runtime_notice_turn_id") or "").strip()
+        if isinstance(metadata, dict)
+        else ""
+    )
+    if not durable_hint:
+        raise ValueError("no durable identity for message-id-free runtime notice")
+    return hashlib.sha256(
+        f"{session_key}|durable|{durable_hint}".encode("utf-8", "replace")
+    ).hexdigest()[:32]
 
 
 def transient_notice_default(platform: str, kind: NoticeKind) -> bool:
@@ -347,10 +358,10 @@ async def _best_effort_post_call_transition(method: Any, *args: Any) -> None:
 
     try:
         await asyncio.to_thread(method, *args)
-    except Exception:
+    except Exception as exc:
         logger.error(
-            "runtime notice ledger post-call transition failed",
-            exc_info=True,
+            "runtime notice ledger post-call transition failed: error_class=%s",
+            type(exc).__name__[:80],
         )
 
 
@@ -368,6 +379,11 @@ async def deliver_human_runtime_notice(
     never retried by this helper or after restart.  Only an adapter's explicit
     ``runtime_notice_definitely_not_delivered(result)`` guarantee permits the
     reservation to be released after a returned failure.
+
+    If the bounded ledger contains only protected tombstones, delivery fails
+    before the adapter call and the caller uses its canonical final rail. This
+    preserves terminal visibility but temporarily degrades durable dedupe; the
+    structured ``runtime_notice_dedupe_degraded`` metric log records that state.
     """
 
     platform = str(envelope.platform or "").strip().lower()
@@ -390,6 +406,20 @@ async def deliver_human_runtime_notice(
             return DeliveryOutcome.SUPPRESSED
 
     content = canonical_human_terminal_content(envelope.notice)
+    # Resolve the transport before creating durable suppression state. A
+    # missing adapter is a definite pre-wire failure and must fall back through
+    # the caller's existing final-response rail rather than tombstone silence.
+    adapter = runner._adapter_for_source(source)
+    if adapter is None:
+        logger.warning(
+            "runtime notice delivery: kind=%s code=%s platform=%s outcome=%s",
+            envelope.notice.kind.value,
+            envelope.notice.code,
+            platform,
+            DeliveryOutcome.FAILED.value,
+        )
+        return DeliveryOutcome.FAILED
+
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     ledger = TerminalNoticeLedger(profile_home)
     reservation = await asyncio.to_thread(
@@ -409,19 +439,11 @@ async def deliver_human_runtime_notice(
             DeliveryOutcome.ALREADY_DELIVERED.value,
         )
         return DeliveryOutcome.ALREADY_DELIVERED
-
-    owner = reservation.owner_token
-    adapter = runner._adapter_for_source(source)
-    if adapter is None:
-        await asyncio.to_thread(
-            ledger.release_reserved,
-            envelope.session_key,
-            envelope.run_id,
-            envelope.notice.code,
-            owner,
-        )
+    if reservation.outcome is ReserveOutcome.CAPACITY_EXHAUSTED:
         logger.warning(
-            "runtime notice delivery: kind=%s code=%s platform=%s outcome=%s",
+            "runtime notice delivery: kind=%s code=%s platform=%s outcome=%s "
+            "reason=ledger_capacity metric=runtime_notice_dedupe_degraded "
+            "fallback=canonical_final",
             envelope.notice.kind.value,
             envelope.notice.code,
             platform,
@@ -429,6 +451,7 @@ async def deliver_human_runtime_notice(
         )
         return DeliveryOutcome.FAILED
 
+    owner = reservation.owner_token
     applied = await asyncio.to_thread(
         ledger.mark_state_applied,
         envelope.session_key,
@@ -437,7 +460,14 @@ async def deliver_human_runtime_notice(
         owner,
     )
     if not applied:
-        return DeliveryOutcome.ALREADY_DELIVERED
+        await asyncio.to_thread(
+            ledger.release_reserved,
+            envelope.session_key,
+            envelope.run_id,
+            envelope.notice.code,
+            owner,
+        )
+        return DeliveryOutcome.FAILED
     started = await asyncio.to_thread(
         ledger.mark_in_flight,
         envelope.session_key,
@@ -446,7 +476,14 @@ async def deliver_human_runtime_notice(
         owner,
     )
     if not started:
-        return DeliveryOutcome.ALREADY_DELIVERED
+        await asyncio.to_thread(
+            ledger.release_reserved,
+            envelope.session_key,
+            envelope.run_id,
+            envelope.notice.code,
+            owner,
+        )
+        return DeliveryOutcome.FAILED
 
     metadata = runner._thread_metadata_for_source(source)
     try:

@@ -3362,7 +3362,11 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def read_user_config_raw(
+    config_path: Optional[Path] = None,
+    *,
+    return_validity: bool = False,
+) -> Dict[str, Any] | tuple[Dict[str, Any], bool]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
@@ -3386,16 +3390,20 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         into the environment. These sites must still apply
         ``managed_scope.apply_managed_overlay`` + ``_expand_env_vars``
         inline, which they do.
+      * LAST-KNOWN-GOOD HEALTH PROBES: pass ``return_validity=True`` to
+        distinguish a readable mapping (including ``{}``) from a missing or
+        non-mapping document without creating another raw YAML reader.
 
     Semantics (deliberately mirrors the bare ``open()+yaml.safe_load()``
     pattern this replaces, so migrated sites keep their exact failure
     behavior):
 
-      * missing file → ``{}``
+      * missing file → ``{}`` (and ``False`` with ``return_validity=True``)
       * unparseable YAML / other I/O errors → raises (callers that want
         fail-open already wrap in try/except; callers with last-known-good
         or warn semantics rely on the exception)
-      * non-dict YAML root → ``{}``
+      * non-dict YAML root → ``{}`` (and ``False`` with
+        ``return_validity=True``)
 
     ``config_path`` defaults to :func:`get_config_path` (profile-aware).
     Pass an explicit path when the caller resolves its own home (gateway
@@ -3405,10 +3413,13 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+            parsed = fast_safe_load(f)
     except FileNotFoundError:
-        return {}
-    return data if isinstance(data, dict) else {}
+        result: Dict[str, Any] = {}
+        return (result, False) if return_validity else result
+    valid = isinstance(parsed, dict)
+    result = parsed if valid else {}
+    return (result, valid) if return_validity else result
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:

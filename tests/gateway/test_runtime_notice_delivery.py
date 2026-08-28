@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import gateway.runtime_notice_ledger as runtime_notice_ledger
 from agent.runtime_notices import FailureCategory, NoticeKind, provider_terminal_notice
 from gateway.runtime_notice_delivery import (
     DeliveryOutcome,
@@ -158,6 +159,36 @@ def test_managed_overlay_wins_and_malformed_update_retains_last_good(
     assert first.config["display"]["runtime_notices"] is True
     assert second.from_last_known_good
     assert second.config == first.config
+
+
+@pytest.mark.parametrize("broken_user", ["display: [\n", "- not\n- mapping\n"])
+def test_broken_user_layer_with_valid_managed_retains_combined_last_good(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    broken_user: str,
+) -> None:
+    home = tmp_path / "profile"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    user_path = home / "config.yaml"
+    user_path.write_text(
+        "display:\n  runtime_notices: false\n", encoding="utf-8"
+    )
+    (managed / "config.yaml").write_text(
+        "display:\n  runtime_notice_kinds:\n    terminal_failure: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    store = RuntimeNoticeConfigStore()
+
+    combined = store.load(home)
+    user_path.write_text(broken_user, encoding="utf-8")
+    retained = store.load(home)
+
+    assert combined.config["display"]["runtime_notices"] is False
+    assert retained.valid and retained.from_last_known_good
+    assert retained.config == combined.config
 
 
 def test_missing_and_non_mapping_config_are_invalid_before_first_good(
@@ -334,6 +365,31 @@ async def test_post_call_failure_is_ambiguous_and_never_retried(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_capacity_degradation_is_measured_and_falls_back_before_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_notice_ledger, "_MAX_ROWS", 0)
+    adapter = _Adapter()
+
+    with caplog.at_level("WARNING", logger="gateway.runtime_notice_delivery"):
+        outcome = await deliver_human_runtime_notice(
+            runner=_Runner(adapter),
+            source=SimpleNamespace(chat_id="chat", thread_id=None),
+            envelope=_envelope(run_id="capacity"),
+            profile_home=tmp_path,
+            config_store=RuntimeNoticeConfigStore(),
+        )
+
+    assert outcome is DeliveryOutcome.FAILED
+    assert adapter.calls == []
+    assert "metric=runtime_notice_dedupe_degraded" in caplog.text
+    assert "fallback=canonical_final" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_runtime_notice_logs_exclude_bodies_and_chat_ids(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -432,4 +488,120 @@ def test_dead_inflight_owner_becomes_ambiguous_without_retry(tmp_path: Path) -> 
     assert after_restart.outcome is ReserveOutcome.ALREADY_DELIVERED
     assert ledger.get_state("session", "crashed-run", "provider.timeout") == (
         ReservationState.AMBIGUOUS.value
+    )
+
+
+def test_prune_reclaims_dead_reserved_and_tombstones_dead_inflight(
+    tmp_path: Path,
+) -> None:
+    ledger = TerminalNoticeLedger(tmp_path)
+    reserved = ledger.reserve(
+        session_key="session",
+        run_id="dead-reserved",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    inflight = ledger.reserve(
+        session_key="session",
+        run_id="dead-inflight",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    assert ledger.mark_in_flight(
+        "session", "dead-inflight", "provider.timeout", inflight.owner_token
+    )
+    conn = ledger._connect()
+    try:
+        conn.execute(
+            """UPDATE terminal_notice_deliveries
+               SET owner_pid=-1, owner_started_at=-1, updated_at=0
+               WHERE run_id IN ('dead-reserved', 'dead-inflight')"""
+        )
+    finally:
+        conn.close()
+
+    trigger = ledger.reserve(
+        session_key="session",
+        run_id="trigger",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+
+    assert trigger.outcome is ReserveOutcome.ACQUIRED
+    assert ledger.get_state("session", "dead-reserved", "provider.timeout") is None
+    assert ledger.get_state("session", "dead-inflight", "provider.timeout") == (
+        ReservationState.AMBIGUOUS.value
+    )
+    assert reserved.owner_token
+
+
+def test_capacity_never_evicts_recent_sent_or_ambiguous_tombstones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_notice_ledger, "_MAX_ROWS", 2)
+    ledger = TerminalNoticeLedger(tmp_path)
+    sent = ledger.reserve(
+        session_key="session",
+        run_id="sent",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    assert ledger.mark_in_flight(
+        "session", "sent", "provider.timeout", sent.owner_token
+    )
+    assert ledger.mark_sent("session", "sent", "provider.timeout", sent.owner_token)
+    ambiguous = ledger.reserve(
+        session_key="session",
+        run_id="ambiguous",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    assert ledger.mark_in_flight(
+        "session", "ambiguous", "provider.timeout", ambiguous.owner_token
+    )
+    assert ledger.mark_ambiguous(
+        "session", "ambiguous", "provider.timeout", ambiguous.owner_token
+    )
+
+    blocked = ledger.reserve(
+        session_key="session",
+        run_id="new",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+
+    assert blocked.outcome is ReserveOutcome.CAPACITY_EXHAUSTED
+    assert ledger.get_state("session", "sent", "provider.timeout") == "sent"
+    assert ledger.get_state("session", "ambiguous", "provider.timeout") == (
+        "ambiguous"
+    )
+    conn = ledger._connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM terminal_notice_deliveries"
+        ).fetchone()[0] == 2
+        conn.execute(
+            """UPDATE terminal_notice_deliveries SET updated_at=0
+               WHERE run_id='sent'"""
+        )
+    finally:
+        conn.close()
+
+    admitted_after_retention = ledger.reserve(
+        session_key="session",
+        run_id="new",
+        code="provider.timeout",
+        content="canonical",
+        content_hash="hash",
+    )
+    assert admitted_after_retention.outcome is ReserveOutcome.ACQUIRED
+    assert ledger.get_state("session", "sent", "provider.timeout") is None
+    assert ledger.get_state("session", "ambiguous", "provider.timeout") == (
+        "ambiguous"
     )

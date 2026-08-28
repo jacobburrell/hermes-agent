@@ -805,6 +805,37 @@ def _provider_terminal_result(
     return result
 
 
+_RAW_PROVIDER_STATUS_PLATFORMS = frozenset(
+    {"", "cli", "local", "api_server", "webhook", "msgraph_webhook"}
+)
+
+
+def _finish_provider_terminal_status_buffer(agent) -> None:
+    """Keep retry diagnostics local/raw and silent on human chat surfaces.
+
+    The typed terminal descriptor is the sole human-chat failure rail. CLI and
+    programmatic callers retain the pre-existing detailed retry trace.
+    """
+
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    if platform in _RAW_PROVIDER_STATUS_PLATFORMS:
+        agent._flush_status_buffer()
+    else:
+        agent._clear_status_buffer()
+
+
+def _emit_provider_long_retry_status(agent, status: str) -> None:
+    """Keep long-wait liveness on raw surfaces without human-chat bubbles."""
+
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    if platform in _RAW_PROVIDER_STATUS_PLATFORMS:
+        agent._emit_status(status)
+    else:
+        # Preserve the status for a recovered successful turn, but let the
+        # typed terminal funnel clear it when retries ultimately exhaust.
+        agent._buffer_status(status)
+
+
 def _billing_failure_result(
     *,
     classified,
@@ -2993,7 +3024,7 @@ def run_conversation(
                         # No fallback available. The typed terminal result is
                         # the only human-chat failure rail; keep buffered retry
                         # detail local so it cannot precede the final bubble.
-                        agent._clear_status_buffer()
+                        _finish_provider_terminal_status_buffer(agent)
                         agent._persist_session(messages, conversation_history)
                         return _provider_terminal_result({
                             "final_response": (
@@ -3556,8 +3587,9 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
-                        # Terminal — flush buffered retry trace so user sees what happened.
-                        agent._flush_status_buffer()
+                        # The typed terminal is the only human-chat failure
+                        # rail; CLI/raw surfaces retain the detailed trace.
+                        _finish_provider_terminal_status_buffer(agent)
                         agent._vprint(
                             f"{agent.log_prefix}❌ Max retries ({max_retries}) "
                             "exceeded for invalid responses. Giving up.",
@@ -3743,7 +3775,7 @@ def run_conversation(
                         _retry.restart_with_rebuilt_messages = True
                         break
 
-                    agent._flush_status_buffer()
+                    _finish_provider_terminal_status_buffer(agent)
                     _refusal_log = (
                         _refusal_text[:500] + "..."
                         if len(_refusal_text) > 500
@@ -6280,9 +6312,9 @@ def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
-                    # Terminal — flush buffered context so the user sees
-                    # what was tried before the abort.
-                    agent._flush_status_buffer()
+                    # The typed terminal is the only human-chat failure rail;
+                    # CLI/raw surfaces retain the detailed retry trace.
+                    _finish_provider_terminal_status_buffer(agent)
                     # Summarize once: Cloudflare/proxy HTML challenge pages and
                     # other raw provider bodies must be collapsed to a short
                     # one-liner here, otherwise the full page leaks into the
@@ -6484,8 +6516,9 @@ def run_conversation(
                         _retry.primary_recovery_attempted = False
                         _retry.restart_with_rebuilt_messages = True
                         break
-                    # Terminal — flush buffered retry/fallback trace.
-                    agent._flush_status_buffer()
+                    # The typed terminal is the only human-chat failure rail;
+                    # CLI/raw surfaces retain the detailed retry trace.
+                    _finish_provider_terminal_status_buffer(agent)
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
@@ -6706,10 +6739,10 @@ def run_conversation(
                     _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
-                    # Z.AI Coding waits are different: they can last minutes, so surface
-                    # progress immediately instead of making the TUI look frozen.
+                    # Z.AI Coding waits can last minutes, so raw/interactive surfaces get
+                    # immediate liveness while human chats keep the typed terminal rail.
                     if _backoff_policy == "zai_coding_overload_long":
-                        agent._emit_status(_rate_limit_status)
+                        _emit_provider_long_retry_status(agent, _rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
                 else:

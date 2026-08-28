@@ -861,6 +861,10 @@ class SessionEntry:
     # exact interrupted session instead of guessing from ``updated_at``.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    # Stable identity for a crash-recovered logical turn. The active ownership
+    # token is copied here before recovery clears it, allowing a reconstructed
+    # no-message-id event to reuse the original terminal-notice ledger key.
+    resume_notice_turn_id: Optional[str] = None
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -904,6 +908,7 @@ class SessionEntry:
                 if self.active_turn_started_at
                 else None
             ),
+            "resume_notice_turn_id": self.resume_notice_turn_id,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -952,6 +957,9 @@ class SessionEntry:
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+        resume_notice_turn_id = data.get("resume_notice_turn_id")
+        if not isinstance(resume_notice_turn_id, str) or not resume_notice_turn_id:
+            resume_notice_turn_id = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -997,6 +1005,7 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            resume_notice_turn_id=resume_notice_turn_id,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -3192,6 +3201,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = None
             candidate["active_turn_started_at"] = None
+            candidate["resume_notice_turn_id"] = None
 
             # Keep the live token until the clear is durable.  A failed write
             # therefore remains retryable instead of becoming a false mismatch.
@@ -3202,6 +3212,7 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.resume_notice_turn_id = None
         return True
 
     def recover_interrupted_turns(
@@ -3242,6 +3253,8 @@ class SessionStore:
                     marker_is_stale = True
 
                 if not marker_is_stale and not entry.suspended:
+                    if not entry.resume_notice_turn_id:
+                        entry.resume_notice_turn_id = entry.active_turn_token
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
@@ -3257,6 +3270,8 @@ class SessionStore:
 
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                if marker_is_stale or entry.suspended:
+                    entry.resume_notice_turn_id = None
                 changed = True
 
             if changed:
@@ -3276,6 +3291,7 @@ class SessionStore:
                     continue
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.resume_notice_turn_id = None
                 cleared += 1
             if cleared:
                 self._save()

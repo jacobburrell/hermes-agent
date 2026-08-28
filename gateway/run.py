@@ -19491,8 +19491,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         event: "MessageEvent",
         session_key: str,
+        recovered_notice_turn_id: Optional[str] = None,
     ) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Persist ownership and bind a durable runtime-notice turn id."""
         try:
             token = await self.async_session_store.mark_turn_active(session_key)
         except Exception as exc:
@@ -19508,6 +19509,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # token out of public metadata, transcripts, and platform payloads.
         setattr(event, "_gateway_active_turn_session_key", session_key)
         setattr(event, "_gateway_active_turn_token", token)
+        metadata = getattr(event, "metadata", None)
+        explicit_notice_turn_id = (
+            str(metadata.get("runtime_notice_turn_id") or "").strip()
+            if isinstance(metadata, dict)
+            else ""
+        )
+        setattr(
+            event,
+            "_runtime_notice_run_id",
+            explicit_notice_turn_id or recovered_notice_turn_id or token,
+        )
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
@@ -20099,7 +20111,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+            getattr(session_entry, "resume_notice_turn_id", None),
+        )
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -21337,11 +21353,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # raw provider response remains intact for CLI/API/webhook
                     # callers and server-side diagnostics.
                     response = canonical_human_terminal_content(_candidate_notice)
-            except Exception:
+            except Exception as _notice_exc:
                 logger.error(
-                    "runtime notice preparation failed: platform=%s",
+                    "runtime notice preparation failed: platform=%s error_class=%s",
                     _platform_name,
-                    exc_info=True,
+                    type(_notice_exc).__name__[:80],
                 )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
@@ -21927,6 +21943,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if _typed_terminal_notice is not None:
                 from gateway.runtime_notice_delivery import (
+                    DeliveryOutcome,
                     GatewayNoticeEnvelope,
                     RuntimeNoticeConfigStore,
                     deliver_human_runtime_notice,
@@ -21936,42 +21953,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _notice_home = self._runtime_notice_profile_home_for_source(source)
                 if _notice_home is None:
                     # An unserved profile must never borrow primary policy or
-                    # ledger state. The normal adapter lookup is also
-                    # fail-closed for this source, so there is no safe target.
+                    # ledger state. Return canonical copy through the existing
+                    # final rail; do not create suppression state in another
+                    # profile.
                     logger.error(
                         "runtime notice delivery failed: platform=%s reason=unserved_profile",
                         _platform_name,
                     )
-                    return None
+                    return response
                 _notice_store = getattr(self, "_runtime_notice_config_store", None)
                 if _notice_store is None:
                     _notice_store = RuntimeNoticeConfigStore()
                     self._runtime_notice_config_store = _notice_store
-                _envelope = GatewayNoticeEnvelope(
-                    notice=_typed_terminal_notice,
-                    session_key=session_key,
-                    run_id=notice_run_id(event, session_key),
-                    platform=_platform_name,
-                    chat_type=str(getattr(source, "chat_type", "") or ""),
-                )
                 try:
-                    await deliver_human_runtime_notice(
+                    _notice_run_id = await asyncio.to_thread(
+                        notice_run_id,
+                        event,
+                        session_key,
+                    )
+                    _envelope = GatewayNoticeEnvelope(
+                        notice=_typed_terminal_notice,
+                        session_key=session_key,
+                        run_id=_notice_run_id,
+                        platform=_platform_name,
+                        chat_type=str(getattr(source, "chat_type", "") or ""),
+                    )
+                    _notice_outcome = await deliver_human_runtime_notice(
                         runner=self,
                         source=source,
                         envelope=_envelope,
                         profile_home=_notice_home,
                         config_store=_notice_store,
                     )
-                except Exception:
+                except Exception as _notice_exc:
                     # Delivery has not reached the adapter when the helper
                     # raises: all post-call failures are converted to
                     # AMBIGUOUS internally. Let Base deliver the same canonical
                     # copy through its existing final-response rail.
                     logger.error(
-                        "runtime notice pre-wire delivery failed: platform=%s",
+                        "runtime notice pre-wire delivery failed: platform=%s error_class=%s",
                         _platform_name,
-                        exc_info=True,
+                        type(_notice_exc).__name__[:80],
                     )
+                    return response
+                if _notice_outcome is DeliveryOutcome.FAILED:
                     return response
                 return None
 
@@ -29265,10 +29290,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             try:
                 homes = dict(_multiplex_profile_homes(self.config))
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "runtime notice profile resolution failed: source=multiplex",
-                    exc_info=True,
+                    "runtime notice profile resolution failed: source=multiplex error_class=%s",
+                    type(exc).__name__[:80],
                 )
                 return None
             home = homes.get(requested)
