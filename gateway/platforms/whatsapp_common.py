@@ -388,6 +388,42 @@ class WhatsAppBehaviorMixin:
         return cleaned.strip() or text
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
+        """Compatibility predicate for callers that only understand drop/process."""
+        disposition = self._classify_inbound_message(data)
+        # Preserve the legacy boolean API for external callers.  The adapter
+        # itself uses the three-way classifier and therefore does not dispatch
+        # this compatibility-only ``True`` for observe traffic.
+        return disposition == "operate" or (
+            disposition == "observe" and not self._whatsapp_require_mention()
+        )
+
+    def _classify_inbound_message(self, data: Dict[str, Any]) -> str:
+        """Classify inbound WhatsApp traffic before it can reach gateway state.
+
+        ``drop`` is an authorization/access decision; ``observe`` is approved
+        group chatter retained by the adapter only; and ``operate`` is a real
+        agent request.  Keeping this at the platform edge guarantees observed
+        traffic never enters BasePlatformAdapter's ownership/queue machinery.
+        """
+        if not self._passes_inbound_access_gate(data):
+            return "drop"
+        is_group = data.get("isGroup", False)
+        if not is_group:
+            return "operate"
+        chat_id = str(data.get("chatId") or "")
+        if chat_id in self._whatsapp_free_response_chats():
+            return "operate"
+        body = str(data.get("body") or "").strip()
+        if body.startswith("/") or self._message_is_reply_to_bot(data):
+            return "operate"
+        if self._message_mentions_bot(data) or self._message_matches_mention_patterns(data):
+            return "operate"
+        # Approved group traffic is context-only by default.  The only
+        # deliberate free-response opt-in is the chat allowlist above.
+        return "observe"
+
+    def _passes_inbound_access_gate(self, data: Dict[str, Any]) -> bool:
+        """Return whether payload may be normalized without reaching the agent."""
         chat_id_raw = str(data.get("chatId") or "")
         # WhatsApp uses pseudo-chats for Status updates (Stories) and
         # Channel/Newsletter broadcasts. These are not real conversations
@@ -406,20 +442,7 @@ class WhatsAppBehaviorMixin:
                 return False
             # DMs that pass the policy gate are always processed
             return True
-        # Group messages: check mention / free-response settings
-        chat_id = str(data.get("chatId") or "")
-        if chat_id in self._whatsapp_free_response_chats():
-            return True
-        if not self._whatsapp_require_mention():
-            return True
-        body = str(data.get("body") or "").strip()
-        if body.startswith("/"):
-            return True
-        if self._message_is_reply_to_bot(data):
-            return True
-        if self._message_mentions_bot(data):
-            return True
-        return self._message_matches_mention_patterns(data)
+        return True
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:

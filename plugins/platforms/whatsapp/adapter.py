@@ -22,10 +22,12 @@ import platform
 import re
 import signal
 import subprocess
+import time
+from collections import defaultdict, deque
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Deque, Dict, Optional, Any
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (
@@ -486,6 +488,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Adapter-local observed context intentionally never enters a session
+        # transcript.  It is attached only to the next addressed group event.
+        self._observed_group_context: Dict[str, Deque[str]] = defaultdict(deque)
+        self._observed_group_context_limit = max(
+            1, int(config.extra.get("observed_group_context_limit", 20) or 20)
+        )
+        self._pending_album_batches: Dict[str, list[tuple[MessageEvent, str]]] = {}
+        self._pending_album_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_album_started: Dict[str, float] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -1346,16 +1357,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not
-                                # delay message dispatch (matches BlueBubbles
-                                # asyncio.create_task pattern for mark_read).
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                            await self._process_inbound_data(msg_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1367,6 +1369,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
+
+    async def _process_inbound_data(self, msg_data: Dict[str, Any]) -> None:
+        """Run one bridge payload through the admission edge and dispatch path."""
+        # Security/access is evaluated before normalization, caching, debounce,
+        # or any Base adapter state.  Address classification intentionally
+        # follows normalization so album members share one complete payload.
+        if not self._passes_inbound_access_gate(msg_data):
+            return
+        event = await self._build_message_event(msg_data, admission="observe")
+        if not event:
+            return
+        disposition = self._classify_inbound_message(msg_data)
+        # Fire-and-forget: a slow bridge /read must not delay message dispatch.
+        asyncio.create_task(self._send_read_receipt(msg_data))
+        if event.source.chat_type == "group" and event.message_type != MessageType.TEXT:
+            self._enqueue_group_media_event(event, disposition)
+        elif disposition == "observe":
+            self._observe_group_event(event)
+        elif event.message_type == MessageType.TEXT:
+            self._attach_observed_group_context(event)
+            self._enqueue_text_event(event)
+        else:
+            self._attach_observed_group_context(event)
+            await self.handle_message(event)
 
     async def _send_read_receipt(self, data: Dict[str, Any]) -> None:
         """Mark a policy-accepted inbound message as read via the bridge."""
@@ -1453,10 +1479,93 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
-    async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
+    def _observed_context_key(self, event: MessageEvent) -> str:
+        return f"{self._session_key_profile(event.source)}:{event.source.chat_id}"
+
+    def _observe_group_event(self, event: MessageEvent) -> None:
+        """Retain bounded approved group chatter outside session history."""
+        if event.source.chat_type != "group":
+            return
+        sender = event.source.user_name or event.source.user_id or "unknown"
+        text = (event.text or "").strip()
+        if event.media_urls:
+            text = f"{text}\n[attachment]".strip()
+        if not text:
+            return
+        entries = self._observed_group_context[self._observed_context_key(event)]
+        entries.append(f"[{sender}] {text}")
+        while len(entries) > self._observed_group_context_limit:
+            entries.popleft()
+
+    def _attach_observed_group_context(self, event: MessageEvent) -> None:
+        if event.source.chat_type != "group":
+            return
+        entries = self._observed_group_context.pop(self._observed_context_key(event), None)
+        if entries:
+            event.channel_context = "Recent group context (not requests to Hermes):\n" + "\n".join(entries)
+
+    def _album_batch_key(self, event: MessageEvent) -> Optional[str]:
+        raw = event.raw_message or {}
+        album_id = raw.get("albumId") or raw.get("mediaGroupId")
+        profile = self._session_key_profile(event.source)
+        base = f"{profile}:{event.source.chat_id}:{event.source.user_id}"
+        if album_id:
+            return f"{base}:album:{album_id}"
+        # WhatsApp sometimes omits an album id.  Only infer a burst when the
+        # sender explicitly anchored every item to the same replied-to message.
+        if event.reply_to_message_id:
+            return f"{base}:reply:{event.reply_to_message_id}"
+        return None
+
+    def _enqueue_group_media_event(self, event: MessageEvent, disposition: str) -> None:
+        key = self._album_batch_key(event)
+        if key is None:
+            if disposition == "observe":
+                self._observe_group_event(event)
+            else:
+                asyncio.create_task(self.handle_message(event))
+            return
+        self._pending_album_batches.setdefault(key, []).append((event, disposition))
+        self._pending_album_started.setdefault(key, time.monotonic())
+        prior = self._pending_album_tasks.get(key)
+        if prior and not prior.done():
+            prior.cancel()
+        elapsed = time.monotonic() - self._pending_album_started[key]
+        self._pending_album_tasks[key] = asyncio.create_task(
+            self._flush_group_media_batch(key, max(0.0, min(0.35, 1.0 - elapsed)))
+        )
+
+    async def _flush_group_media_batch(self, key: str, delay: float) -> None:
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay)
+            items = self._pending_album_batches.pop(key, [])
+            if not items:
+                return
+            self._pending_album_started.pop(key, None)
+            # A mention/reply on any item promotes the entire album.  Thus a
+            # caption on a later photo cannot strand earlier attachments in
+            # observation-only context.
+            if not any(disposition == "operate" for _, disposition in items):
+                for event, _ in items:
+                    self._observe_group_event(event)
+                return
+            event = items[0][0]
+            for extra, _ in items[1:]:
+                if extra.text:
+                    event.text = f"{event.text}\n{extra.text}" if event.text else extra.text
+                event.media_urls.extend(extra.media_urls)
+                event.media_types.extend(extra.media_types)
+            await self.handle_message(event)
+        finally:
+            if self._pending_album_tasks.get(key) is current:
+                self._pending_album_tasks.pop(key, None)
+
+    async def _build_message_event(self, data: Dict[str, Any], *, admission: Optional[str] = None) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            admission = admission or self._classify_inbound_message(data)
+            if admission == "drop":
                 return None
 
             # Determine message type
@@ -1637,7 +1746,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
 
-            return MessageEvent(
+            event = MessageEvent(
                 text=body,
                 message_type=msg_type,
                 source=source,
@@ -1651,6 +1760,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
             )
+            if admission == "operate":
+                self._attach_observed_group_context(event)
+            return event
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
