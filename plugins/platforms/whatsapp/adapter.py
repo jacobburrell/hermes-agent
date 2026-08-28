@@ -1503,7 +1503,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if event.source.chat_type != "group":
             return
         sender = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", event.source.user_name or event.source.user_id or "unknown").strip()
-        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", (event.text or "")).strip()
+        text = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", (event.text or "")).strip()
+        # Delimit every ambient line as untrusted evidence; it cannot mint a
+        # provider-side section header by embedding one in message text.
+        text = text.replace("[Observed group context", "［Observed group context").replace(
+            "[Current addressed message]", "［Current addressed message］"
+        )
         if event.media_urls:
             text = f"{text}\n[attachment]".strip()
         if not text:
@@ -1589,12 +1594,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 for event, _ in items:
                     self._observe_group_event(event)
                 return
-            event = items[0][0]
-            for extra, _ in items[1:]:
+            # Preserve the actual addressed reply anchor (including a later
+            # caption/reply) while retaining attachment order from the wire.
+            event = next((candidate for candidate, original in items if original == "operate"), items[0][0])
+            ordered_items = [candidate for candidate, _ in items]
+            event.metadata["whatsapp_album_items"] = [
+                {
+                    "message_id": candidate.message_id,
+                    "caption": candidate.text,
+                    "reply_to_message_id": candidate.reply_to_message_id,
+                    "reply_to_is_own_message": candidate.reply_to_is_own_message,
+                    "read_receipt_key": (candidate.raw_message or {}).get("readReceiptKey"),
+                }
+                for candidate in ordered_items
+            ]
+            all_urls = [url for candidate in ordered_items for url in candidate.media_urls]
+            all_types = [kind for candidate in ordered_items for kind in candidate.media_types]
+            captions = [candidate.text for candidate in ordered_items if candidate.text]
+            event.media_urls = all_urls
+            event.media_types = all_types
+            event.text = "\n".join(captions)
+            for extra, _ in items:
+                if extra is event:
+                    continue
                 if extra.text:
-                    event.text = f"{event.text}\n{extra.text}" if event.text else extra.text
-                event.media_urls.extend(extra.media_urls)
-                event.media_types.extend(extra.media_types)
+                    pass
             self._attach_observed_group_context(event)
             await self.handle_message(event)
         finally:

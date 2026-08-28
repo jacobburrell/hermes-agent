@@ -21219,7 +21219,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
-        message_text, _observed_persisted_message = _observed_context_api_and_persisted_message(
+        # Keep hooks, durable rows, and activity logs addressed-only.  The
+        # observed envelope is constructed solely at the provider handoff.
+        _, _observed_persisted_message = _observed_context_api_and_persisted_message(
             message_text, event,
         )
 
@@ -21298,8 +21300,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            _provider_message, _ = _observed_context_api_and_persisted_message(
+                message_text, event,
+            )
             agent_result = await self._run_agent(
-                message=message_text,
+                message=_provider_message,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
