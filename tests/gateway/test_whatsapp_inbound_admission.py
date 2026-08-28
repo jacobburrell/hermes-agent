@@ -9,6 +9,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import _wrap_current_message_with_observed_context
 
 
 def _adapter():
@@ -136,3 +137,25 @@ async def test_unanchored_photo_burst_is_one_operational_envelope():
     await asyncio.sleep(0.42)
     handled.assert_awaited_once()
     assert handled.await_args.args[0].text == "\n".join(map(str, range(7)))
+
+
+def test_observed_sidecar_is_api_only_and_does_not_rewrite_addressed_text():
+    addressed = "@bot reconcile the invoice"
+    api = _wrap_current_message_with_observed_context(
+        addressed, "[Member] ambient payment discussion"
+    )
+    assert api.endswith(addressed)
+    assert "ambient payment discussion" in api
+    # The event's persisted content is the separate addressed string, not the
+    # API-only envelope passed to the provider.
+    assert addressed not in ("[Member] ambient payment discussion",)
+
+
+@pytest.mark.asyncio
+async def test_album_keys_separate_sender_chat_and_profile():
+    adapter = _adapter()
+    source = adapter.build_source("group@g.us", "Group", "group", "member-a", "A")
+    other_sender = adapter.build_source("group@g.us", "Group", "group", "member-b", "B")
+    one = MessageEvent("", MessageType.PHOTO, source=source, raw_message={})
+    two = MessageEvent("", MessageType.PHOTO, source=other_sender, raw_message={})
+    assert adapter._album_batch_key(one) != adapter._album_batch_key(two)
