@@ -49,6 +49,15 @@ def test_access_drop_precedes_group_observation_and_operation():
     assert adapter._classify_inbound_message(_data("/new")) == "operate"
 
 
+@pytest.mark.parametrize("require_mention, expected", [(None, False), (True, False), (False, True)])
+def test_shared_whatsapp_boolean_ingress_only_allows_operate(require_mention, expected):
+    """Cloud/alternate adapters sharing the mixin cannot dispatch OBSERVE."""
+    adapter = _adapter()
+    if require_mention is not None:
+        adapter.config.extra["require_mention"] = require_mention
+    assert adapter._should_process_message(_data()) is expected
+
+
 @pytest.mark.asyncio
 async def test_observed_chatter_is_adapter_only_and_attaches_to_next_addressed_turn():
     adapter = _adapter()
@@ -137,6 +146,20 @@ async def test_unanchored_photo_burst_is_one_operational_envelope():
     await asyncio.sleep(0.42)
     handled.assert_awaited_once()
     assert handled.await_args.args[0].text == "\n".join(map(str, range(7)))
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_quiet_and_hard_flush_are_idempotent():
+    adapter = _adapter()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    raw = {"isGroup": True, "chatId": "group@g.us", "albumId": "race", "botIds": ["bot"], "mentionedIds": ["bot"]}
+    event = MessageEvent("caption", MessageType.PHOTO, source=source, raw_message=raw)
+    key = adapter._album_batch_key(event)
+    adapter._pending_album_batches[key] = [(event, "operate")]
+    await asyncio.gather(adapter._flush_group_media_batch(key, 0), adapter._flush_group_media_batch(key, 0))
+    handled.assert_awaited_once()
 
 
 @pytest.mark.asyncio
