@@ -1506,6 +1506,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if event.source.chat_type != "group":
             return
         sender = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", event.source.user_name or event.source.user_id or "unknown").strip()
+        sender = sender.replace("[Observed group context", "［Observed group context").replace(
+            "[Current addressed message]", "［Current addressed message］"
+        )
         text = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", (event.text or "")).strip()
         # Delimit every ambient line as untrusted evidence; it cannot mint a
         # provider-side section header by embedding one in message text.
@@ -1616,6 +1619,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                  if (event.raw_message or {}).get("quotedParticipant")), ""
             )
             disposition = self._classify_inbound_message(merged_raw)
+            # Preserve the per-item edge decision: a later slash, reply, or
+            # wake caption must promote its complete album even if a merged
+            # textual representation would not independently match.
+            if any(original == "operate" for _, original in items):
+                disposition = "operate"
             if disposition != "operate":
                 for event, _ in items:
                     self._observe_group_event(event)
@@ -1629,7 +1637,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "message_id": candidate.message_id,
                     "caption": candidate.text,
                     "reply_to_message_id": candidate.reply_to_message_id,
+                    "reply_to_text": candidate.reply_to_text,
+                    "reply_to_author_id": candidate.reply_to_author_id,
                     "reply_to_is_own_message": candidate.reply_to_is_own_message,
+                    "media_urls": list(candidate.media_urls),
+                    "media_types": list(candidate.media_types),
                     "read_receipt_key": (candidate.raw_message or {}).get("readReceiptKey"),
                 }
                 for candidate in ordered_items
