@@ -490,10 +490,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         # Adapter-local observed context intentionally never enters a session
         # transcript.  It is attached only to the next addressed group event.
-        self._observed_group_context: Dict[str, Deque[str]] = defaultdict(deque)
-        self._observed_group_context_limit = max(
-            1, int(config.extra.get("observed_group_context_limit", 20) or 20)
-        )
+        self._observed_group_context: Dict[str, Deque[tuple[float, str]]] = defaultdict(deque)
+        self._observed_group_context_limit = self._bounded_int_extra("observed_group_context_limit", 20, 1, 100)
+        self._observed_group_context_bytes = self._bounded_int_extra("observed_group_context_bytes", 8192, 256, 65536)
+        self._observed_group_context_ttl_seconds = self._bounded_int_extra("observed_group_context_ttl_seconds", 900, 1, 86400)
         self._pending_album_batches: Dict[str, list[tuple[MessageEvent, str]]] = {}
         self._pending_album_tasks: Dict[str, asyncio.Task] = {}
         self._pending_album_hard_tasks: Dict[str, asyncio.Task] = {}
@@ -517,6 +517,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    def _bounded_int_extra(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return min(maximum, max(minimum, int(self.config.extra.get(key, default))))
+        except (TypeError, ValueError):
+            return default
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -894,6 +900,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
+        # Do not leave deferred inbound albums alive after disconnect.  They
+        # have not entered Base yet, so cancellation is safer than a late send.
+        for task in [*self._pending_album_tasks.values(), *self._pending_album_hard_tasks.values()]:
+            if not task.done():
+                task.cancel()
+        self._pending_album_tasks.clear()
+        self._pending_album_hard_tasks.clear()
+        self._pending_album_batches.clear()
+        self._pending_album_started.clear()
         if self._bridge_process:
             try:
                 try:
@@ -1487,15 +1502,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Retain bounded approved group chatter outside session history."""
         if event.source.chat_type != "group":
             return
-        sender = event.source.user_name or event.source.user_id or "unknown"
-        text = (event.text or "").strip()
+        sender = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", event.source.user_name or event.source.user_id or "unknown").strip()
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", (event.text or "")).strip()
         if event.media_urls:
             text = f"{text}\n[attachment]".strip()
         if not text:
             return
         entries = self._observed_group_context[self._observed_context_key(event)]
-        entries.append(f"[{sender}] {text}")
+        now = time.monotonic()
+        while entries and now - entries[0][0] > self._observed_group_context_ttl_seconds:
+            entries.popleft()
+        entries.append((now, f"[{sender}] {text}"))
         while len(entries) > self._observed_group_context_limit:
+            entries.popleft()
+        while sum(len(item.encode("utf-8")) for _, item in entries) > self._observed_group_context_bytes:
             entries.popleft()
 
     def _attach_observed_group_context(self, event: MessageEvent) -> None:
@@ -1503,7 +1523,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         entries = self._observed_group_context.pop(self._observed_context_key(event), None)
         if entries:
-            event.metadata["observed_group_context"] = "\n".join(entries)
+            now = time.monotonic()
+            retained = [item for seen, item in entries if now - seen <= self._observed_group_context_ttl_seconds]
+            if retained:
+                event.metadata["observed_group_context"] = "\n".join(retained)
 
     def _album_batch_key(self, event: MessageEvent) -> Optional[str]:
         raw = event.raw_message or {}

@@ -61,7 +61,7 @@ async def test_observed_chatter_is_adapter_only_and_attaches_to_next_addressed_t
     adapter._attach_observed_group_context(addressed)
     assert "first" in addressed.metadata["observed_group_context"] and "second" in addressed.metadata["observed_group_context"]
     assert addressed.text == "please help"
-    assert adapter._observed_group_context == {}
+    assert not adapter._observed_group_context
 
 
 @pytest.mark.asyncio

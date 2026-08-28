@@ -1717,6 +1717,10 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["free_response_chats"] = platform_cfg["free_response_chats"]
                 if plat == Platform.WHATSAPP and "observed_group_context_limit" in platform_cfg:
                     bridged["observed_group_context_limit"] = platform_cfg["observed_group_context_limit"]
+                if plat == Platform.WHATSAPP and "observed_group_context_bytes" in platform_cfg:
+                    bridged["observed_group_context_bytes"] = platform_cfg["observed_group_context_bytes"]
+                if plat == Platform.WHATSAPP and "observed_group_context_ttl_seconds" in platform_cfg:
+                    bridged["observed_group_context_ttl_seconds"] = platform_cfg["observed_group_context_ttl_seconds"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
