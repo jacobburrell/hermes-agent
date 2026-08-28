@@ -164,6 +164,20 @@ async def test_simultaneous_quiet_and_hard_flush_are_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_continuous_album_arrival_cannot_starve_hard_flush():
+    adapter = _adapter()
+    handled = AsyncMock()
+    adapter.handle_message = handled
+    source = adapter.build_source("group@g.us", "Group", "group", "member", "Member")
+    raw = {"isGroup": True, "chatId": "group@g.us", "albumId": "continuous", "botIds": ["bot"], "mentionedIds": ["bot"]}
+    for index in range(5):
+        adapter._enqueue_group_media_event(MessageEvent(str(index), MessageType.PHOTO, source=source, raw_message=raw), "operate")
+        await asyncio.sleep(0.24)
+    await asyncio.sleep(0.12)
+    handled.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_drop_never_builds_caches_reads_or_dispatches():
     adapter = _adapter()
     adapter._build_message_event = AsyncMock()
@@ -213,6 +227,18 @@ async def test_runner_handoff_keeps_observed_context_provider_only(monkeypatch, 
     assert "ambient" not in runner.hooks.emit.await_args_list[0].args[1].get("message", "")
     assert "ambient" in runner._run_agent.await_args.kwargs["message"]
     assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed request"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_runner_handoff_keeps_observed_context_provider_only(monkeypatch, tmp_path):
+    runner = _runner_bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": [], "tools": [], "history_offset": 0, "last_prompt_tokens": 0})
+    source = adapter_source = _adapter().build_source("group@g.us", "Group", "group", "member", "Member")
+    event = MessageEvent("addressed WhatsApp request", source=source, metadata={"observed_group_context": "[Member] ambient WhatsApp"})
+    await runner._handle_message_with_agent(event, adapter_source, "agent:main:telegram:group:-1001:12345", 1)
+    assert "ambient WhatsApp" not in runner.hooks.emit.await_args_list[0].args[1].get("message", "")
+    assert "ambient WhatsApp" in runner._run_agent.await_args.kwargs["message"]
+    assert runner._run_agent.await_args.kwargs["persist_user_message"] == "addressed WhatsApp request"
 
 
 def test_observed_context_neutralizes_reserved_headers_and_newlines():
