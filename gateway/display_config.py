@@ -156,13 +156,19 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    "whatsapp":        {
+        **_TIER_MEDIUM,
+        # A busy acknowledgement is a permanent internal-status bubble on
+        # this mobile chat surface. Keep new profiles final-answer-first;
+        # users can explicitly opt in at chat/platform/global scope.
+        "busy_ack_enabled": False,
+    },  # Baileys bridge supports /edit
     # WhatsApp Cloud API: Meta added message editing in 2023 but the
     # Hermes Cloud adapter doesn't implement edit_message yet, so we
     # stay on TIER_LOW (tool_progress off) to avoid spamming each
     # status update as a separate message. Promote to TIER_MEDIUM once
     # Cloud's edit_message lands.
-    "whatsapp_cloud":  _TIER_LOW,
+    "whatsapp_cloud":  {**_TIER_LOW, "busy_ack_enabled": False},
     # Photon (managed iMessage over the gRPC sidecar) and BlueBubbles are both
     # permanent-message iMessage inboxes with no message-edit support, so both
     # stay TIER_LOW. This keeps tool progress, interim scratch commentary,
@@ -274,7 +280,8 @@ def resolve_busy_ack_enabled(
     2. ``display.platforms.<platform>``
     3. global ``display``
     4. the legacy process environment bridge
-    5. the built-in default
+    5. the built-in platform default
+    6. the built-in global default
 
     Invalid explicit values are ignored so the next lower-precedence source
     remains authoritative.
@@ -290,6 +297,13 @@ def resolve_busy_ack_enabled(
     parsed_legacy = _normalise_busy_ack_value(legacy_env)
     if parsed_legacy is not None:
         return parsed_legacy
+
+    platform_default = _PLATFORM_DEFAULTS.get(platform_key, {}).get(
+        "busy_ack_enabled"
+    )
+    parsed_platform_default = _normalise_busy_ack_value(platform_default)
+    if parsed_platform_default is not None:
+        return parsed_platform_default
     return bool(_GLOBAL_DEFAULTS["busy_ack_enabled"])
 
 

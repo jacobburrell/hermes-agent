@@ -2603,11 +2603,15 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
             if "busy_text_mode" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
-            if "busy_ack_enabled" in _display_cfg:
-                os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
-            # This process-level env var is documented as an override for
-            # service managers, so preserve it when already set. Other display
-            # bridges stay config-authoritative for backwards compatibility.
+            # busy_ack_enabled is resolved live from the routed profile at the
+            # outbound boundary. Do not mirror it into process-global state:
+            # that stale bridge could turn a removed/defaulted WhatsApp value
+            # into a permanent legacy override. A service-manager-provided
+            # HERMES_GATEWAY_BUSY_ACK_ENABLED remains available as fallback.
+            # busy_steer_ack_enabled still has a documented process-level
+            # service-manager override, so preserve that variable when set.
+            # Other display bridges stay config-authoritative for backwards
+            # compatibility.
             if (
                 "busy_steer_ack_enabled" in _display_cfg
                 and "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ
