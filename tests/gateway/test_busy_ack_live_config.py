@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -185,6 +189,51 @@ async def test_yaml_false_suppresses_only_ack_after_busy_state_mutation(
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     _write_config(tmp_path, busy_ack_enabled=False)
+
+    effective_mode = "interrupt" if mode == "redirect" else mode
+    runner = _runner(mode=effective_mode)
+    adapter = _adapter()
+    runner.adapters[Platform.WHATSAPP] = adapter
+    event = _event()
+    session_key, agent = _seed_busy_turn(runner, adapter, event)
+    if mode == "redirect":
+        agent._supports_active_turn_redirect = True
+
+    assert await runner._handle_active_session_busy_message(event, session_key) is True
+
+    adapter._send_with_retry.assert_not_awaited()
+    assert session_key not in runner._busy_ack_ts
+    if mode == "queue":
+        assert adapter._pending_messages[session_key] is event
+        agent.steer.assert_not_called()
+        agent.interrupt.assert_not_called()
+    elif mode == "steer":
+        agent.steer.assert_called_once_with("follow up")
+        agent.interrupt.assert_not_called()
+        assert session_key not in adapter._pending_messages
+    elif mode == "redirect":
+        agent.redirect.assert_called_once_with("follow up")
+        agent.interrupt.assert_not_called()
+        assert session_key not in adapter._pending_messages
+    else:
+        assert adapter._pending_messages[session_key] is event
+        agent.steer.assert_not_called()
+        agent.interrupt.assert_called_once_with("follow up")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["queue", "steer", "interrupt", "redirect"])
+async def test_whatsapp_builtin_default_is_silent_after_busy_state_mutation(
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    """An unconfigured WhatsApp profile keeps admission semantics, not the ack."""
+    import gateway.run as gateway_run
+
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _write_config(tmp_path)
 
     effective_mode = "interrupt" if mode == "redirect" else mode
     runner = _runner(mode=effective_mode)
@@ -647,12 +696,19 @@ def test_unknown_or_unserved_routed_whatsapp_profile_never_borrows_primary_polic
 
 
 @pytest.mark.parametrize(
-    ("env_value", "expected"),
-    [("false", False), ("true", True), (None, True)],
+    ("platform", "env_value", "expected"),
+    [
+        (Platform.WHATSAPP, "false", False),
+        (Platform.WHATSAPP, "true", True),
+        (Platform.WHATSAPP, None, False),
+        (Platform.WHATSAPP_CLOUD, None, False),
+        (Platform.TELEGRAM, None, True),
+    ],
 )
-def test_valid_empty_mapping_preserves_env_then_builtin_fallback(
+def test_valid_empty_mapping_preserves_env_then_platform_builtin_fallback(
     tmp_path,
     monkeypatch,
+    platform,
     env_value,
     expected,
 ):
@@ -665,7 +721,59 @@ def test_valid_empty_mapping_preserves_env_then_builtin_fallback(
     else:
         monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", env_value)
 
-    assert _runner()._busy_ack_enabled_for_source(_event().source) is expected
+    source = _event(platform=platform).source
+    assert _runner()._busy_ack_enabled_for_source(source) is expected
+
+
+@pytest.mark.parametrize(
+    ("legacy_env", "expected"),
+    [(None, "<missing>"), ("true", "true")],
+)
+def test_gateway_import_does_not_synthesize_busy_ack_legacy_env(
+    tmp_path,
+    legacy_env,
+    expected,
+):
+    """Only a real pre-import service-manager value may occupy the legacy rail."""
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  busy_input_mode: interrupt\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    if legacy_env is None:
+        env.pop("HERMES_GATEWAY_BUSY_ACK_ENABLED", None)
+    else:
+        env["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = legacy_env
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; import gateway.run; "
+                "print(os.environ.get('HERMES_GATEWAY_BUSY_ACK_ENABLED', '<missing>'))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == expected
+
+
+def test_full_config_defaults_keep_only_whatsapp_surfaces_busy_silent():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    platform_defaults = DEFAULT_CONFIG["display"]["platforms"]
+    assert platform_defaults["whatsapp"]["busy_ack_enabled"] is False
+    assert platform_defaults["whatsapp_cloud"]["busy_ack_enabled"] is False
+    assert DEFAULT_CONFIG["display"]["busy_ack_enabled"] is True
 
 
 @pytest.mark.parametrize("env_value", ["true", "false"])
