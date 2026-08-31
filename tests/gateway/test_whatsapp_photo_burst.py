@@ -292,7 +292,7 @@ async def test_photo_arriving_during_dispatch_gets_its_own_timer(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_photo_burst_teardown_cancels_delayed_dispatch(monkeypatch):
+async def test_disconnect_cancels_photo_burst_before_bridge_shutdown(monkeypatch):
     """Teardown is explicit: a buffered accepted photo never dispatches late."""
     adapter = _adapter()
     adapter.handle_message = AsyncMock()
@@ -303,7 +303,12 @@ async def test_photo_burst_teardown_cancels_delayed_dispatch(monkeypatch):
     assert event is not None
 
     adapter._enqueue_group_photo_burst(event)
-    await adapter._cancel_pending_group_photo_bursts()
+    adapter._bridge_process = None
+    adapter._poll_task = None
+    adapter._http_session = SimpleNamespace(closed=True)
+    adapter._session_lock_identity = None
+    adapter._running = True
+    await adapter.disconnect()
     await asyncio.sleep(WhatsAppAdapter._PHOTO_BURST_QUIET_SECONDS + 0.05)
 
     adapter.handle_message.assert_not_awaited()
