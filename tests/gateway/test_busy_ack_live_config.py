@@ -71,7 +71,7 @@ def _adapter() -> _WhatsAppAdapter:
 
 
 def _real_whatsapp_adapter():
-    """Real ingress with mocked Node transport; text delivery stays unused."""
+    """Real WhatsApp adapter shell with a mocked Node transport."""
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     adapter = WhatsAppAdapter(
@@ -87,6 +87,21 @@ def _real_whatsapp_adapter():
     adapter._http_session = node_transport
     adapter._send_with_retry = AsyncMock(wraps=adapter._send_with_retry)
     return adapter, node_transport
+
+
+def _real_whatsapp_cloud_adapter():
+    """Real Cloud adapter shell; busy tests never open its HTTP transport."""
+    from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+    adapter = WhatsAppCloudAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"phone_number_id": "test-phone", "access_token": "test-token"},
+        )
+    )
+    adapter.set_message_handler(AsyncMock(return_value="unused"))
+    adapter._send_with_retry = AsyncMock(wraps=adapter._send_with_retry)
+    return adapter
 
 
 def _event(
@@ -299,6 +314,92 @@ async def test_yaml_false_suppresses_drain_notice_after_preserving_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("draining", [False, True], ids=["normal", "drain"])
+async def test_real_whatsapp_cloud_busy_boundary_sends_nothing_when_muted(
+    tmp_path, monkeypatch, draining
+):
+    """The real Cloud adapter reaches both busy gates before any HTTP send."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _write_config(tmp_path, busy_ack_enabled=False)
+
+    runner = _runner(mode="queue")
+    runner._draining = draining
+    runner._queue_during_drain_enabled = MagicMock(return_value=True)
+    adapter = _real_whatsapp_cloud_adapter()
+    runner.adapters[Platform.WHATSAPP_CLOUD] = adapter
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    event = _event(platform=Platform.WHATSAPP_CLOUD)
+    session_key, agent = _seed_busy_turn(runner, adapter, event)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    adapter._send_with_retry.assert_not_awaited()
+    assert adapter._pending_messages[session_key] is event
+    if draining:
+        runner._queue_during_drain_enabled.assert_called_once_with("queue")
+        agent.interrupt.assert_not_called()
+    else:
+        agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_active_drain_busy_boundary_observes_live_yaml_mute(tmp_path, monkeypatch):
+    """The direct drain acknowledgement rereads YAML at each outbound boundary."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _write_config(tmp_path, busy_ack_enabled=True)
+    runner = _runner(mode="queue")
+    runner._draining = True
+    runner._queue_during_drain_enabled = MagicMock(return_value=True)
+    adapter = _adapter()
+    runner.adapters[Platform.WHATSAPP] = adapter
+    first = _event(message_id="drain-1")
+    session_key, _agent = _seed_busy_turn(runner, adapter, first)
+
+    assert await runner._handle_active_session_busy_message(first, session_key) is True
+    assert adapter._send_with_retry.await_count == 1
+
+    _write_config(tmp_path, busy_ack_enabled=False)
+    second = _event(message_id="drain-2")
+    assert await runner._handle_active_session_busy_message(second, session_key) is True
+
+    assert adapter._send_with_retry.await_count == 1
+    # Queue semantics are unchanged: the first event stays in the head slot
+    # and the edited follow-up occupies the FIFO tail.
+    assert adapter._pending_messages[session_key] is first
+    assert runner._queue_depth(session_key, adapter=adapter) == 2
+
+
+@pytest.mark.asyncio
+async def test_priority_drain_boundary_observes_live_yaml_mute(tmp_path, monkeypatch):
+    """The priority path returns no text after a live mute, so Base cannot send."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _write_config(tmp_path, busy_ack_enabled=True)
+    runner = _runner(mode="queue")
+    runner._draining = True
+    adapter = _adapter()
+    runner.adapters[Platform.WHATSAPP] = adapter
+    first = _event(message_id="priority-drain-1")
+    session_key, _agent = _seed_busy_turn(runner, adapter, first)
+
+    first_response = await runner._handle_message(first)
+    assert isinstance(first_response, str) and first_response
+
+    _write_config(tmp_path, busy_ack_enabled=False)
+    second = _event(message_id="priority-drain-2")
+    assert await runner._handle_message(second) is None
+
+
+@pytest.mark.asyncio
 async def test_explicit_queue_command_result_remains_user_visible(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
@@ -382,11 +483,11 @@ async def test_busy_event_observes_yaml_edit_without_gateway_restart(
 
 
 @pytest.mark.asyncio
-async def test_real_whatsapp_seven_photo_burst_falls_back_to_silent_queue(
+async def test_base_busy_path_seven_photo_burst_falls_back_to_silent_queue(
     tmp_path,
     monkeypatch,
 ):
-    """One owner plus six non-steerable photos form one silent queued album."""
+    """Base busy handling queues one silent album; bridge ingress is out of scope."""
     import gateway.run as gateway_run
 
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
