@@ -21,36 +21,74 @@ from gateway.session import SessionSource
 from run_agent import AIAgent
 
 
+_LONG_PROVIDER_DETAIL = "provider-controlled refusal detail " * 24
+
+# These final strings are the exact terminal envelopes produced by
+# agent.conversation_loop, not hand-written generic error fragments.  The two
+# content-policy envelopes deliberately exceed the generic provider-error
+# length threshold: human chat still needs the fixed safe category, while
+# local/API retain the diagnostic body unchanged.
 TERMINAL_PROVIDER_CASES = (
     (
-        "auth",
-        "Provider authentication failed: Incorrect API key provided",
+        "invalid_response",
+        "❌ Max retries (3) exceeded for invalid responses. Giving up.",
+        "Invalid API response after 3 retries: slow response (61s) — likely upstream timeout",
+        "failed after retries",
+    ),
+    (
+        "http_200_content_filter",
+        "⚠️ The model declined to respond to this request (safety refusal).",
+        "⚠️  The model declined to respond to this request "
+        "(safety refusal — not a Hermes/gateway failure).\n\n"
+        f"Model's explanation: {_LONG_PROVIDER_DETAIL}\n\n"
+        "Try rephrasing the request, narrowing the context, or adding a fallback provider.",
+        "provider rejected",
+    ),
+    (
+        "nonretryable_content_policy",
+        "❌ Provider safety filter blocked this request: provider detail",
+        "⚠️  The model provider's safety filter blocked this request "
+        "(not a Hermes/gateway failure).\n\n"
+        f"Provider message: {_LONG_PROVIDER_DETAIL}\n\n"
+        "Try rephrasing the request, narrowing the context, or adding a fallback provider.",
+        "provider rejected",
+    ),
+    (
+        "nonretryable_auth",
+        "❌ Non-retryable error (HTTP 401): Incorrect API key provided: provider detail",
+        "HTTP 401: Incorrect API key provided: provider detail",
         "authentication failed",
     ),
     (
+        "nonretryable_tls",
+        "❌ TLS certificate verification failed: provider detail",
+        "SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] "
+        "certificate verify failed: unable to get local issuer certificate",
+        "failed after retries",
+    ),
+    (
         "billing",
+        "❌ Billing or credits exhausted — provider detail",
         "Billing or credits exhausted: provider detail",
         "billing or usage",
     ),
     (
-        "policy",
-        "⚠️ The model provider's safety filter blocked this request: provider detail",
-        "rejected the request",
-    ),
-    (
         "rate_limit",
-        "API call failed after 3 retries: rate limited after 3 retries",
+        "❌ Rate limited after 3 retries — provider detail",
+        "API call failed after 3 retries: rate limited after 3 retries: provider detail",
         "rate-limiting",
     ),
     (
-        "nonretryable",
-        "Non-retryable error (HTTP 400): provider detail",
-        "failed after retries",
-    ),
-    (
         "timeout_transport",
+        "❌ API failed after 3 retries — provider detail",
         "API call failed after 3 retries: httpx.ConnectError: connection reset",
         "not responding",
+    ),
+    (
+        "max_retry_generic",
+        "❌ API failed after 3 retries — provider detail",
+        "API call failed after 3 retries: HTTP 500: provider detail",
+        "failed after retries",
     ),
 )
 
@@ -130,9 +168,12 @@ def _ledger_rows():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("_kind", "raw_final", "expected_fragment"), TERMINAL_PROVIDER_CASES)
+@pytest.mark.parametrize(
+    ("_kind", "terminal_status", "raw_final", "expected_fragment"),
+    TERMINAL_PROVIDER_CASES,
+)
 async def test_terminal_provider_status_is_silent_while_base_delivers_one_final(
-    _kind, raw_final, expected_fragment, monkeypatch
+    _kind, terminal_status, raw_final, expected_fragment, monkeypatch
 ):
     """One terminal provider failure yields zero status sends and one final.
 
@@ -143,12 +184,16 @@ async def test_terminal_provider_status_is_silent_while_base_delivers_one_final(
     adapter = _WhatsAppAdapter()
     agent, scheduled = _terminal_status_agent(adapter, monkeypatch)
 
-    agent._emit_status(f"terminal provider {_kind}: provider detail", terminal_provider=True)
+    agent._emit_status(terminal_status, terminal_provider=True)
 
     assert scheduled == [], "terminal provider diagnostics must not send on WhatsApp"
 
     expected_final = _sanitize_gateway_final_response(Platform.WHATSAPP, raw_final)
     assert expected_fragment in expected_final.lower()
+    assert expected_final != raw_final
+    assert "provider-controlled refusal detail" not in expected_final
+    if "content_filter" in _kind or "content_policy" in _kind:
+        assert len(raw_final) > 400, "must exercise the long-envelope bypass"
     adapter._message_handler = AsyncMock(return_value=expected_final)
     session_key = "agent:main:whatsapp:group:test-chat"
     adapter._active_sessions[session_key] = asyncio.Event()
@@ -159,7 +204,13 @@ async def test_terminal_provider_status_is_silent_while_base_delivers_one_final(
     assert _ledger_rows() == [("delivered", expected_final)]
 
 
-def test_terminal_provider_diagnostics_stay_available_on_raw_surfaces(monkeypatch):
+@pytest.mark.parametrize(
+    ("_kind", "terminal_status", "raw_final", "_expected_fragment"),
+    TERMINAL_PROVIDER_CASES,
+)
+def test_terminal_provider_diagnostics_stay_available_on_raw_surfaces(
+    _kind, terminal_status, raw_final, _expected_fragment
+):
     """The dedicated event suppresses chat only; local/API remain diagnostic."""
     events = []
     agent = object.__new__(AIAgent)
@@ -167,13 +218,22 @@ def test_terminal_provider_diagnostics_stay_available_on_raw_surfaces(monkeypatc
     agent._vprint = lambda *_args, **_kwargs: None
     agent.status_callback = lambda kind, message: events.append((kind, message))
 
-    message = "terminal provider: provider detail"
-    agent._emit_status(message, terminal_provider=True)
+    agent._emit_status(terminal_status, terminal_provider=True)
 
-    assert events == [("terminal_provider", message)]
+    assert events == [("terminal_provider", terminal_status)]
     for platform in ("local", "api_server", "webhook"):
-        assert _prepare_gateway_status_message(platform, events[0][0], message) == message
-        assert _sanitize_gateway_final_response(platform, message) == message
+        assert (
+            _prepare_gateway_status_message(platform, events[0][0], terminal_status)
+            == terminal_status
+        )
+        assert _sanitize_gateway_final_response(platform, raw_final) == raw_final
+
+
+def test_normal_short_prose_about_a_model_safety_filter_is_not_rewritten():
+    """Only fixed terminal envelopes get the long-body bypass."""
+    answer = "The model provider's safety filter blocked my draft yesterday."
+
+    assert _sanitize_gateway_final_response(Platform.WHATSAPP, answer) == answer
 
 
 def test_ordinary_lifecycle_status_keeps_its_existing_callback_kind():

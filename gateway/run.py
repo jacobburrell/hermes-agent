@@ -604,6 +604,26 @@ _GATEWAY_PROVIDER_POLICY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# These are the two *generator-owned* terminal-response envelopes emitted by
+# ``agent.conversation_loop``.  Their bodies intentionally preserve a provider
+# explanation for local/API diagnostics, so they can be well over the generic
+# short-error threshold below.  Match only their fixed preambles at the final
+# outbound boundary; do not turn ordinary assistant prose about a model's
+# policy or refusal into an infrastructure error.
+_GATEWAY_INVALID_RESPONSE_FINAL_RE = re.compile(
+    r"^\s*(?:\W*\s*)?invalid\s+api\s+response\s+after\s+\d+\s+retries:\s+",
+    re.IGNORECASE,
+)
+_GATEWAY_CONTENT_POLICY_FINAL_RE = re.compile(
+    r"^\s*(?:\W*\s*)?(?:"
+    r"the\s+model\s+declined\s+to\s+respond\s+to\s+this\s+request\s+"
+    r"\(safety\s+refusal\s+—\s+not\s+a\s+hermes/gateway\s+failure\)\."
+    r"|the\s+model\s+provider's\s+safety\s+filter\s+blocked\s+this\s+request\s+"
+    r"\(not\s+a\s+hermes/gateway\s+failure\)\."
+    r")",
+    re.IGNORECASE,
+)
+
 _GATEWAY_AUTH_ERROR_RE = re.compile(
     r"(provider\s+authentication\s+failed|incorrect\s+api\s+key|invalid\s+api\s+key|\b401\b)",
     re.IGNORECASE,
@@ -960,8 +980,6 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"|rate\s+limited\s+after\s+\d+\s+retries"
     r"|billing\s+or\s+credits?\s+exhausted"
     r"|provider\s+reported\s+usage/credit\s+exhaustion"
-    r"|(?:the\s+)?model(?:\s+provider)?(?:'s)?\s+safety\s+filter\s+blocked"
-    r"|model\s+declined\s+to\s+respond"
     r"|error\s+code\s*:"
     r"|http\s*\d{3}\b"
     r"|incorrect\s+api\s+key"
@@ -975,6 +993,8 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"|winerror\s+10061"
     r"|errno\s+111"
     r"|all\s+connection\s+attempts\s+failed"
+    r"|sslcertverificationerror\b"
+    r"|\[ssl:\s*certificate_verify_failed\]"
     r")",
     re.IGNORECASE,
 )
@@ -1037,6 +1057,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    # The terminal envelopes above can include long provider-controlled
+    # detail, so recognize them before the generic, deliberately short-only
+    # provider-error heuristic.  Supply only a fixed classification to the
+    # reply mapper: no portion of the provider body reaches human chat.
+    if _GATEWAY_INVALID_RESPONSE_FINAL_RE.search(redacted):
+        return _gateway_provider_error_reply("terminal provider failure")
+    if _GATEWAY_CONTENT_POLICY_FINAL_RE.search(redacted):
+        return _gateway_provider_error_reply("safety filter")
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
