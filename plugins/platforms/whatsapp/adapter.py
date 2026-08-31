@@ -936,6 +936,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
+        await self._cancel_pending_group_photo_bursts()
         if self._bridge_process:
             try:
                 try:
@@ -968,8 +969,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
         self._poll_task = None
-
-        await self._cancel_pending_group_photo_bursts()
 
         # Close the persistent HTTP session
         if self._http_session and not self._http_session.closed:
