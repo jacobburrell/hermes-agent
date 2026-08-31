@@ -768,12 +768,13 @@ def test_gateway_import_does_not_synthesize_busy_ack_legacy_env(
 
 
 def test_full_config_defaults_keep_only_whatsapp_surfaces_busy_silent():
-    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    """Built-ins belong to the display resolver, not merged user defaults."""
+    from gateway.display_config import resolve_busy_ack_enabled
 
-    platform_defaults = DEFAULT_CONFIG["display"]["platforms"]
-    assert platform_defaults["whatsapp"]["busy_ack_enabled"] is False
-    assert platform_defaults["whatsapp_cloud"]["busy_ack_enabled"] is False
-    assert DEFAULT_CONFIG["display"]["busy_ack_enabled"] is True
+    assert resolve_busy_ack_enabled({}, "whatsapp") is False
+    assert resolve_busy_ack_enabled({}, "whatsapp_cloud") is False
+    assert resolve_busy_ack_enabled({}, "telegram") is True
+    assert resolve_busy_ack_enabled({}, "discord") is True
 
 
 @pytest.mark.parametrize("env_value", ["true", "false"])
