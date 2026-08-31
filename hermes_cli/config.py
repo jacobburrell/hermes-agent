@@ -327,6 +327,35 @@ def validate_env_var_name_for_write(key: str) -> None:
     _reject_denylisted_env_var(key)
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+
+
+@dataclass(frozen=True)
+class ReadonlyConfigSnapshot:
+    """A canonical read plus whether it has a valid on-disk policy source.
+
+    ``config`` always comes from :func:`load_config_readonly`, so it has the
+    same defaults, normalization, environment expansion, and managed overlay
+    semantics as every other behavioral config read.  ``has_valid_source`` is
+    deliberately stricter: an absent, malformed, unreadable, or non-mapping
+    user/managed YAML file is not a valid source on a fresh process.
+
+    A successfully loaded snapshot is retained per user-config path and the
+    current managed-scope path.  If either file is later malformed, callers
+    receive that last-known-good canonical configuration instead.  The managed
+    scope is process-global; multiplex callers must enter the routed profile's
+    runtime scope before calling this helper rather than trying to infer a
+    profile-specific managed directory here.
+    """
+
+    config: Dict[str, Any]
+    has_valid_source: bool
+
+
+# Canonical behavioral readers occasionally need to distinguish a real
+# configuration from ``load_config_readonly``'s fresh-process defaults.  Keep
+# that provenance and its last-known-good value with the loader, not in each
+# consumer (gateway, cron, adapters, ...).
+_READONLY_CONFIG_LKG_BY_SOURCE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
@@ -3877,6 +3906,66 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def _mapping_source_state(path: Optional[Path]) -> Optional[bool]:
+    """Return ``True``/``False`` for an existing mapping YAML, else ``None``.
+
+    This is intentionally only a *source-validity* probe.  It does not build a
+    competing config view: :func:`load_config_readonly_with_status` still gets
+    its effective value from the canonical merged loader below.
+    """
+    if path is None:
+        return None
+    try:
+        if not path.exists():
+            return None
+        with open(path, encoding="utf-8") as config_file:
+            loaded = fast_safe_load(config_file)
+    except Exception:
+        return False
+    # A literal/empty YAML null is not the same thing as an explicit empty
+    # mapping (``{}``).  Policy readers must not treat a torn/blank file as a
+    # valid source during the first load.
+    return isinstance(loaded, dict)
+
+
+def load_config_readonly_with_status() -> ReadonlyConfigSnapshot:
+    """Return the canonical config and a source-validity/LKG status.
+
+    Use this for a policy whose safe fresh-process behavior depends on knowing
+    whether the effective value came from real YAML or from built-in defaults.
+    It preserves the normal :func:`load_config_readonly` resolution path and
+    cache; the small validity probe exists only so callers never have to
+    reopen YAML or independently merge the process-global managed scope.
+    """
+    with _CONFIG_LOCK:
+        config = load_config_readonly()
+        config_path = get_config_path()
+
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+        managed_path = (managed_dir / "config.yaml") if managed_dir else None
+        source_key = (str(config_path), str(managed_path or ""))
+        user_state = _mapping_source_state(config_path)
+        managed_state = _mapping_source_state(managed_path)
+        valid_now = (
+            user_state is not False
+            and managed_state is not False
+            and (user_state is True or managed_state is True)
+        )
+        if valid_now:
+            # ``load_config_readonly`` returns its shared cache object.  Keep a
+            # private copy so another read-only caller cannot mutate our LKG.
+            retained = copy.deepcopy(config)
+            _READONLY_CONFIG_LKG_BY_SOURCE[source_key] = retained
+            return ReadonlyConfigSnapshot(retained, True)
+
+        retained = _READONLY_CONFIG_LKG_BY_SOURCE.get(source_key)
+        if retained is not None:
+            return ReadonlyConfigSnapshot(copy.deepcopy(retained), True)
+    return ReadonlyConfigSnapshot(config, False)
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -5644,6 +5733,14 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Valid user-facing leaves that intentionally rely on the display resolver's
+# built-in defaults rather than being materialized into ``DEFAULT_CONFIG``.
+# Keeping them out of the merged defaults lets a platform default remain below
+# an explicit global value in the precedence chain.
+_EXTRA_KNOWN_CONFIG_PATHS = frozenset({
+    "display.busy_ack_enabled",
+})
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -5697,6 +5794,17 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
 
     segments = _split_key_path(key)
     top = segments[0]
+
+    if ".".join(segments) in _EXTRA_KNOWN_CONFIG_PATHS:
+        return True, None
+    if (
+        len(segments) >= 4
+        and segments[:2] == ["display", "platforms"]
+        and segments[-1] == "busy_ack_enabled"
+    ):
+        # Platform names and chat-type keys are intentionally dynamic, but the
+        # busy-ack leaf itself is a documented display setting.
+        return True, None
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
     # A leading underscore on the top-level segment (e.g. ``_test.shim_marker``)
