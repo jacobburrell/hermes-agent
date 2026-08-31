@@ -334,6 +334,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
+    merge_pending_message_event,
 )
 from utils import env_int
 
@@ -450,6 +451,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     # Default bridge location resolved via shared helper
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
+    # Baileys exposes each image as an independent inbound event and does not
+    # expose an album identifier. Keep the window short enough for a normal
+    # photo to feel immediate while allowing a mobile client's burst to settle.
+    _PHOTO_BURST_QUIET_SECONDS = 0.35
+    _PHOTO_BURST_MAX_SECONDS = 1.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
@@ -526,6 +532,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Accepted group photos are buffered only at the bridge adapter edge.
+        # Their key includes the credential-owning profile, source chat and
+        # sender, plus the exact reply anchor, so distinct conversations never
+        # merge merely because they arrive in one polling batch.
+        self._pending_photo_bursts: Dict[tuple, MessageEvent] = {}
+        self._pending_photo_burst_started: Dict[tuple, float] = {}
+        self._pending_photo_burst_last: Dict[tuple, float] = {}
+        self._pending_photo_burst_tasks: Dict[tuple, asyncio.Task] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -954,6 +968,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
         self._poll_task = None
+
+        await self._cancel_pending_group_photo_bursts()
 
         # Close the persistent HTTP session
         if self._http_session and not self._http_session.closed:
@@ -1394,6 +1410,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 asyncio.create_task(self._send_read_receipt(msg_data))
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
+                                elif (
+                                    event.message_type == MessageType.PHOTO
+                                    and event.source.chat_type == "group"
+                                ):
+                                    self._enqueue_group_photo_burst(event)
                                 else:
                                     await self.handle_message(event)
             except asyncio.CancelledError:
@@ -1431,6 +1452,103 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     )
         except Exception as exc:
             logger.warning("[%s] WhatsApp read receipt failed: %s", self.name, exc)
+
+    # ── Group-photo burst coalescing ───────────────────────────────
+
+    def _group_photo_burst_key(self, event: MessageEvent) -> tuple:
+        """Return an adapter-local key for one admitted group photo burst.
+
+        The bridge has no album ID. A profile/chat/sender tuple is the stable
+        grouping boundary; the reply anchor is deliberately part of the key so
+        photos replying to different messages cannot acquire each other's
+        context or captions.
+        """
+        source = event.source
+        return (
+            self._session_key_profile(source) or "",
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "user_id", "") or ""),
+            str(event.reply_to_message_id or ""),
+            str(event.reply_to_author_id or ""),
+            bool(event.reply_to_is_own_message),
+        )
+
+    def _enqueue_group_photo_burst(self, event: MessageEvent) -> None:
+        """Merge an already-admitted group photo into its short burst window."""
+        key = self._group_photo_burst_key(event)
+        now = asyncio.get_running_loop().time()
+        if key not in self._pending_photo_bursts:
+            event.metadata["whatsapp_photo_captions"] = [event.text]
+            self._pending_photo_bursts[key] = event
+            self._pending_photo_burst_started[key] = now
+        else:
+            existing = self._pending_photo_bursts[key]
+            captions = existing.metadata.setdefault(
+                "whatsapp_photo_captions", [existing.text]
+            )
+            captions.append(event.text)
+            # Shared Base merge logic preserves attachment order and appends
+            # distinct captions while keeping all MessageEvent media fields in
+            # lockstep. It does not dispatch or alter admission semantics.
+            merge_pending_message_event(self._pending_photo_bursts, key, event)
+        self._pending_photo_burst_last[key] = now
+        if key not in self._pending_photo_burst_tasks:
+            self._pending_photo_burst_tasks[key] = asyncio.create_task(
+                self._flush_group_photo_burst(key)
+            )
+
+    async def _flush_group_photo_burst(self, key: tuple) -> None:
+        """Dispatch one buffered burst after quiet, bounded by a hard cap."""
+        current_task = asyncio.current_task()
+        try:
+            loop = asyncio.get_running_loop()
+            while key in self._pending_photo_bursts:
+                started = self._pending_photo_burst_started.get(key)
+                last = self._pending_photo_burst_last.get(key)
+                if started is None or last is None:
+                    return
+                now = loop.time()
+                deadline = min(
+                    started + self._PHOTO_BURST_MAX_SECONDS,
+                    last + self._PHOTO_BURST_QUIET_SECONDS,
+                )
+                if deadline > now:
+                    await asyncio.sleep(deadline - now)
+                    continue
+                event = self._pending_photo_bursts.pop(key, None)
+                self._pending_photo_burst_started.pop(key, None)
+                self._pending_photo_burst_last.pop(key, None)
+                # Drop this timer's ownership before awaiting Base dispatch.
+                # A later physical photo that arrives while the turn starts
+                # must create its own timer rather than being left buffered
+                # behind this in-flight task.
+                if self._pending_photo_burst_tasks.get(key) is current_task:
+                    self._pending_photo_burst_tasks.pop(key, None)
+                if event is not None:
+                    await self.handle_message(event)
+                return
+        finally:
+            if self._pending_photo_burst_tasks.get(key) is current_task:
+                self._pending_photo_burst_tasks.pop(key, None)
+
+    async def _cancel_pending_group_photo_bursts(self) -> None:
+        """Cancel delayed group-photo dispatch during adapter teardown."""
+        tasks_by_key = getattr(self, "_pending_photo_burst_tasks", {})
+        tasks = list(tasks_by_key.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for attr in (
+            "_pending_photo_bursts",
+            "_pending_photo_burst_started",
+            "_pending_photo_burst_last",
+            "_pending_photo_burst_tasks",
+        ):
+            store = getattr(self, attr, None)
+            if isinstance(store, dict):
+                store.clear()
 
     # ── Text debounce batching ──────────────────────────────────────
 
