@@ -334,7 +334,6 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
-    merge_pending_message_event,
 )
 from utils import env_int
 
@@ -1477,19 +1476,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         key = self._group_photo_burst_key(event)
         now = asyncio.get_running_loop().time()
         if key not in self._pending_photo_bursts:
-            event.metadata["whatsapp_photo_captions"] = [event.text]
             self._pending_photo_bursts[key] = event
             self._pending_photo_burst_started[key] = now
         else:
             existing = self._pending_photo_bursts[key]
-            captions = existing.metadata.setdefault(
-                "whatsapp_photo_captions", [existing.text]
+            # Keep every physical caption in order, including repeated text.
+            # Base's generic pending-event merge intentionally de-duplicates
+            # equal captions, which is appropriate for retry-prone text
+            # streams but would lose an image occurrence in a photo burst.
+            if event.text:
+                existing.text = (
+                    f"{existing.text}\n\n{event.text}"
+                    if existing.text
+                    else event.text
+                )
+            existing_flags = list(existing.media_text_inlined or [])
+            existing_flags.extend(
+                [None] * max(0, len(existing.media_urls) - len(existing_flags))
             )
-            captions.append(event.text)
-            # Shared Base merge logic preserves attachment order and appends
-            # distinct captions while keeping all MessageEvent media fields in
-            # lockstep. It does not dispatch or alter admission semantics.
-            merge_pending_message_event(self._pending_photo_bursts, key, event)
+            incoming_flags = list(event.media_text_inlined or [])
+            incoming_flags.extend(
+                [None] * max(0, len(event.media_urls) - len(incoming_flags))
+            )
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            existing.media_text_inlined = existing_flags + incoming_flags
         self._pending_photo_burst_last[key] = now
         if key not in self._pending_photo_burst_tasks:
             self._pending_photo_burst_tasks[key] = asyncio.create_task(

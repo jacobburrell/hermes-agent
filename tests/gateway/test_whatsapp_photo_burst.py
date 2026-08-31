@@ -138,10 +138,6 @@ async def test_poll_coalesces_real_shaped_admitted_group_photo_burst(monkeypatch
         f"site photo {word}"
         for word in ("one", "two", "three", "four", "five", "six", "seven")
     )
-    assert event.metadata["whatsapp_photo_captions"] == [
-        f"site photo {word}"
-        for word in ("one", "two", "three", "four", "five", "six", "seven")
-    ]
     assert event.reply_to_message_id == "bot-message-1"
     assert event.reply_to_text == "please review these photos"
 
@@ -258,6 +254,68 @@ async def test_photo_burst_hard_cap_and_reply_anchors_keep_dispatches_separate(m
     assert [event.reply_to_message_id for event in dispatched] == ["bot-message-1", "bot-message-2"]
     assert dispatched[0].media_urls == ["/tmp/wa-photo-1.jpg", "/tmp/wa-photo-3.jpg"]
     assert dispatched[1].media_urls == ["/tmp/wa-photo-2.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_photo_captions_retain_every_physical_occurrence(monkeypatch):
+    """Repeated captions describe separate images and must not be de-duplicated."""
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    monkeypatch.setattr(WhatsAppAdapter, "_PHOTO_BURST_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "plugins.platforms.whatsapp.adapter._is_allowed_bridge_path", lambda _path: True
+    )
+    first = await adapter._build_message_event(_message_at(0, body="same caption"))
+    second = await adapter._build_message_event(_message_at(1, body="same caption"))
+    assert first is not None and second is not None
+
+    adapter._enqueue_group_photo_burst(first)
+    adapter._enqueue_group_photo_burst(second)
+    await asyncio.sleep(0.03)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "same caption\n\nsame caption"
+    assert event.media_urls == ["/tmp/wa-photo-1.jpg", "/tmp/wa-photo-2.jpg"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("boundary", "second_updates", "second_profile"),
+    (
+        (
+            "sender",
+            {"senderId": "15550000002@s.whatsapp.net"},
+            None,
+        ),
+        ("owner profile", {}, "other-owner"),
+    ),
+)
+async def test_photo_burst_keys_do_not_merge_across_sender_or_owner_profile(
+    monkeypatch, boundary, second_updates, second_profile
+):
+    """The adapter-local burst key keeps independent ingress lanes apart."""
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+    monkeypatch.setattr(WhatsAppAdapter, "_PHOTO_BURST_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "plugins.platforms.whatsapp.adapter._is_allowed_bridge_path", lambda _path: True
+    )
+    first = await adapter._build_message_event(_message_at(0))
+    second = await adapter._build_message_event(_message_at(1, **second_updates))
+    assert first is not None and second is not None
+    if second_profile:
+        first.source.profile = "photo-burst-test"
+        second.source.profile = second_profile
+
+    adapter._enqueue_group_photo_burst(first)
+    adapter._enqueue_group_photo_burst(second)
+    await asyncio.sleep(0.03)
+
+    assert adapter.handle_message.await_count == 2, boundary
+    assert [call.args[0].media_urls for call in adapter.handle_message.await_args_list] == [
+        ["/tmp/wa-photo-1.jpg"],
+        ["/tmp/wa-photo-2.jpg"],
+    ]
 
 
 @pytest.mark.asyncio
