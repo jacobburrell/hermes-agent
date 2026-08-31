@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from gateway.config import GatewayConfig, Platform
@@ -78,6 +79,27 @@ def test_managed_scope_is_process_global_and_wins_at_the_live_boundary(
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
 
     assert _runner()._busy_ack_enabled_for_source(_source()) is False
+
+
+@pytest.mark.parametrize("platform", [Platform.WHATSAPP, Platform.WHATSAPP_CLOUD])
+def test_blank_managed_overlay_leaves_valid_user_busy_policy_intact(
+    tmp_path, monkeypatch, platform
+):
+    """An empty managed overlay is no policy, not a malformed override."""
+    import gateway.run as gateway_run
+    from hermes_cli import managed_scope
+
+    user_home = tmp_path / "user"
+    managed_home = tmp_path / "managed"
+    _write_config(user_home, {"busy_ack_enabled": True})
+    managed_home.mkdir()
+    (managed_home / "config.yaml").write_text("\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", user_home)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_home))
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    managed_scope.invalidate_managed_cache()
+
+    assert _runner()._busy_ack_enabled_for_source(_source(platform)) is True
 
 
 def test_builtin_precedence_keeps_mobile_silent_and_other_platforms_unchanged():
