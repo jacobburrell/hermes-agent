@@ -1436,11 +1436,6 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
-        # Suppress only the visible busy-session acknowledgment when false;
-        # queue/steer/interrupt state transitions still happen normally.
-        # This is the global/non-WhatsApp default. WhatsApp surfaces ship an
-        # explicit platform default below so new profiles stay final-first.
-        "busy_ack_enabled": True,
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
@@ -1644,8 +1639,6 @@ DEFAULT_CONFIG = {
             "telegram": {"streaming": True},
             "discord": {"streaming": False},
             "slack": {"streaming": False},
-            "whatsapp": {"busy_ack_enabled": False},
-            "whatsapp_cloud": {"busy_ack_enabled": False},
             # WeCom uses native streaming (msgtype: "stream") via
             # aibot_respond_msg — opt in by default so the WeCom client
             # renders the typing animation and cumulative content updates.

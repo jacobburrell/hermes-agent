@@ -10414,13 +10414,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         source: SessionSource,
     ) -> tuple[dict, bool]:
-        """Return live routed config and whether a valid policy read exists.
+        """Load busy policy through the routed canonical config scope.
 
-        The last-known-good cache is keyed by the resolved config path, so a
-        torn write in one multiplexed profile cannot borrow another profile's
-        policy. A valid empty mapping is still a successful read; a missing,
-        unreadable, malformed, or non-mapping file is not.
+        ``HERMES_MANAGED_DIR`` is process-scoped, not profile-scoped.  The
+        profile runtime scope below therefore selects only the source profile's
+        ``HERMES_HOME``; the canonical loader applies the one process-managed
+        overlay consistently after that profile's user config.
         """
+        def _load_active_scope() -> tuple[dict, bool]:
+            from hermes_cli.config import load_config_readonly_with_status
+
+            snapshot = load_config_readonly_with_status()
+            return snapshot.config, snapshot.has_valid_source
+
         try:
             if getattr(
                 getattr(self, "config", None), "multiplex_profiles", False
@@ -10455,123 +10461,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             expected_home,
                         )
                         return {}, False
-                    config_path = resolved_home / "config.yaml"
+                    with _profile_runtime_scope(resolved_home):
+                        return _load_active_scope()
                 else:
-                    config_path = (
-                        self._resolve_profile_home_for_source(source) / "config.yaml"
-                    )
-            else:
-                config_path = _gateway_config_home() / "config.yaml"
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        return _load_active_scope()
+            with _profile_runtime_scope(_gateway_config_home()):
+                return _load_active_scope()
         except Exception:
             logger.warning(
                 "Failed to resolve routed profile config for busy-ack policy",
                 exc_info=True,
             )
             return {}, False
-
-        cache_key = str(config_path)
-        last_known_good = self.__dict__.setdefault(
-            "_busy_ack_config_lkg_by_path",
-            {},
-        )
-        read_error: Exception | None = None
-        try:
-            # read_user_config_raw intentionally collapses missing and
-            # non-mapping roots to {}, so this presence-sensitive policy reads
-            # through the same YAML primitive while retaining those states.
-            from utils import fast_safe_load
-
-            with open(config_path, encoding="utf-8") as config_file:
-                loaded = fast_safe_load(config_file)
-            if not isinstance(loaded, dict):
-                raise TypeError(
-                    "top-level YAML must be a mapping, got "
-                    f"{type(loaded).__name__}"
-                )
-            user_config = loaded
-        except Exception as exc:
-            user_config = {}
-            read_error = exc
-
-        managed_config: dict = {}
-        managed_read_error: Exception | None = None
-        try:
-            from hermes_cli import managed_scope
-
-            managed_dir = managed_scope.get_managed_dir()
-            if managed_dir is not None:
-                managed_path = managed_dir / "config.yaml"
-                if managed_path.exists():
-                    try:
-                        with open(managed_path, encoding="utf-8") as managed_file:
-                            managed_loaded = fast_safe_load(managed_file)
-                        # The canonical managed loader treats an empty document
-                        # as an empty mapping, but rejects every other non-map.
-                        if managed_loaded is None:
-                            managed_loaded = {}
-                        if not isinstance(managed_loaded, dict):
-                            raise TypeError(
-                                "top-level managed YAML must be a mapping, got "
-                                f"{type(managed_loaded).__name__}"
-                            )
-                    except Exception as exc:
-                        managed_read_error = exc
-
-            if managed_read_error is not None:
-                cached = last_known_good.get(cache_key)
-                if isinstance(cached, dict):
-                    logger.warning(
-                        "Busy-ack managed config refresh failed for %s; "
-                        "keeping last-known-good routed policy: %s",
-                        managed_path,
-                        managed_read_error,
-                    )
-                    return cached, True
-
-            managed_config = managed_scope.apply_managed_overlay({})
-            config = managed_scope.apply_managed_overlay(dict(user_config))
-        except Exception:
-            config = dict(user_config)
-
-        try:
-            from hermes_cli.config import _expand_env_vars
-
-            managed_expanded = _expand_env_vars(managed_config)
-            if isinstance(managed_expanded, dict):
-                managed_config = managed_expanded
-            expanded = _expand_env_vars(config)
-            if isinstance(expanded, dict):
-                config = expanded
-        except Exception:
-            pass
-
-        from gateway.display_config import resolve_busy_ack_override
-
-        managed_explicit = resolve_busy_ack_override(
-            managed_config,
-            _platform_config_key(source.platform),
-            chat_type=getattr(source, "chat_type", None),
-        )
-        has_valid_policy_source = read_error is None or managed_explicit is not None
-        if not has_valid_policy_source:
-            cached = last_known_good.get(cache_key)
-            if isinstance(cached, dict):
-                logger.debug(
-                    "Busy-ack config refresh failed for %s; keeping "
-                    "last-known-good policy: %s",
-                    config_path,
-                    read_error,
-                )
-                return cached, True
-            logger.warning(
-                "Busy-ack config refresh failed for %s before any valid read: %s",
-                config_path,
-                read_error,
-            )
-            return {}, False
-
-        last_known_good[cache_key] = config
-        return config, True
 
     def _busy_ack_enabled_for_source(self, source: SessionSource) -> bool:
         """Resolve the source profile's live busy-ack visibility policy."""
