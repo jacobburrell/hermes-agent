@@ -414,6 +414,12 @@ By default, messaging a busy agent redirects its active turn. Two other modes ar
 display:
   busy_input_mode: steer   # or queue, or interrupt (default)
   busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
+  platforms:
+    whatsapp:
+      busy_ack_enabled: false       # platform override
+      chat_types:
+        group:
+          busy_ack_enabled: false   # group overrides platform/global
 ```
 
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.

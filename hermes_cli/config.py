@@ -3790,7 +3790,7 @@ def load_config_readonly() -> Dict[str, Any]:
 
 
 def _mapping_source_state(path: Optional[Path]) -> Optional[bool]:
-    """Return ``True``/``False`` for an existing mapping YAML, else ``None``.
+    """Return mapping validity, or ``None`` when a source has no policy.
 
     This is intentionally only a *source-validity* probe.  It does not build a
     competing config view: :func:`load_config_readonly_with_status` still gets
@@ -3805,9 +3805,12 @@ def _mapping_source_state(path: Optional[Path]) -> Optional[bool]:
             loaded = fast_safe_load(config_file)
     except Exception:
         return False
-    # A literal/empty YAML null is not the same thing as an explicit empty
-    # mapping (``{}``).  Policy readers must not treat a torn/blank file as a
-    # valid source during the first load.
+    # A literal/empty YAML null has no policy, just like an absent overlay.
+    # It must not invalidate a valid user config that the managed scope merely
+    # leaves untouched.  Parse/I/O failures and scalar/list YAML remain False:
+    # those are a broken source, not an empty one.
+    if loaded is None:
+        return None
     return isinstance(loaded, dict)
 
 
