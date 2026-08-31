@@ -159,6 +159,60 @@ import {
 }
 
 {
+  // The Python group-photo-burst fixture is intentionally shaped like these
+  // two physical bridge events.  Keep this contract at the native boundary:
+  // every event retains one image URL, its caption and reply anchor, plus the
+  // exact receipt key needed to acknowledge that physical image.  Baileys
+  // does not provide an album ID here.
+  const groupChat = '120363001234567890@g.us';
+  const sender = '15550001111@s.whatsapp.net';
+  const quote = {
+    stanzaId: 'bot-message-1',
+    participant: '15559998888@s.whatsapp.net',
+    remoteJid: groupChat,
+    quotedMessage: { conversation: 'please review these photos' },
+  };
+  let saved = 0;
+  const events = [];
+  for (const [id, caption] of [
+    ['group-image-1', 'site photo one'],
+    ['group-image-2', 'site photo two'],
+  ]) {
+    events.push(await extractBridgeEvent({
+      msg: {
+        key: { id, remoteJid: groupChat, participant: sender, fromMe: false },
+        pushName: 'Field reporter',
+        messageTimestamp: 123,
+        message: { imageMessage: { caption, mimetype: 'image/jpeg', contextInfo: quote } },
+      },
+      chatId: groupChat,
+      senderId: sender,
+      senderNumber: '15550001111',
+      isGroup: true,
+      downloadMedia: async () => Buffer.from('image'),
+      writeMediaFile: async () => `/tmp/group-photo-${++saved}.jpg`,
+    }));
+  }
+
+  assert.deepEqual(events.map(event => event.mediaUrls), [
+    ['/tmp/group-photo-1.jpg'],
+    ['/tmp/group-photo-2.jpg'],
+  ]);
+  assert.deepEqual(events.map(event => event.body), ['site photo one', 'site photo two']);
+  assert.deepEqual(events.map(event => event.quotedMessageId), ['bot-message-1', 'bot-message-1']);
+  assert.deepEqual(events.map(event => event.quotedParticipant), [
+    '15559998888@s.whatsapp.net',
+    '15559998888@s.whatsapp.net',
+  ]);
+  assert.deepEqual(events.map(event => event.readReceiptKey), [
+    { id: 'group-image-1', remoteJid: groupChat, participant: sender, fromMe: false },
+    { id: 'group-image-2', remoteJid: groupChat, participant: sender, fromMe: false },
+  ]);
+  assert.equal(Object.hasOwn(events[0], 'albumId'), false);
+  console.log('  ✓ group image burst contract preserves media, captions, quote and receipts');
+}
+
+{
   const cacheDir = mkdtempSync(path.join(tmpdir(), 'hermes-wa-doc-'));
   const event = await extractBridgeEvent({
     msg: {
