@@ -3599,7 +3599,10 @@ def run_conversation(
                             break
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
-                        agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                        agent._emit_status(
+                            f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.",
+                            terminal_provider=True,
+                        )
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
@@ -3789,7 +3792,8 @@ def run_conversation(
                         _refusal_log or "(no text)",
                     )
                     agent._emit_status(
-                        "⚠️ The model declined to respond to this request (safety refusal)."
+                        "⚠️ The model declined to respond to this request (safety refusal).",
+                        terminal_provider=True,
                     )
 
                     _refusal_detail = (
@@ -6364,17 +6368,20 @@ def run_conversation(
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
-                            f"{_nonretryable_summary}"
+                            f"{_nonretryable_summary}",
+                            terminal_provider=True,
                         )
                     elif classified.reason == FailoverReason.ssl_cert_verification:
                         agent._emit_status(
                             f"❌ TLS certificate verification failed: "
-                            f"{_nonretryable_summary}"
+                            f"{_nonretryable_summary}",
+                            terminal_provider=True,
                         )
                     else:
                         agent._emit_status(
                             f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{_nonretryable_summary}"
+                            f"{_nonretryable_summary}",
+                            terminal_provider=True,
                         )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
@@ -6570,10 +6577,14 @@ def run_conversation(
                             # Ambiguous body (#82154) — hedge the terminal line.
                             agent._emit_status(
                                 "❌ Provider reported usage/credit exhaustion "
-                                f"(unverified — may be a content-filter rejection) — {_final_summary}"
+                                f"(unverified — may be a content-filter rejection) — {_final_summary}",
+                                terminal_provider=True,
                             )
                         else:
-                            agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
+                            agent._emit_status(
+                                f"❌ Billing or credits exhausted — {_final_summary}",
+                                terminal_provider=True,
+                            )
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
@@ -6590,9 +6601,15 @@ def run_conversation(
                             unverified=classified.billing_unverified,
                         )
                     elif is_rate_limited:
-                        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                        agent._emit_status(
+                            f"❌ Rate limited after {max_retries} retries — {_final_summary}",
+                            terminal_provider=True,
+                        )
                     else:
-                        agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                        agent._emit_status(
+                            f"❌ API failed after {max_retries} retries — {_final_summary}",
+                            terminal_provider=True,
+                        )
                     agent._vprint(f"{agent.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                     # Detect SSE stream-drop pattern (e.g. "Network

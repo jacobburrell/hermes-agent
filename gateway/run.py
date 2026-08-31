@@ -593,6 +593,7 @@ _GATEWAY_PROVIDER_POLICY_RE = re.compile(
     r"cybersecurity\s+risk"
     r"|security\s+policy"
     r"|safety\s+policy"
+    r"|safety\s+filter"
     r"|policy\s+violation"
     r"|violat(?:e|es|ed|ion)"
     r"|blocked\s+(?:because|by|under)"
@@ -610,6 +611,13 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 
 _GATEWAY_RATE_LIMIT_RE = re.compile(
     r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
+    re.IGNORECASE,
+)
+
+_GATEWAY_BILLING_ERROR_RE = re.compile(
+    r"(billing\s+or\s+credits?\s+exhausted|"
+    r"usage/credit\s+exhaustion|"
+    r"usage\s+limit\s+reached)",
     re.IGNORECASE,
 )
 
@@ -926,6 +934,11 @@ def _gateway_provider_error_reply(text: str) -> str:
             "⚠️ The model provider rejected the request. I kept the raw provider "
             "error out of chat; check gateway logs for details or try rephrasing."
         )
+    if _GATEWAY_BILLING_ERROR_RE.search(text):
+        return (
+            "⚠️ The model provider reported a billing or usage-access issue. "
+            "Check the provider account or try another configured model."
+        )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
     if _GATEWAY_CONNECTION_ERROR_RE.search(text):
@@ -945,6 +958,10 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"|provider\s+authentication\s+failed"
     r"|non-retryable\s+error"
     r"|rate\s+limited\s+after\s+\d+\s+retries"
+    r"|billing\s+or\s+credits?\s+exhausted"
+    r"|provider\s+reported\s+usage/credit\s+exhaustion"
+    r"|(?:the\s+)?model(?:\s+provider)?(?:'s)?\s+safety\s+filter\s+blocked"
+    r"|model\s+declined\s+to\s+respond"
     r"|error\s+code\s*:"
     r"|http\s*\d{3}\b"
     r"|incorrect\s+api\s+key"
@@ -1036,6 +1053,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    # Terminal provider diagnostics are paired with the conversation loop's
+    # final_response.  Chat receives the one sanitized final via the normal
+    # Base adapter + delivery-ledger rail; scheduling this progress callback
+    # as well creates a duplicate visible reply.  Local/API retain the raw
+    # event above for troubleshooting.
+    if event_type == "terminal_provider":
+        return None
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
