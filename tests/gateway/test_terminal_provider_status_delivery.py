@@ -41,7 +41,8 @@ TERMINAL_PROVIDER_CASES = (
         "⚠️  The model declined to respond to this request "
         "(safety refusal — not a Hermes/gateway failure).\n\n"
         f"Model's explanation: {_LONG_PROVIDER_DETAIL}\n\n"
-        "Try rephrasing the request, narrowing the context, or adding a fallback provider.",
+        "Try rephrasing the request, narrowing the context, or "
+        "adding a fallback provider with `hermes fallback add`.",
         "provider rejected",
     ),
     (
@@ -50,7 +51,8 @@ TERMINAL_PROVIDER_CASES = (
         "⚠️  The model provider's safety filter blocked this request "
         "(not a Hermes/gateway failure).\n\n"
         f"Provider message: {_LONG_PROVIDER_DETAIL}\n\n"
-        "Try rephrasing the request, narrowing the context, or adding a fallback provider.",
+        "Try rephrasing the request, narrowing the context, or "
+        "adding a fallback provider with `hermes fallback add`.",
         "provider rejected",
     ),
     (
