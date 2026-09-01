@@ -312,10 +312,17 @@ async def test_photo_burst_keys_do_not_merge_across_sender_or_owner_profile(
     await asyncio.sleep(0.03)
 
     assert adapter.handle_message.await_count == 2, boundary
-    assert [call.args[0].media_urls for call in adapter.handle_message.await_args_list] == [
-        ["/tmp/wa-photo-1.jpg"],
-        ["/tmp/wa-photo-2.jpg"],
-    ]
+    # These are independent timers, so their callback order is deliberately
+    # unspecified.  Assert each singleton by the same identity fields the
+    # burst key isolates: profile + sender.
+    dispatched = {
+        (event.source.profile, event.user_id): event.media_urls
+        for event in (call.args[0] for call in adapter.handle_message.await_args_list)
+    }
+    assert dispatched == {
+        (first.source.profile, first.user_id): first.media_urls,
+        (second.source.profile, second.user_id): second.media_urls,
+    }
 
 
 @pytest.mark.asyncio
