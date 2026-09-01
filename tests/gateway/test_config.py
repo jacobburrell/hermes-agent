@@ -315,6 +315,68 @@ class TestLoadGatewayConfig:
 
         assert config.default_reset_policy.mode == "none"
 
+    def test_managed_platform_loads_without_user_config(self, tmp_path, monkeypatch):
+        """A managed-only profile still reaches the gateway platform schema."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    whatsapp:\n"
+            "      enabled: true\n"
+            "      extra:\n"
+            "        require_mention: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("WHATSAPP_ENABLED", raising=False)
+
+        config = load_gateway_config()
+
+        whatsapp = config.platforms[Platform.WHATSAPP]
+        assert whatsapp.enabled is True
+        assert whatsapp.extra["require_mention"] is True
+
+    def test_managed_platform_overlays_present_user_config(self, tmp_path, monkeypatch):
+        """Managed values win while unrelated user platform settings remain."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    whatsapp:\n"
+            "      enabled: true\n"
+            "      extra:\n"
+            "        require_mention: false\n"
+            "        user_only: retained\n",
+            encoding="utf-8",
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    whatsapp:\n"
+            "      extra:\n"
+            "        require_mention: true\n"
+            "        managed_only: applied\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("WHATSAPP_ENABLED", raising=False)
+
+        config = load_gateway_config()
+
+        whatsapp = config.platforms[Platform.WHATSAPP]
+        assert whatsapp.enabled is True
+        assert whatsapp.extra["require_mention"] is True
+        assert whatsapp.extra["user_only"] == "retained"
+        assert whatsapp.extra["managed_only"] == "applied"
+
 
     def test_explicit_session_reset_opt_in_is_honored(self, tmp_path, monkeypatch):
         """Users who explicitly opt in to auto-reset keep their policy."""
