@@ -1412,18 +1412,22 @@ def load_gateway_config() -> GatewayConfig:
     try:
         import yaml
         config_yaml_path = _home / "config.yaml"
+        yaml_cfg: dict = {}
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
 
-            # Managed scope: overlay administrator-pinned values so the gateway
-            # honors them too. This loader builds its own dict instead of going
-            # through hermes_cli.config.load_config, so without this a managed
-            # session_reset / quick_commands / stt / model would be ignored by
-            # the messaging gateway. Fail-open via the shared helper.
-            from hermes_cli import managed_scope
-            yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+        # Managed scope: overlay administrator-pinned values so the gateway
+        # honors them too. This loader builds its own dict instead of going
+        # through hermes_cli.config.load_config, so without this a managed
+        # session_reset / quick_commands / stt / model would be ignored by
+        # the messaging gateway. Fail-open via the shared helper.  Apply it
+        # even for a fresh HERMES_HOME with no user config, so a process-scoped
+        # managed platform is not silently dropped before schema mapping.
+        from hermes_cli import managed_scope
+        yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
 
+        if config_yaml_path.exists() or yaml_cfg:
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`
             # (e.g. via `hermes config set gateway.<key> ...`, which naturally
