@@ -22,7 +22,19 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  sessionPathFingerprint,
 } from './bridge_helpers.js';
+
+// -- bridge health ownership fingerprint ---------------------------------
+{
+  const first = sessionPathFingerprint('/tmp/hermes-profile-a/session');
+  const equivalent = sessionPathFingerprint('/tmp/hermes-profile-a/./session');
+  const other = sessionPathFingerprint('/tmp/hermes-profile-b/session');
+  assert.equal(first.length, 32);
+  assert.equal(first, equivalent);
+  assert.notEqual(first, other);
+  console.log('  ✓ bridge health exposes only a stable session fingerprint');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

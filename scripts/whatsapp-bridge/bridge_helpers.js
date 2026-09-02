@@ -1,6 +1,16 @@
 import path from 'path';
 import { mkdirSync, writeFileSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
+
+export function sessionPathFingerprint(sessionDir) {
+  // Health responses are local-only, but never expose a profile/session path
+  // or auth material. The Python adapter calculates the same digest before
+  // it reuses a bridge bound to a shared local port.
+  return createHash('sha256')
+    .update(path.resolve(String(sessionDir || '')))
+    .digest('hex')
+    .slice(0, 32);
+}
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',

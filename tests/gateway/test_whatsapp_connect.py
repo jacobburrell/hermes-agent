@@ -66,6 +66,10 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    # Connection/error tests do not own the process-global bridge lock.  The
+    # ownership behavior is exercised in test_whatsapp_bridge_ownership.py.
+    adapter._acquire_bridge_port_lock = MagicMock(return_value=True)
+    adapter._release_bridge_port_lock = MagicMock()
     return adapter
 
 
@@ -293,8 +297,15 @@ class TestBridgeRuntimeFailure:
         mock_proc.returncode = 1
 
         # Health returns 200 with status != "connected" -> triggers Phase 2
+        from plugins.platforms.whatsapp.adapter import _session_path_fingerprint
+
         mock_client_cls = _mock_aiohttp(
-            status=200, json_data={"status": "disconnected"},
+            status=200,
+            json_data={
+                "status": "disconnected",
+                "sessionFingerprint": _session_path_fingerprint(adapter._session_path),
+                "pid": 12345,
+            },
         )
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
@@ -340,7 +351,7 @@ class TestKillPortProcess:
         with patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run, \
              patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
                    return_value=True):
-            _kill_port_process(3000)
+            _kill_port_process(3000, expected_pid=12345)
 
         # netstat called
         assert any(
@@ -371,7 +382,7 @@ class TestKillPortProcess:
         with patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run, \
              patch("plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
                    return_value=False):
-            _kill_port_process(3000)
+            _kill_port_process(3000, expected_pid=12345)
 
         assert not any(
             call.args[0][0] == "taskkill" for call in mock_run.call_args_list
@@ -399,7 +410,7 @@ class TestKillPortProcess:
                    return_value=True), \
              patch("plugins.platforms.whatsapp.adapter.os.kill",
                    side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+            wa._kill_port_process(3000, expected_pid=55555)
 
         mock_listeners.assert_called_once_with(3000)
         assert kills == [(55555, signal.SIGTERM)]
@@ -416,7 +427,7 @@ class TestKillPortProcess:
                    return_value=False), \
              patch("plugins.platforms.whatsapp.adapter.os.kill",
                    side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+            wa._kill_port_process(3000, expected_pid=55555)
 
         assert kills == []
 
