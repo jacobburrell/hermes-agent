@@ -38,7 +38,7 @@ class _AsyncCM:
         return False
 
 
-def _make_adapter():
+def _make_adapter(*, mock_session_lock: bool = True):
     """Create a WhatsAppAdapter with test attributes (bypass __init__)."""
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
@@ -69,6 +69,8 @@ def _make_adapter():
     # ownership behavior is exercised in test_whatsapp_bridge_ownership.py.
     adapter._acquire_bridge_port_lock = MagicMock(return_value=True)
     adapter._release_bridge_port_lock = MagicMock()
+    if mock_session_lock:
+        adapter._acquire_platform_lock = MagicMock(return_value=True)
     return adapter
 
 
@@ -204,7 +206,7 @@ class TestConnectCleanup:
 
     @pytest.mark.asyncio
     async def test_releases_lock_when_npm_install_fails(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(mock_session_lock=False)
 
         def _path_exists(path_obj):
             return not str(path_obj).endswith("node_modules")

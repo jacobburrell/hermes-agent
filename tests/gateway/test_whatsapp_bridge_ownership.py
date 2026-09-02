@@ -289,6 +289,62 @@ class TestBridgePortOwnership:
         popen.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_connect_creates_missing_scoped_lock_dir_before_health_reuse(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh host reaches the mocked bridge with no pre-created lock dir.
+
+        The adapter claims both the port and session scoped locks before its
+        first health request.  ``acquire_scoped_lock`` owns creation of their
+        shared machine-local parent; do not mock that primitive away here.
+        """
+        from plugins.platforms.whatsapp.adapter import (
+            _file_content_hash,
+            _session_path_fingerprint,
+        )
+
+        bridge, session_path = _bridge_tree(tmp_path, "profile-a")
+        adapter = _adapter(session_path, bridge)
+        lock_dir = tmp_path / "fresh-state" / "gateway-locks"
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-home"))
+        assert not lock_dir.exists()
+
+        health = {
+            "status": "connected",
+            "scriptHash": _file_content_hash(bridge),
+            "sendReadReceipts": False,
+            "sessionFingerprint": _session_path_fingerprint(session_path),
+            "pid": 42128,
+        }
+        health_client = _health_client(health)
+        fake_aiohttp = SimpleNamespace(
+            ClientSession=health_client,
+            ClientTimeout=lambda **_kwargs: object(),
+        )
+
+        try:
+            with patch(
+                "plugins.platforms.whatsapp.adapter.check_whatsapp_requirements",
+                return_value=True,
+            ), patch.dict(sys.modules, {"aiohttp": fake_aiohttp}), patch(
+                "subprocess.Popen"
+            ) as popen, patch.object(
+                adapter, "_wire_plugin_handlers"
+            ), patch(
+                "plugins.platforms.whatsapp.adapter.asyncio.create_task",
+                side_effect=_discard_background_coroutine,
+            ):
+                assert await adapter.connect() is True
+        finally:
+            adapter._release_platform_lock()
+            adapter._release_bridge_port_lock()
+
+        assert lock_dir.is_dir()
+        health_client.return_value.value.get.assert_called_once()
+        popen.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_mismatched_health_never_reuses_or_kills_other_profile(self, tmp_path):
         """A port owner's different session is a retryable, silent conflict."""
         from plugins.platforms.whatsapp.adapter import _session_path_fingerprint
