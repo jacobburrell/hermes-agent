@@ -85,6 +85,7 @@ class TestWriteAndRoundTrip:
 
 
 class TestIdentityGuard:
+    @pytest.mark.live_system_guard_bypass
     def test_kills_when_start_time_matches(self, tmp_path):
         """A genuine bridge (recorded start time matches) IS reaped."""
         proc = _spawn_node_bridge(tmp_path)
@@ -99,6 +100,7 @@ class TestIdentityGuard:
                 proc.wait()
 
 
+    @pytest.mark.live_system_guard_bypass
     def test_legacy_pidfile_kills_matching_bridge_cmdline(self, tmp_path):
         """Legacy pidfile: a PID whose cmdline names node + session IS reaped."""
         # Shape the cmdline to look like the node bridge for this session.
