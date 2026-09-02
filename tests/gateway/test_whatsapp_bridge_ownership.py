@@ -79,15 +79,17 @@ def _bridge_tree(tmp_path: Path, session_name: str) -> tuple[Path, Path]:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir(exist_ok=True)
     bridge = bridge_dir / "bridge.js"
-    bridge.write_text("// ownership test bridge\n")
+    bridge.write_text("// ownership test bridge\n", encoding="utf-8")
     package = bridge_dir / "package.json"
-    package.write_text('{"name":"bridge"}\n')
+    package.write_text('{"name":"bridge"}\n', encoding="utf-8")
     node_modules = bridge_dir / "node_modules"
     node_modules.mkdir(exist_ok=True)
-    (node_modules / ".hermes-pkg-hash").write_text(_file_content_hash(package))
+    (node_modules / ".hermes-pkg-hash").write_text(
+        _file_content_hash(package), encoding="utf-8"
+    )
     session = tmp_path / session_name
     session.mkdir()
-    (session / "creds.json").write_text("{}")
+    (session / "creds.json").write_text("{}", encoding="utf-8")
     return bridge, session
 
 
