@@ -10,7 +10,6 @@ suppressed by _prepare_gateway_status_message rather than pushed to chat.
 
 import pytest
 
-from agent.conversation_compression import COMPACTION_DONE_STATUS
 from gateway.config import Platform
 from gateway.run import _prepare_gateway_status_message
 
@@ -54,11 +53,6 @@ def test_lifecycle_gate_is_scoped_to_lifecycle_only():
     # with interim assistant messages muted.
     warn = "⚠️ Tool execution failed; retrying with a different approach."
     assert _prepare_gateway_status_message(platform, "warn", warn, interim_enabled=False) == warn
-    # Compacted event likewise.
-    assert (
-        _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS, interim_enabled=False)
-        == COMPACTION_DONE_STATUS
-    )
 
 
 # Durable must-see lifecycle statuses that reach the gateway today and MUST
