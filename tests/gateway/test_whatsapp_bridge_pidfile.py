@@ -18,6 +18,9 @@ import subprocess
 import sys
 import time
 
+import pytest
+
+from hermes_constants import find_node_executable
 from plugins.platforms.whatsapp.adapter import (
     _bridge_pid_is_ours,
     _kill_stale_bridge_by_pidfile,
@@ -30,6 +33,23 @@ def _spawn_sleeper(*extra_argv) -> subprocess.Popen:
     """Spawn a real, short-lived process; optional extra argv shapes its cmdline."""
     return subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(0.2)", *extra_argv]
+    )
+
+
+def _spawn_node_bridge(session_path) -> subprocess.Popen:
+    """Spawn a real Node-shaped bridge command line for identity testing."""
+    node = find_node_executable("node")
+    if not node:
+        pytest.skip("Node is required for the live bridge PID identity check")
+    return subprocess.Popen(
+        [
+            node,
+            "-e",
+            "setTimeout(() => {}, 1000)",
+            "bridge.js",
+            "--session",
+            str(session_path),
+        ]
     )
 
 
@@ -57,14 +77,17 @@ class TestWriteAndRoundTrip:
             else:
                 assert int(lines[1]) == start_time
         finally:
-            proc.kill()
-            proc.wait()
+            # The helper process exits by itself.  Do not signal it here: the
+            # repository-wide live-system guard can observe a just-reparented
+            # child as outside this test's subtree even though ``poll()`` has
+            # not caught up yet.
+            proc.wait(timeout=5)
 
 
 class TestIdentityGuard:
     def test_kills_when_start_time_matches(self, tmp_path):
         """A genuine bridge (recorded start time matches) IS reaped."""
-        proc = _spawn_sleeper("node", str(tmp_path))
+        proc = _spawn_node_bridge(tmp_path)
         try:
             _write_bridge_pidfile(tmp_path, proc.pid)
             _kill_stale_bridge_by_pidfile(tmp_path)
@@ -79,7 +102,7 @@ class TestIdentityGuard:
     def test_legacy_pidfile_kills_matching_bridge_cmdline(self, tmp_path):
         """Legacy pidfile: a PID whose cmdline names node + session IS reaped."""
         # Shape the cmdline to look like the node bridge for this session.
-        proc = _spawn_sleeper("node", str(tmp_path))
+        proc = _spawn_node_bridge(tmp_path)
         try:
             (tmp_path / "bridge.pid").write_text(str(proc.pid))  # legacy: pid only
             _kill_stale_bridge_by_pidfile(tmp_path)
@@ -130,3 +153,87 @@ class TestIdentityGuard:
         _kill_stale_bridge_by_pidfile(tmp_path)
 
         assert killed == []
+
+    @pytest.mark.parametrize(
+        ("pidfile", "expected_start"),
+        [("4242\n100", 100), ("4242", None)],
+        ids=["start-time", "legacy"],
+    )
+    @pytest.mark.parametrize(
+        "cmdline_builder",
+        [
+            lambda session: f"node bridge.js --session {session}-other",
+            lambda session: (
+                f"node bridge.js --session "
+                f"{session.parent / ('other-' + session.name)}"
+            ),
+            lambda session: f"python node bridge.js --session {session}",
+            lambda session: (
+                f"node bridge.js --session {session}-other --session {session}"
+            ),
+            lambda session: (
+                f"node bridge.js --session {session} --session {session}-other"
+            ),
+        ],
+        ids=[
+            "session-suffix",
+            "session-prefix",
+            "fake-node-argument",
+            "duplicate-foreign-first",
+            "duplicate-foreign-second",
+        ],
+    )
+    def test_pidfile_never_kills_prefix_suffix_or_fake_node(
+        self, tmp_path, monkeypatch, pidfile, expected_start, cmdline_builder
+    ):
+        """Only Node's exact ``--session <path>`` argv pair can authorize SIGTERM."""
+        from gateway import status
+
+        session = tmp_path / "wa-session"
+        session.mkdir()
+        (session / "bridge.pid").write_text(pidfile, encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: expected_start)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda _pid: cmdline_builder(session)
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(session)
+
+        assert killed == []
+
+    @pytest.mark.parametrize(
+        ("pidfile", "expected_start"),
+        [("4242\n100", 100), ("4242", None)],
+        ids=["start-time", "legacy"],
+    )
+    def test_pidfile_kills_only_exact_node_session_argv(
+        self, tmp_path, monkeypatch, pidfile, expected_start
+    ):
+        """Both modern and legacy PID files retain an exact positive path."""
+        from gateway import status
+
+        session = tmp_path / "wa-session"
+        session.mkdir()
+        (session / "bridge.pid").write_text(pidfile, encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: expected_start)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: f"/usr/local/bin/node bridge.js --session {session}",
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(session)
+
+        assert killed == [(4242, 15)]

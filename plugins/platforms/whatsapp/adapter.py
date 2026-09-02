@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -84,9 +85,9 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     at irregular intervals (every time the flapping bridge restarted).
 
     Identity is confirmed by the kernel start time captured when we wrote the
-    pidfile *and* the command line, which must contain ``node`` and this
-    session's unique path.  Legacy pidfiles without a start-time baseline keep
-    the command-line check only.  A recycled PID is never ours.
+    pidfile *and* an exact Node ``--session`` argv pair.  Legacy pidfiles
+    without a start-time baseline keep that exact command-line check only. A
+    recycled PID is never ours.
     """
     from gateway.status import _pid_exists
     if not _pid_exists(pid):
@@ -97,12 +98,38 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
             return False
     # Do not use PID/start-time alone: confirm the live process still has the
     # exact bridge/session command-line shape before any signal.  If the
-    # cmdline is unavailable we refuse to kill rather than risk a stranger.
+    # command cannot be parsed, fail closed rather than risk a stranger.  The
+    # status helper supplies a display command line on non-/proc platforms;
+    # quoted paths parse correctly there, while an ambiguous /proc rendering
+    # (for example a session path with spaces) is deliberately not killable.
     from gateway.status import _read_process_cmdline
     cmdline = _read_process_cmdline(pid)
     if not cmdline:
         return False
-    return ("node" in cmdline) and (str(session_path) in cmdline)
+    try:
+        argv = shlex.split(cmdline, posix=not _IS_WINDOWS)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    executable = Path(argv[0].strip('"\'')).name.casefold()
+    if executable not in {"node", "node.exe"}:
+        return False
+
+    # bridge.js reads its first ``--session`` flag.  Do not let cleanup accept
+    # a duplicate-flag argv whose selected bridge session could be different:
+    # any duplicate or missing flag value is unsafe to signal.
+    session_indexes = [
+        index for index, argument in enumerate(argv) if argument == "--session"
+    ]
+    if len(session_indexes) != 1:
+        return False
+    session_index = session_indexes[0]
+    return (
+        session_index + 1 < len(argv)
+        and argv[session_index + 1] == str(session_path)
+    )
 
 
 def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
