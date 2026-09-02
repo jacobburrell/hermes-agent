@@ -46,6 +46,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  sessionPathFingerprint,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -86,6 +87,7 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const SESSION_FINGERPRINT = sessionPathFingerprint(SESSION_DIR);
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -1110,6 +1112,8 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    sessionFingerprint: SESSION_FINGERPRINT,
+    pid: process.pid,
     sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });
