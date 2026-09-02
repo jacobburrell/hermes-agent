@@ -985,6 +985,29 @@ def find_node_executable_on_path(command: str) -> str | None:
     return None
 
 
+_DARWIN_NODE_TOOL_DIRS = (Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
+
+
+def _find_darwin_node_tool_fallback(command: str) -> str | None:
+    """Find a standard macOS Node tool omitted from a service's ``PATH``.
+
+    launchd jobs do not inherit an interactive shell's PATH, so a normal
+    Homebrew installation can be available to a user but invisible to a
+    gateway service.  This is deliberately a last-resort lookup: managed
+    Hermes Node and an explicitly supplied PATH always win.  Do not extend it
+    to arbitrary commands or paths -- callers that supplied a path should not
+    be silently redirected to a different executable.
+    """
+    if sys.platform != "darwin" or command not in {"node", "npm"}:
+        return None
+
+    for directory in _DARWIN_NODE_TOOL_DIRS:
+        candidate = directory / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def find_node_executable(command: str) -> str | None:
     """Resolve a Node.js command, preferring healthy Hermes-managed installs.
 
@@ -998,7 +1021,10 @@ def find_node_executable(command: str) -> str | None:
         return managed
     if hermes_managed_node_tree_present():
         return None
-    return find_node_executable_on_path(command)
+    on_path = find_node_executable_on_path(command)
+    if on_path:
+        return on_path
+    return _find_darwin_node_tool_fallback(command)
 
 
 def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:

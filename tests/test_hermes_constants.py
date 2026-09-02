@@ -206,6 +206,90 @@ class TestHermesManagedNode:
         assert find_node_executable("npm") != str(path_npm)
 
 
+class TestDarwinNodeToolFallback:
+    """macOS services can miss Homebrew's Node tools in their launch PATH."""
+
+    @staticmethod
+    def _disable_managed_node(monkeypatch):
+        monkeypatch.setattr(
+            hermes_constants, "find_hermes_node_executable", lambda command: None
+        )
+        monkeypatch.setattr(
+            hermes_constants, "hermes_managed_node_tree_present", lambda: False
+        )
+
+    @pytest.mark.parametrize(
+        ("command", "common_path"),
+        (
+            ("node", ("opt", "homebrew", "bin")),
+            ("npm", ("usr", "local", "bin")),
+        ),
+    )
+    def test_macos_falls_back_to_common_node_tool_dirs(
+        self, tmp_path, monkeypatch, command, common_path
+    ):
+        common_bin = tmp_path.joinpath(*common_path)
+        common_bin.mkdir(parents=True)
+        tool = common_bin / command
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+
+        self._disable_managed_node(monkeypatch)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "darwin")
+        monkeypatch.setattr(hermes_constants, "_DARWIN_NODE_TOOL_DIRS", (common_bin,))
+        monkeypatch.setattr(
+            hermes_constants, "find_node_executable_on_path", lambda command: None
+        )
+
+        assert find_node_executable(command) == str(tool)
+
+    def test_path_result_wins_over_macos_fallback(self, monkeypatch):
+        self._disable_managed_node(monkeypatch)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            hermes_constants,
+            "find_node_executable_on_path",
+            lambda command: "/service-path/node",
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "_find_darwin_node_tool_fallback",
+            lambda command: pytest.fail("Darwin fallback must not override PATH"),
+        )
+
+        assert find_node_executable("node") == "/service-path/node"
+
+    def test_managed_node_still_wins_before_path_or_macos_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            hermes_constants,
+            "find_hermes_node_executable",
+            lambda command: "/managed/node",
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "find_node_executable_on_path",
+            lambda command: pytest.fail("PATH must not override managed Node"),
+        )
+
+        assert find_node_executable("node") == "/managed/node"
+
+    def test_non_darwin_never_uses_macos_fallback(self, tmp_path, monkeypatch):
+        common_bin = tmp_path / "usr" / "local" / "bin"
+        common_bin.mkdir(parents=True)
+        node = common_bin / "node"
+        node.write_text("#!/bin/sh\nexit 0\n")
+        node.chmod(0o755)
+
+        self._disable_managed_node(monkeypatch)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "linux")
+        monkeypatch.setattr(hermes_constants, "_DARWIN_NODE_TOOL_DIRS", (common_bin,))
+        monkeypatch.setattr(
+            hermes_constants, "find_node_executable_on_path", lambda command: None
+        )
+
+        assert find_node_executable("node") is None
+
+
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shell stubs; Windows uses .cmd shims")
 class TestNodeToolRunnable:
