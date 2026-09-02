@@ -22,6 +22,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -526,6 +527,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Group photos have a distinct burst shape in the bridge: an album ID
+        # is not guaranteed, so admitted photos share a short quiet window.
+        # Keep this entirely adapter-local and only create it after admission.
+        self._pending_photo_bursts: Dict[str, list[MessageEvent]] = {}
+        self._pending_photo_burst_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_photo_burst_hard_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_photo_burst_started: Dict[str, float] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -922,6 +930,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
+
+        # Stop ingress before any bridge-stop await.  Otherwise the poll task
+        # can finish building a message while shutdown waits for SIGTERM and
+        # create a fresh burst after teardown tried to cancel the old ones.
+        poll_task = getattr(self, "_poll_task", None)
+        if (
+            poll_task
+            and not poll_task.done()
+            and poll_task is not asyncio.current_task()
+        ):
+            poll_task.cancel()
+            try:
+                await poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._poll_task = None
+        self._cancel_pending_photo_bursts()
         if self._bridge_process:
             try:
                 try:
@@ -945,15 +970,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             (self._session_path / "bridge.pid").unlink(missing_ok=True)
         except OSError:
             pass
-
-        # Cancel the poll task explicitly
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._poll_task = None
 
         # Close the persistent HTTP session
         if self._http_session and not self._http_session.closed:
@@ -1386,16 +1402,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not
-                                # delay message dispatch (matches BlueBubbles
-                                # asyncio.create_task pattern for mark_read).
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                            await self._process_inbound_data(msg_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1407,6 +1414,35 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
+
+    async def _process_inbound_data(self, msg_data: Dict[str, Any]) -> None:
+        """Admit one bridge event before it can cause any adapter side effect.
+
+        Group traffic that is not explicitly operational must leave here.  In
+        particular, it must not be normalized into an event, cache media,
+        read a document, schedule a read receipt, or join a burst timer.
+        """
+        if getattr(self, "_shutting_down", False) or not self._should_process_message(msg_data):
+            return
+
+        event = await self._build_message_event(msg_data)
+        if not event:
+            return
+        # A cancellation-resistant builder can finish after disconnect() has
+        # already stopped polling.  Treat that result as stale ingress rather
+        # than scheduling receipt, batching, or Base/session work.
+        if getattr(self, "_shutting_down", False):
+            return
+
+        # Fire-and-forget: a slow bridge /read must not delay an admitted
+        # request.  It remains after admission, never on ambient traffic.
+        asyncio.create_task(self._send_read_receipt(msg_data))
+        if event.source.chat_type == "group" and event.message_type == MessageType.PHOTO:
+            self._enqueue_admitted_photo_burst(event)
+        elif event.message_type == MessageType.TEXT:
+            self._enqueue_text_event(event)
+        else:
+            await self.handle_message(event)
 
     async def _send_read_receipt(self, data: Dict[str, Any]) -> None:
         """Mark a policy-accepted inbound message as read via the bridge."""
@@ -1492,6 +1528,91 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    _PHOTO_BURST_QUIET_SECONDS = 0.35
+    _PHOTO_BURST_HARD_CAP_SECONDS = 1.0
+
+    def _photo_burst_key(self, event: MessageEvent) -> str:
+        """Keep admitted photo bursts isolated by source ownership and reply."""
+        raw = event.raw_message or {}
+        album_id = raw.get("albumId") or raw.get("mediaGroupId")
+        profile = self._session_key_profile(event.source) or "default"
+        sender = event.source.user_id or "unknown"
+        reply_anchor = event.reply_to_message_id or "-"
+        album_or_burst = f"album:{album_id}" if album_id else "burst"
+        return "\x1f".join(
+            (profile, event.source.chat_id, sender, reply_anchor, album_or_burst)
+        )
+
+    def _enqueue_admitted_photo_burst(self, event: MessageEvent) -> None:
+        """Coalesce only already-admitted group photos before Base dispatch."""
+        key = self._photo_burst_key(event)
+        self._pending_photo_bursts.setdefault(key, []).append(event)
+        started = self._pending_photo_burst_started.setdefault(key, time.monotonic())
+
+        if key not in self._pending_photo_burst_hard_tasks:
+            self._pending_photo_burst_hard_tasks[key] = asyncio.create_task(
+                self._flush_admitted_photo_burst(key, self._PHOTO_BURST_HARD_CAP_SECONDS)
+            )
+
+        quiet_task = self._pending_photo_burst_tasks.get(key)
+        if quiet_task and not quiet_task.done():
+            quiet_task.cancel()
+        elapsed = time.monotonic() - started
+        self._pending_photo_burst_tasks[key] = asyncio.create_task(
+            self._flush_admitted_photo_burst(
+                key,
+                max(0.0, min(self._PHOTO_BURST_QUIET_SECONDS, self._PHOTO_BURST_HARD_CAP_SECONDS - elapsed)),
+            )
+        )
+
+    async def _flush_admitted_photo_burst(self, key: str, delay: float) -> None:
+        """Dispatch one ordered photo envelope after quiet time or hard cap."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay)
+            events = self._pending_photo_bursts.pop(key, None)
+            if not events:
+                return
+            self._pending_photo_burst_started.pop(key, None)
+
+            for task_map in (
+                self._pending_photo_burst_tasks,
+                self._pending_photo_burst_hard_tasks,
+            ):
+                sibling = task_map.get(key)
+                if sibling is not None and sibling is not current_task and not sibling.done():
+                    sibling.cancel()
+                task_map.pop(key, None)
+
+            merged = events[0]
+            merged.media_urls = [url for event in events for url in event.media_urls]
+            merged.media_types = [kind for event in events for kind in event.media_types]
+            # Captions are deliberately not deduplicated: occurrence and wire
+            # order carry meaning for albums whose photos share a caption.
+            merged.text = "\n".join(event.text for event in events if event.text)
+            await self.handle_message(merged)
+        finally:
+            for task_map in (
+                self._pending_photo_burst_tasks,
+                self._pending_photo_burst_hard_tasks,
+            ):
+                if task_map.get(key) is current_task:
+                    task_map.pop(key, None)
+
+    def _cancel_pending_photo_bursts(self) -> None:
+        """Prevent a deferred admitted burst from dispatching after teardown."""
+        for task_map in (
+            getattr(self, "_pending_photo_burst_tasks", {}).values(),
+            getattr(self, "_pending_photo_burst_hard_tasks", {}).values(),
+        ):
+            for task in task_map:
+                if not task.done():
+                    task.cancel()
+        getattr(self, "_pending_photo_bursts", {}).clear()
+        getattr(self, "_pending_photo_burst_tasks", {}).clear()
+        getattr(self, "_pending_photo_burst_hard_tasks", {}).clear()
+        getattr(self, "_pending_photo_burst_started", {}).clear()
 
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
