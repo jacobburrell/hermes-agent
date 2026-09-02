@@ -9,8 +9,9 @@ the user's browser main process got SIGTERMed, closing the browser at irregular
 intervals (no crash, no coredump — a clean kill of a stranger).
 
 These tests prove the identity guard: a PID is only signalled when it is still
-our bridge (kernel start time matches, or — for legacy pidfiles — its command
-line names node + this session). A recycled PID is left alone.
+our bridge (kernel start time matches and its command line names node + this
+session; legacy pidfiles retain the command-line check). A recycled PID is
+left alone.
 """
 
 import subprocess
@@ -19,23 +20,36 @@ import time
 
 import pytest
 
-import os
-import socket
-
+from hermes_constants import find_node_executable
 from plugins.platforms.whatsapp.adapter import (
     _bridge_pid_is_ours,
-    _kill_port_process,
     _kill_stale_bridge_by_pidfile,
-    _listener_pids_on_port,
     _write_bridge_pidfile,
 )
-from gateway.status import get_process_start_time, _pid_exists
+from gateway.status import get_process_start_time
 
 
 def _spawn_sleeper(*extra_argv) -> subprocess.Popen:
     """Spawn a real, short-lived process; optional extra argv shapes its cmdline."""
     return subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(0.2)", *extra_argv]
+    )
+
+
+def _spawn_node_bridge(session_path) -> subprocess.Popen:
+    """Spawn a real Node-shaped bridge command line for identity testing."""
+    node = find_node_executable("node")
+    if not node:
+        pytest.skip("Node is required for the live bridge PID identity check")
+    return subprocess.Popen(
+        [
+            node,
+            "-e",
+            "setTimeout(() => {}, 1000)",
+            "bridge.js",
+            "--session",
+            str(session_path),
+        ]
     )
 
 
@@ -55,17 +69,25 @@ class TestWriteAndRoundTrip:
             _write_bridge_pidfile(tmp_path, proc.pid)
             lines = (tmp_path / "bridge.pid").read_text().split("\n")
             assert int(lines[0]) == proc.pid
-            # Line 2 is the kernel start time (present on Linux).
-            assert int(lines[1]) == get_process_start_time(proc.pid)
+            # Some platforms cannot expose a process start time; the helper
+            # intentionally retains a one-line legacy-safe pidfile there.
+            start_time = get_process_start_time(proc.pid)
+            if start_time is None:
+                assert len(lines) == 1
+            else:
+                assert int(lines[1]) == start_time
         finally:
-            proc.kill()
-            proc.wait()
+            # The helper process exits by itself.  Do not signal it here: the
+            # repository-wide live-system guard can observe a just-reparented
+            # child as outside this test's subtree even though ``poll()`` has
+            # not caught up yet.
+            proc.wait(timeout=5)
 
 
 class TestIdentityGuard:
     def test_kills_when_start_time_matches(self, tmp_path):
         """A genuine bridge (recorded start time matches) IS reaped."""
-        proc = _spawn_sleeper()
+        proc = _spawn_node_bridge(tmp_path)
         try:
             _write_bridge_pidfile(tmp_path, proc.pid)
             _kill_stale_bridge_by_pidfile(tmp_path)
@@ -80,7 +102,7 @@ class TestIdentityGuard:
     def test_legacy_pidfile_kills_matching_bridge_cmdline(self, tmp_path):
         """Legacy pidfile: a PID whose cmdline names node + session IS reaped."""
         # Shape the cmdline to look like the node bridge for this session.
-        proc = _spawn_sleeper("node", str(tmp_path))
+        proc = _spawn_node_bridge(tmp_path)
         try:
             (tmp_path / "bridge.pid").write_text(str(proc.pid))  # legacy: pid only
             _kill_stale_bridge_by_pidfile(tmp_path)
@@ -90,39 +112,128 @@ class TestIdentityGuard:
                 proc.kill()
                 proc.wait()
 
+    def test_recycled_node_pid_is_not_killed_when_start_time_changes(self, tmp_path, monkeypatch):
+        """A recycled PID remains unsafe even if it now names another node."""
+        from gateway import status
 
-class TestKillPortProcess:
-    """Freeing the bridge port must target only LISTENers, never clients.
+        (tmp_path / "bridge.pid").write_text("4242\n100", encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 101)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: f"node bridge.js --session {tmp_path}",
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
 
-    Root cause of the live Firefox kills: ``lsof -ti :PORT`` (and ``fuser
-    PORT/tcp``) also returned *client* sockets whose connection merely involved
-    the port number. The WhatsApp bridge uses port 3000 by default — a common
-    local dev-server port — so a browser tab on ``localhost:3000`` was matched
-    and SIGTERMed every time the (crash-looping) bridge restarted.
-    """
+        _kill_stale_bridge_by_pidfile(tmp_path)
 
-    def test_listener_lookup_excludes_client_process(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        port = srv.getsockname()[1]
-        srv.listen(5)
-        # A separate process holding a *client* connection to that port.
-        client = subprocess.Popen([
-            sys.executable, "-c",
-            "import socket,time; c=socket.create_connection(('127.0.0.1',%d)); time.sleep(0.2)" % port,
-        ])
-        try:
-            conn, _ = srv.accept()  # establish the client connection
-            pids = _listener_pids_on_port(port)
-            if os.getpid() not in pids:
-                pytest.skip("neither lsof nor ss detected the listener here")
-            # The listener (this process) is found; the client process is NOT —
-            # the LISTEN filter is what spares unrelated clients like a browser.
-            assert client.pid not in pids
-            conn.close()
-        finally:
-            client.kill()
-            client.wait()
-            srv.close()
+        assert killed == []
 
+    def test_matching_start_time_still_requires_session_command_line(self, tmp_path, monkeypatch):
+        """A PID/start-time match alone cannot authorize a signal."""
+        from gateway import status
+
+        (tmp_path / "bridge.pid").write_text("4242\n100", encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 100)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda _pid: "node unrelated.js"
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(tmp_path)
+
+        assert killed == []
+
+    @pytest.mark.parametrize(
+        ("pidfile", "expected_start"),
+        [("4242\n100", 100), ("4242", None)],
+        ids=["start-time", "legacy"],
+    )
+    @pytest.mark.parametrize(
+        "cmdline_builder",
+        [
+            lambda session: f"node bridge.js --session {session}-other",
+            lambda session: (
+                f"node bridge.js --session "
+                f"{session.parent / ('other-' + session.name)}"
+            ),
+            lambda session: f"python node bridge.js --session {session}",
+            lambda session: (
+                f"node bridge.js --session {session}-other --session {session}"
+            ),
+            lambda session: (
+                f"node bridge.js --session {session} --session {session}-other"
+            ),
+        ],
+        ids=[
+            "session-suffix",
+            "session-prefix",
+            "fake-node-argument",
+            "duplicate-foreign-first",
+            "duplicate-foreign-second",
+        ],
+    )
+    def test_pidfile_never_kills_prefix_suffix_or_fake_node(
+        self, tmp_path, monkeypatch, pidfile, expected_start, cmdline_builder
+    ):
+        """Only Node's exact ``--session <path>`` argv pair can authorize SIGTERM."""
+        from gateway import status
+
+        session = tmp_path / "wa-session"
+        session.mkdir()
+        (session / "bridge.pid").write_text(pidfile, encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: expected_start)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda _pid: cmdline_builder(session)
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(session)
+
+        assert killed == []
+
+    @pytest.mark.parametrize(
+        ("pidfile", "expected_start"),
+        [("4242\n100", 100), ("4242", None)],
+        ids=["start-time", "legacy"],
+    )
+    def test_pidfile_kills_only_exact_node_session_argv(
+        self, tmp_path, monkeypatch, pidfile, expected_start
+    ):
+        """Both modern and legacy PID files retain an exact positive path."""
+        from gateway import status
+
+        session = tmp_path / "wa-session"
+        session.mkdir()
+        (session / "bridge.pid").write_text(pidfile, encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: expected_start)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: f"/usr/local/bin/node bridge.js --session {session}",
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(session)
+
+        assert killed == [(4242, 15)]
