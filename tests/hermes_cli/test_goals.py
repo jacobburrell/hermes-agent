@@ -247,6 +247,180 @@ class TestGoalStateSubgoalsBackcompat:
         assert state.subgoals == []
 
 
+class TestGoalTerminalOutcome:
+    """Stage-A persistence contract for truthful terminal goal records."""
+
+    def test_legacy_row_decodes_without_terminal_outcome(self):
+        from hermes_cli.goals import GoalState
+
+        legacy = json.dumps({
+            "goal": "keep working",
+            "status": "active",
+            "turns_used": 2,
+            "subgoals": ["preserve the contract"],
+            "contract": {"verification": "pytest -q"},
+        })
+
+        state = GoalState.from_json(legacy)
+
+        assert state.goal == "keep working"
+        assert state.status == "active"
+        assert state.subgoals == ["preserve the contract"]
+        assert state.contract.verification == "pytest -q"
+        assert state.terminal_outcome is None
+
+    def test_terminal_outcome_roundtrips_with_revision_and_evidence(self):
+        from hermes_cli.goals import GoalState, GoalTerminalOutcome
+
+        state = GoalState(
+            goal="stop safely",
+            status="cleared",
+            terminal_outcome=GoalTerminalOutcome(
+                state="cleared",
+                origin="user_clear",
+                reason="owner cancelled the task",
+                evidence_ref="operator:request-42",
+                timestamp=123.5,
+                revision=2,
+            ),
+        )
+
+        restored = GoalState.from_json(state.to_json())
+
+        assert restored.terminal_outcome is not None
+        assert restored.terminal_outcome.to_dict() == {
+            "state": "cleared",
+            "origin": "user_clear",
+            "reason": "owner cancelled the task",
+            "evidence_ref": "operator:request-42",
+            "timestamp": 123.5,
+            "revision": 2,
+        }
+
+    def test_clear_is_auditable_cancellation_not_achievement(self, hermes_home):
+        from hermes_cli.goals import GoalManager, load_goal
+
+        mgr = GoalManager(session_id="terminal-clear")
+        mgr.set("finish the task")
+        # The existing /goal clear and legacy /goal done aliases both call
+        # this method.  Stage A records cancellation; it does not claim done.
+        assert mgr.clear() is True
+
+        stored = load_goal("terminal-clear")
+        assert stored is not None
+        assert stored.status == "cleared"
+        assert stored.terminal_outcome is not None
+        assert stored.terminal_outcome.state == "cleared"
+        assert stored.terminal_outcome.origin == "user_clear"
+        assert stored.terminal_outcome.state != "achieved"
+
+    def test_legacy_done_is_not_promoted_to_achieved_without_a_decision_layer(self):
+        from hermes_cli.goals import GoalState
+
+        legacy = json.dumps({
+            "goal": "historical goal",
+            "status": "done",
+            "last_reason": "old judge verdict",
+        })
+
+        state = GoalState.from_json(legacy)
+
+        # Preserve the historical state for compatibility, but never invent a
+        # new achieved audit record without the future evidence-owning layer.
+        assert state.status == "done"
+        assert state.terminal_outcome is None
+
+    def test_malformed_terminal_outcome_fails_safe(self):
+        from hermes_cli.goals import GoalState
+
+        raw = json.dumps({
+            "goal": "stay active",
+            "status": "active",
+            "terminal_outcome": {
+                "state": "achieved",
+                "origin": ["not-a-string"],
+                "timestamp": "not-a-number",
+            },
+        })
+
+        state = GoalState.from_json(raw)
+
+        assert state.status == "active"
+        assert state.terminal_outcome is None
+
+    def test_existing_achieved_record_is_coherent_and_cannot_be_cleared(self, hermes_home):
+        from hermes_cli.goals import GoalManager, GoalTerminalOutcome, clear_goal, save_goal
+
+        mgr = GoalManager(session_id="already-achieved")
+        state = mgr.set("finish safely")
+        state.status = "active"  # Simulate stale metadata from a future writer.
+        state.terminal_outcome = GoalTerminalOutcome(
+            state="achieved",
+            origin="future_decision",
+            evidence_ref="evidence:verified",
+            timestamp=12.0,
+        )
+        assert save_goal("already-achieved", state) is True
+
+        reloaded = GoalManager(session_id="already-achieved")
+        assert reloaded.state is not None and reloaded.state.status == "done"
+        assert reloaded.clear() is False
+        assert clear_goal("already-achieved") is False
+        assert reloaded.state.status == "done"
+        assert reloaded.state.terminal_outcome is not None
+        assert reloaded.state.terminal_outcome.state == "achieved"
+
+    def test_existing_done_state_is_not_rewritten_as_clear(self, hermes_home):
+        from hermes_cli.goals import GoalManager, load_goal
+
+        mgr = GoalManager(session_id="legacy-done")
+        mgr.set("already completed")
+        mgr.mark_done("existing decision")
+
+        assert mgr.clear() is False
+        stored = load_goal("legacy-done")
+        assert stored is not None and stored.status == "done"
+        assert stored.terminal_outcome is None
+
+
+class TestGoalPersistenceFailures:
+    def test_save_goal_reports_db_unavailable(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, save_goal
+
+        monkeypatch.setattr(goals, "_get_session_db", lambda: None)
+
+        assert save_goal("no-db", GoalState(goal="stay durable")) is False
+
+    def test_save_goal_reports_set_meta_failure(self, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, save_goal
+
+        class BrokenDB:
+            def set_meta(self, *_args, **_kwargs):
+                raise OSError("disk unavailable")
+
+        monkeypatch.setattr(goals, "_get_session_db", lambda: BrokenDB())
+
+        assert save_goal("write-fail", GoalState(goal="stay durable")) is False
+
+    def test_manager_set_and_clear_expose_failed_durability(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="manager-write-fail")
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        state = mgr.set("keep local state")
+        assert state.status == "active"
+        assert mgr.last_persistence_succeeded is False
+        assert mgr.clear() is False
+        assert mgr.last_persistence_succeeded is False
+        assert mgr.state is state
+        assert mgr.state.status == "active"
+        assert mgr.state.terminal_outcome is None
+
+
 class TestMigrateGoalToSession:
     """migrate_goal_to_session carries a /goal from a parent session to its
     compression continuation child (#33618). load_goal does a flat
@@ -262,6 +436,84 @@ class TestMigrateGoalToSession:
         # Parent row archived (cleared) so only the child is active.
         parent = load_goal("parent-sid")
         assert parent is not None and parent.status == "cleared"
+        assert parent.terminal_outcome is None
+        assert parent.compaction_archive is not None
+        assert parent.compaction_archive.origin == "compaction"
+        assert parent.compaction_archive.reason == "compression"
+        assert parent.compaction_archive.successor_ref == "goal:child-sid"
+
+    @pytest.mark.parametrize("status", ["done", "cleared"])
+    def test_does_not_migrate_terminal_rows(self, hermes_home, status):
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        assert save_goal("terminal-parent", GoalState(goal="finished", status=status))
+
+        assert migrate_goal_to_session("terminal-parent", "terminal-child") is False
+        assert load_goal("terminal-child") is None
+        parent = load_goal("terminal-parent")
+        assert parent is not None and parent.status == status
+
+    def test_migrates_active_wait_barrier_with_child_state(self, hermes_home):
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        assert save_goal(
+            "waiting-parent",
+            GoalState(
+                goal="wait for CI",
+                waiting_on_pid=4242,
+                waiting_reason="CI running",
+                waiting_since=10.0,
+            ),
+        )
+
+        assert migrate_goal_to_session("waiting-parent", "waiting-child") is True
+        child = load_goal("waiting-child")
+        assert child is not None
+        assert child.status == "active"
+        assert child.waiting_on_pid == 4242
+        assert child.waiting_reason == "CI running"
+
+    def test_child_write_failure_keeps_parent_authoritative(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        assert save_goal("child-fail-parent", GoalState(goal="keep moving"))
+        db = goals._get_session_db()
+        assert db is not None
+        real_set_meta = db.set_meta
+
+        def fail_child(key, value, *, cursor=None):
+            if key == "goal:child-fail-child":
+                raise OSError("child write failed")
+            return real_set_meta(key, value, cursor=cursor)
+
+        monkeypatch.setattr(db, "set_meta", fail_child)
+
+        assert migrate_goal_to_session("child-fail-parent", "child-fail-child") is False
+        parent = load_goal("child-fail-parent")
+        assert parent is not None and parent.status == "active"
+        assert load_goal("child-fail-child") is None
+
+    def test_parent_archive_failure_rolls_back_child_write(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        assert save_goal("archive-fail-parent", GoalState(goal="keep moving"))
+        db = goals._get_session_db()
+        assert db is not None
+        real_set_meta = db.set_meta
+
+        def fail_parent_archive(key, value, *, cursor=None):
+            if key == "goal:archive-fail-parent":
+                raise OSError("archive write failed")
+            return real_set_meta(key, value, cursor=cursor)
+
+        monkeypatch.setattr(db, "set_meta", fail_parent_archive)
+
+        assert migrate_goal_to_session("archive-fail-parent", "archive-fail-child") is False
+        parent = load_goal("archive-fail-parent")
+        assert parent is not None and parent.status == "active"
+        assert load_goal("archive-fail-child") is None
 
 
     def test_does_not_clobber_existing_child_goal(self, hermes_home):
@@ -797,4 +1049,3 @@ class TestContractAndBackgroundCompose:
         # The judge can return a wait verdict on a contract goal.
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
-

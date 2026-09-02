@@ -544,6 +544,150 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
 
 
 @dataclass
+class GoalTerminalOutcome:
+    """A durable, non-speculative audit record for a terminal goal state.
+
+    This is deliberately a *record*, not a decision mechanism.  Stage A only
+    writes cancellation/clear records; a future, evidence-owning decision
+    layer may write an ``achieved`` record.  Keeping that distinction in the
+    persisted shape prevents a legacy ``/goal done`` alias (which clears the
+    goal) from being mistaken for proof that the objective was achieved.
+    """
+
+    state: str
+    origin: str
+    reason: str = ""
+    evidence_ref: str = ""
+    timestamp: float = 0.0
+    revision: int = 1
+
+    _VALID_STATES = frozenset({"achieved", "cleared"})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "origin": self.origin,
+            "reason": self.reason,
+            "evidence_ref": self.evidence_ref,
+            "timestamp": self.timestamp,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["GoalTerminalOutcome"]:
+        """Decode a persisted audit record without trusting malformed data.
+
+        A bad optional audit record must never promote a goal to an achieved
+        state or prevent the established goal row from loading.
+        """
+        if not isinstance(data, dict):
+            return None
+        raw_state = data.get("state")
+        raw_origin = data.get("origin")
+        if not isinstance(raw_state, str) or not isinstance(raw_origin, str):
+            return None
+        state = raw_state.strip().lower()
+        origin = raw_origin.strip()
+        if state not in cls._VALID_STATES or not origin:
+            return None
+        try:
+            timestamp = float(data.get("timestamp", 0.0) or 0.0)
+            revision = max(1, int(data.get("revision", 1) or 1))
+        except (TypeError, ValueError):
+            return None
+        return cls(
+            state=state,
+            origin=origin,
+            reason=str(data.get("reason") or ""),
+            evidence_ref=str(data.get("evidence_ref") or ""),
+            timestamp=timestamp,
+            revision=revision,
+        )
+
+
+@dataclass
+class GoalCompactionArchive:
+    """Metadata for a goal row archived after a successful compaction move.
+
+    Compaction changes where an ongoing goal is stored; it is not a user
+    cancellation and must not manufacture a terminal outcome.
+    """
+
+    origin: str
+    reason: str = ""
+    successor_ref: str = ""
+    timestamp: float = 0.0
+    revision: int = 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "origin": self.origin,
+            "reason": self.reason,
+            "successor_ref": self.successor_ref,
+            "timestamp": self.timestamp,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["GoalCompactionArchive"]:
+        if not isinstance(data, dict):
+            return None
+        raw_origin = data.get("origin")
+        if not isinstance(raw_origin, str) or raw_origin.strip() != "compaction":
+            return None
+        raw_successor = data.get("successor_ref")
+        if raw_successor is not None and not isinstance(raw_successor, str):
+            return None
+        try:
+            timestamp = float(data.get("timestamp", 0.0) or 0.0)
+            revision = max(1, int(data.get("revision", 1) or 1))
+        except (TypeError, ValueError):
+            return None
+        return cls(
+            origin="compaction",
+            reason=str(data.get("reason") or ""),
+            successor_ref=str(raw_successor or ""),
+            timestamp=timestamp,
+            revision=revision,
+        )
+
+
+def _record_cleared_outcome(
+    state: "GoalState",
+    *,
+    origin: str,
+    reason: str = "",
+    evidence_ref: str = "",
+) -> None:
+    """Attach the first clear/cancellation audit record to ``state``.
+
+    Terminal audit records are append-once at this stage: clear must not
+    overwrite any later evidence-owning decision record.  In particular, this
+    helper never creates an ``achieved`` record.
+    """
+    if state.terminal_outcome is not None:
+        return
+    state.terminal_outcome = GoalTerminalOutcome(
+        state="cleared",
+        origin=origin,
+        reason=reason,
+        evidence_ref=evidence_ref,
+        timestamp=time.time(),
+    )
+
+
+def _is_achieved_goal_state(state: "GoalState") -> bool:
+    """Return whether a row is already terminal-success and must stay so."""
+    return (
+        state.status == "done"
+        or (
+            state.terminal_outcome is not None
+            and state.terminal_outcome.state == "achieved"
+        )
+    )
+
+
+@dataclass
 class GoalState:
     """Serializable goal state stored per session."""
 
@@ -599,6 +743,13 @@ class GoalState:
     # must ALL pass before the judge may declare the goal done. Empty by
     # default — a goal with no gates behaves exactly as before.
     gates: List[GoalGate] = field(default_factory=list)
+    # Optional audit record for terminal state.  Existing decision logic owns
+    # whether a goal can ever become ``done``; persistence alone never creates
+    # success.  Old rows without this field remain valid.
+    terminal_outcome: Optional[GoalTerminalOutcome] = None
+    # A parent row retained after context compaction is archival metadata, not
+    # a cancellation outcome.  The child row carries the continuing state.
+    compaction_archive: Optional[GoalCompactionArchive] = None
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -608,13 +759,39 @@ class GoalState:
     @classmethod
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("stored goal must be a JSON object")
         raw_subgoals = data.get("subgoals") or []
         subgoals: List[str] = []
         if isinstance(raw_subgoals, list):
             subgoals = [str(s).strip() for s in raw_subgoals if str(s).strip()]
+        terminal_outcome = GoalTerminalOutcome.from_dict(data.get("terminal_outcome"))
+        compaction_archive = GoalCompactionArchive.from_dict(data.get("compaction_archive"))
+        status = str(data.get("status") or "active")
+        # Earlier versions persisted a cleared goal without an audit record.
+        # Preserve it as a cancellation, never as inferred success.  A legacy
+        # ``status: done`` row is intentionally left alone: Stage A has no
+        # evidence-owning authority to promote it into an achieved record.
+        if (
+            terminal_outcome is None
+            and compaction_archive is None
+            and status == "cleared"
+        ):
+            terminal_outcome = GoalTerminalOutcome(
+                state="cleared",
+                origin="legacy_clear",
+                reason=str(data.get("last_reason") or ""),
+                timestamp=float(data.get("last_turn_at", 0.0) or data.get("created_at", 0.0) or 0.0),
+            )
+        # A future decision layer may supply a valid achieved record.  Decode
+        # it coherently so a stale active status cannot resume the loop.  This
+        # branch only honors an existing evidence-owning record; it never
+        # constructs one from legacy state.
+        if terminal_outcome is not None:
+            status = "done" if terminal_outcome.state == "achieved" else "cleared"
         return cls(
             goal=data.get("goal", ""),
-            status=data.get("status", "active"),
+            status=status,
             turns_used=int(data.get("turns_used", 0) or 0),
             max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
             created_at=float(data.get("created_at", 0.0) or 0.0),
@@ -636,6 +813,8 @@ class GoalState:
                 for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            terminal_outcome=terminal_outcome,
+            compaction_archive=compaction_archive,
         )
 
     # --- contract helpers -------------------------------------------------
@@ -848,27 +1027,105 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
+def save_goal(session_id: str, state: GoalState) -> bool:
+    """Persist a goal to SessionDB and report whether the write committed."""
     if not session_id:
-        return
+        return False
     db = _get_session_db()
     if db is None:
         _warn_dropped_write("GoalManager", "goal", session_id)
-        return
+        return False
     try:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+        logger.warning("GoalManager: set_meta failed: %s", exc)
+        return False
+    return True
 
 
-def clear_goal(session_id: str) -> None:
-    """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
+def clear_goal(
+    session_id: str,
+    *,
+    origin: str = "clear",
+    reason: str = "",
+    evidence_ref: str = "",
+) -> bool:
+    """Durably mark a non-achieved goal cleared and return write success."""
     state = load_goal(session_id)
     if state is None:
-        return
+        return False
+    if _is_achieved_goal_state(state):
+        return False
+    previous_status = state.status
+    previous_outcome = state.terminal_outcome
+    _record_cleared_outcome(
+        state,
+        origin=origin,
+        reason=reason,
+        evidence_ref=evidence_ref,
+    )
     state.status = "cleared"
-    save_goal(session_id, state)
+    if save_goal(session_id, state):
+        return True
+    state.status = previous_status
+    state.terminal_outcome = previous_outcome
+    return False
+
+
+def _archive_goal_for_compaction(
+    state: GoalState,
+    *,
+    new_session_id: str,
+    reason: str,
+) -> GoalState:
+    """Return an archival parent copy without creating a cancellation record."""
+    archived = GoalState.from_json(state.to_json())
+    archived.status = "cleared"
+    archived.terminal_outcome = None
+    archived.compaction_archive = GoalCompactionArchive(
+        origin="compaction",
+        reason=reason or "session rotation",
+        successor_ref=f"goal:{new_session_id}",
+        timestamp=time.time(),
+    )
+    return archived
+
+
+def _persist_goal_compaction(
+    old_session_id: str,
+    new_session_id: str,
+    state: GoalState,
+    *,
+    reason: str,
+) -> bool:
+    """Atomically write child state then archive the parent state.
+
+    ``SessionDB.set_meta`` supports an existing write cursor.  Keeping both
+    rows in one transaction means an archive failure rolls back the child
+    write, so a retry never leaves two active goals behind.
+    """
+    db = _get_session_db()
+    if db is None:
+        _warn_dropped_write("GoalManager", "goal compaction", old_session_id)
+        return False
+    child_payload = state.to_json()
+    parent_payload = _archive_goal_for_compaction(
+        state,
+        new_session_id=new_session_id,
+        reason=reason,
+    ).to_json()
+    try:
+        def _write(cursor: Any) -> None:
+            # Child first, then parent archive: transaction rollback preserves
+            # the parent as authoritative if either write cannot commit.
+            db.set_meta(_meta_key(new_session_id), child_payload, cursor=cursor)
+            db.set_meta(_meta_key(old_session_id), parent_payload, cursor=cursor)
+
+        db._execute_write(_write)
+    except Exception as exc:
+        logger.warning("GoalManager: compaction state write failed: %s", exc)
+        return False
+    return True
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -890,15 +1147,21 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
     try:
         state = load_goal(old_session_id)
-        if state is None or getattr(state, "status", None) == "cleared":
+        # A compaction continuation carries only ongoing work.  Historic done
+        # and cleared rows remain terminal records in their original session.
+        if state is None or state.status not in {"active", "paused"}:
             return False
         # Don't clobber a goal already set on the child (e.g. a resumed
         # lineage that re-established its own goal).
         if load_goal(new_session_id) is not None:
             return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
+        if not _persist_goal_compaction(
+            old_session_id,
+            new_session_id,
+            state,
+            reason=reason,
+        ):
+            return False
         logger.debug(
             "GoalManager: migrated goal %s -> %s (%s)",
             old_session_id, new_session_id, reason or "rotation",
@@ -1427,12 +1690,23 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
+        self._last_persistence_succeeded: Optional[bool] = None
 
     # --- introspection ------------------------------------------------
 
     @property
     def state(self) -> Optional[GoalState]:
         return self._state
+
+    @property
+    def last_persistence_succeeded(self) -> Optional[bool]:
+        """Result of the most recent Stage-A set/clear durable write.
+
+        The established command APIs continue returning their historical state
+        objects, while callers that need durability truth can inspect this
+        explicit result instead of inferring it from an in-memory mutation.
+        """
+        return self._last_persistence_succeeded
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -1487,7 +1761,7 @@ class GoalManager:
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
-        save_goal(self.session_id, state)
+        self._last_persistence_succeeded = save_goal(self.session_id, state)
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1531,12 +1805,28 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
-    def clear(self) -> None:
+    def clear(self, *, reason: str = "cleared by user") -> bool:
         if self._state is None:
-            return
+            self._last_persistence_succeeded = False
+            return False
+        if _is_achieved_goal_state(self._state):
+            self._last_persistence_succeeded = False
+            return False
+        previous_status = self._state.status
+        previous_outcome = self._state.terminal_outcome
+        _record_cleared_outcome(
+            self._state,
+            origin="user_clear",
+            reason=reason,
+        )
         self._state.status = "cleared"
-        save_goal(self.session_id, self._state)
+        self._last_persistence_succeeded = save_goal(self.session_id, self._state)
+        if not self._last_persistence_succeeded:
+            self._state.status = previous_status
+            self._state.terminal_outcome = previous_outcome
+            return False
         self._state = None
+        return True
 
     def mark_done(self, reason: str) -> None:
         if not self._state:
