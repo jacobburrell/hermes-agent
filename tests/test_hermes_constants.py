@@ -173,7 +173,7 @@ class TestHermesManagedNode:
         node_dir = home / "node"
         node_dir.mkdir(parents=True)
         npm_cmd = node_dir / "npm.cmd"
-        npm_cmd.write_text("@echo off\n")
+        npm_cmd.write_text("@echo off\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(hermes_constants, "node_tool_runnable", lambda path: True)
 
@@ -186,11 +186,11 @@ class TestHermesManagedNode:
         home = tmp_path / "hermes"
         managed_npm = home / "node" / "npm.cmd"
         managed_npm.parent.mkdir(parents=True)
-        managed_npm.write_text("@echo off\n")
+        managed_npm.write_text("@echo off\n", encoding="utf-8")
         bin_dir = tmp_path / "nodejs"
         bin_dir.mkdir()
         path_npm = bin_dir / "npm.cmd"
-        path_npm.write_text("@echo off\n")
+        path_npm.write_text("@echo off\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("PATH", str(bin_dir))
         monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
@@ -231,7 +231,7 @@ class TestDarwinNodeToolFallback:
         common_bin = tmp_path.joinpath(*common_path)
         common_bin.mkdir(parents=True)
         tool = common_bin / command
-        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         tool.chmod(0o755)
 
         self._disable_managed_node(monkeypatch)
@@ -277,7 +277,7 @@ class TestDarwinNodeToolFallback:
         common_bin = tmp_path / "usr" / "local" / "bin"
         common_bin.mkdir(parents=True)
         node = common_bin / "node"
-        node.write_text("#!/bin/sh\nexit 0\n")
+        node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         node.chmod(0o755)
 
         self._disable_managed_node(monkeypatch)
@@ -297,7 +297,7 @@ class TestNodeToolRunnable:
 
     def _stub(self, tmp_path, name, body, mode=0o755):
         path = tmp_path / name
-        path.write_text(body)
+        path.write_text(body, encoding="utf-8")
         path.chmod(mode)
         return path
 
@@ -326,7 +326,9 @@ class TestNodeToolRunnable:
 
         def _heal():
             heal_called["value"] = True
-            broken_npm.write_text("#!/bin/sh\necho '22.0.0'\nexit 0\n")
+            broken_npm.write_text(
+                "#!/bin/sh\necho '22.0.0'\nexit 0\n", encoding="utf-8"
+            )
             broken_npm.chmod(0o755)
             return True
 
@@ -372,7 +374,9 @@ class TestNodeToolRunnable:
 
         def _heal():
             heal_called["value"] = True
-            old_node.write_text(f"#!/bin/sh\necho 'v{target}.5.1'\nexit 0\n")
+            old_node.write_text(
+                f"#!/bin/sh\necho 'v{target}.5.1'\nexit 0\n", encoding="utf-8"
+            )
             old_node.chmod(0o755)
             return True
 
@@ -735,7 +739,7 @@ class TestAgentBrowserRunnable:
 
     def _stub(self, tmp_path, name, body, mode=0o755):
         p = tmp_path / name
-        p.write_text(body)
+        p.write_text(body, encoding="utf-8")
         p.chmod(mode)
         return p
 
@@ -823,7 +827,7 @@ class TestGetHermesDir:
         legacy.symlink_to(tmp_path / "does-not-exist")
         new = tmp_path / "platforms" / "pairing"
         new.mkdir(parents=True)
-        (new / "discord-approved.json").write_text("[]")
+        (new / "discord-approved.json").write_text("[]", encoding="utf-8")
         result = get_hermes_dir("platforms/pairing", "pairing")
         assert result == new
 
