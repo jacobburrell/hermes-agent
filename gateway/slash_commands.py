@@ -2743,6 +2743,7 @@ class GatewaySlashCommandsMixin:
         """
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
+        from hermes_cli.goals import GoalDurabilityError
 
         mgr, session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
@@ -2756,7 +2757,10 @@ class GatewaySlashCommandsMixin:
             return f"{mgr.status_line()}\n{mgr.render_contract()}"
 
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            try:
+                state = mgr.pause(reason="user-paused")
+            except GoalDurabilityError as exc:
+                return f"⚠ {exc}"
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
@@ -2769,7 +2773,10 @@ class GatewaySlashCommandsMixin:
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except GoalDurabilityError as exc:
+                return f"⚠ {exc}"
             if state is None:
                 return t("gateway.goal.no_resume")
             # Resume must restart work, not just flip persisted state
@@ -2797,7 +2804,12 @@ class GatewaySlashCommandsMixin:
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
+            try:
+                cleared = mgr.clear()
+            except GoalDurabilityError as exc:
+                return f"⚠ {exc}"
+            if had and not cleared:
+                return t("gateway.no_active_goal")
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -2820,14 +2832,18 @@ class GatewaySlashCommandsMixin:
             reason = wtokens[1].strip() if len(wtokens) > 1 else ""
             try:
                 mgr.wait_on(pid, reason=reason)
-            except (RuntimeError, ValueError) as exc:
+            except (RuntimeError, ValueError, GoalDurabilityError) as exc:
                 return f"/goal wait: {exc}"
             rtxt = f" ({reason})" if reason else ""
             return f"⏳ Goal parked on pid {pid}{rtxt}. Loop pauses until it exits."
 
         # /goal unwait — clear the wait barrier.
         if lower == "unwait":
-            if mgr.stop_waiting():
+            try:
+                stopped = mgr.stop_waiting()
+            except GoalDurabilityError as exc:
+                return f"⚠ {exc}"
+            if stopped:
                 return "▶ Wait barrier cleared — goal loop resumes."
             return "No wait barrier set."
 
@@ -2841,7 +2857,7 @@ class GatewaySlashCommandsMixin:
                 command = gate_arg[len("add"):].strip()
                 try:
                     gate = mgr.add_gate(command)
-                except (RuntimeError, ValueError) as exc:
+                except (RuntimeError, ValueError, GoalDurabilityError) as exc:
                     return f"/goal gate add: {exc}"
                 return (
                     f"⚿ Gate added: $ {gate.command} "
@@ -2852,13 +2868,13 @@ class GatewaySlashCommandsMixin:
                 idx_text = gate_arg.split(None, 1)[1].strip()
                 try:
                     removed = mgr.remove_gate(int(idx_text))
-                except (RuntimeError, ValueError, IndexError) as exc:
+                except (RuntimeError, ValueError, IndexError, GoalDurabilityError) as exc:
                     return f"/goal gate remove: {exc}"
                 return f"✓ Gate removed: $ {removed}"
             if gate_lower == "clear":
                 try:
                     prev = mgr.clear_gates()
-                except RuntimeError as exc:
+                except (RuntimeError, GoalDurabilityError) as exc:
                     return f"/goal gate clear: {exc}"
                 return f"✓ Cleared {prev} gate{'s' if prev != 1 else ''}."
             return "Usage: /goal gate [list | add <command> | remove <N> | clear]"
@@ -2895,7 +2911,7 @@ class GatewaySlashCommandsMixin:
         # Otherwise — treat the remaining text as the new goal.
         try:
             state = mgr.set(args, contract=contract)
-        except ValueError as exc:
+        except (ValueError, GoalDurabilityError) as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
         # Queue the goal text as an immediate first turn so the agent
@@ -3105,6 +3121,7 @@ class GatewaySlashCommandsMixin:
         to invoke while the agent is running.
         """
         args = (event.get_command_args() or "").strip()
+        from hermes_cli.goals import GoalDurabilityError
         mgr, _session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
@@ -3128,14 +3145,14 @@ class GatewaySlashCommandsMixin:
                 return "/subgoal remove: <n> must be an integer (1-based index)."
             try:
                 removed = mgr.remove_subgoal(idx)
-            except (IndexError, RuntimeError) as exc:
+            except (IndexError, RuntimeError, GoalDurabilityError) as exc:
                 return f"/subgoal remove: {exc}"
             return f"✓ Removed subgoal {idx}: {removed}"
 
         if verb == "clear":
             try:
                 prev = mgr.clear_subgoals()
-            except RuntimeError as exc:
+            except (RuntimeError, GoalDurabilityError) as exc:
                 return f"/subgoal clear: {exc}"
             if prev:
                 return f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
@@ -3143,7 +3160,7 @@ class GatewaySlashCommandsMixin:
 
         try:
             text = mgr.add_subgoal(args)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, GoalDurabilityError) as exc:
             return f"/subgoal: {exc}"
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"

@@ -33,6 +33,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -45,11 +46,47 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class GoalDurabilityError(RuntimeError):
+    """A requested goal mutation was not committed to durable state.
+
+    Callers must not acknowledge or schedule work from an in-memory goal
+    mutation until its SessionDB write has committed. Keeping this distinct
+    from user-input validation lets each public surface retain its existing
+    command grammar while reporting a truthful, retryable failure.
+    """
+
+    def __init__(self, action: str):
+        self.action = action
+        super().__init__(f"{action} was not persisted; no work was scheduled")
+
+
+def _finite_nonnegative_timestamp(value: Any) -> Optional[float]:
+    """Return a durable timestamp only when it is finite and non-negative."""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    return timestamp if math.isfinite(timestamp) and timestamp >= 0 else None
+
+
+def _state_timestamp(data: Dict[str, Any], field_name: str) -> float:
+    """Decode a state timestamp without allowing a later write to explode."""
+    timestamp = _finite_nonnegative_timestamp(data.get(field_name, 0.0))
+    if timestamp is None:
+        raise ValueError(f"stored goal has an invalid {field_name} timestamp")
+    return timestamp
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Constants & defaults
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+GOAL_STATE_SCHEMA_VERSION = 1
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -590,8 +627,10 @@ class GoalTerminalOutcome:
         origin = raw_origin.strip()
         if state not in cls._VALID_STATES or not origin:
             return None
+        timestamp = _finite_nonnegative_timestamp(data.get("timestamp", 0.0))
+        if timestamp is None:
+            return None
         try:
-            timestamp = float(data.get("timestamp", 0.0) or 0.0)
             revision = max(1, int(data.get("revision", 1) or 1))
         except (TypeError, ValueError):
             return None
@@ -638,8 +677,10 @@ class GoalCompactionArchive:
         raw_successor = data.get("successor_ref")
         if raw_successor is not None and not isinstance(raw_successor, str):
             return None
+        timestamp = _finite_nonnegative_timestamp(data.get("timestamp", 0.0))
+        if timestamp is None:
+            return None
         try:
-            timestamp = float(data.get("timestamp", 0.0) or 0.0)
             revision = max(1, int(data.get("revision", 1) or 1))
         except (TypeError, ValueError):
             return None
@@ -750,17 +791,35 @@ class GoalState:
     # A parent row retained after context compaction is archival metadata, not
     # a cancellation outcome.  The child row carries the continuing state.
     compaction_archive: Optional[GoalCompactionArchive] = None
+    # Missing on existing rows; ``from_json`` normalizes those rows to the
+    # current schema without changing their goal semantics.
+    schema_version: int = GOAL_STATE_SCHEMA_VERSION
 
     def to_json(self) -> str:
         data = asdict(self)
         # asdict already recursed GoalContract into a plain dict.
-        return json.dumps(data, ensure_ascii=False)
+        data["schema_version"] = GOAL_STATE_SCHEMA_VERSION
+        return json.dumps(data, ensure_ascii=False, allow_nan=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("stored goal must be a JSON object")
+        raw_schema_version = data.get("schema_version", 0)
+        # Schema versions are an integer protocol field, not a coercion
+        # boundary: accepting ``1.5`` via int() would silently select v1
+        # semantics for a record the writer never produced. Missing remains
+        # the explicit v0 compatibility path for historic rows.
+        if not isinstance(raw_schema_version, int) or isinstance(raw_schema_version, bool):
+            raise ValueError("stored goal has an invalid schema version")
+        schema_version = raw_schema_version
+        if schema_version < 0 or schema_version > GOAL_STATE_SCHEMA_VERSION:
+            raise ValueError("stored goal has an unsupported schema version")
+        created_at = _state_timestamp(data, "created_at")
+        last_turn_at = _state_timestamp(data, "last_turn_at")
+        waiting_until = _state_timestamp(data, "waiting_until")
+        waiting_since = _state_timestamp(data, "waiting_since")
         raw_subgoals = data.get("subgoals") or []
         subgoals: List[str] = []
         if isinstance(raw_subgoals, list):
@@ -781,7 +840,11 @@ class GoalState:
                 state="cleared",
                 origin="legacy_clear",
                 reason=str(data.get("last_reason") or ""),
-                timestamp=float(data.get("last_turn_at", 0.0) or data.get("created_at", 0.0) or 0.0),
+                timestamp=(
+                    last_turn_at
+                    or created_at
+                    or 0.0
+                ),
             )
         # A future decision layer may supply a valid achieved record.  Decode
         # it coherently so a stale active status cannot resume the loop.  This
@@ -794,8 +857,8 @@ class GoalState:
             status=status,
             turns_used=int(data.get("turns_used", 0) or 0),
             max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
-            created_at=float(data.get("created_at", 0.0) or 0.0),
-            last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
+            created_at=created_at,
+            last_turn_at=last_turn_at,
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -804,9 +867,9 @@ class GoalState:
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
-            waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
+            waiting_until=waiting_until,
             waiting_reason=data.get("waiting_reason"),
-            waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
+            waiting_since=waiting_since,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -815,6 +878,7 @@ class GoalState:
             ],
             terminal_outcome=terminal_outcome,
             compaction_archive=compaction_archive,
+            schema_version=GOAL_STATE_SCHEMA_VERSION,
         )
 
     # --- contract helpers -------------------------------------------------
@@ -1097,6 +1161,7 @@ def _persist_goal_compaction(
     state: GoalState,
     *,
     reason: str,
+    expected_parent_payload: str,
 ) -> bool:
     """Atomically write child state then archive the parent state.
 
@@ -1114,14 +1179,38 @@ def _persist_goal_compaction(
         new_session_id=new_session_id,
         reason=reason,
     ).to_json()
+    class _GoalCompactionConflict(Exception):
+        pass
+
     try:
         def _write(cursor: Any) -> None:
+            # Compare-and-swap both rows *inside* the write transaction.
+            # A parent that changed after the initial read remains the source
+            # of truth; an independently created child is never overwritten.
+            current_child = cursor.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_meta_key(new_session_id),),
+            ).fetchone()
+            if current_child is not None:
+                raise _GoalCompactionConflict("child already exists")
+            current_parent = cursor.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_meta_key(old_session_id),),
+            ).fetchone()
+            current_parent_payload = (
+                current_parent[0] if current_parent is not None else None
+            )
+            if current_parent_payload != expected_parent_payload:
+                raise _GoalCompactionConflict("parent changed")
             # Child first, then parent archive: transaction rollback preserves
             # the parent as authoritative if either write cannot commit.
             db.set_meta(_meta_key(new_session_id), child_payload, cursor=cursor)
             db.set_meta(_meta_key(old_session_id), parent_payload, cursor=cursor)
 
         db._execute_write(_write)
+    except _GoalCompactionConflict as exc:
+        logger.debug("GoalManager: compaction CAS rejected: %s", exc)
+        return False
     except Exception as exc:
         logger.warning("GoalManager: compaction state write failed: %s", exc)
         return False
@@ -1146,20 +1235,27 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
+        db = _get_session_db()
+        if db is None:
+            return False
+        parent_payload = db.get_meta(_meta_key(old_session_id))
+        if not parent_payload:
+            return False
+        state = GoalState.from_json(parent_payload)
         # A compaction continuation carries only ongoing work.  Historic done
         # and cleared rows remain terminal records in their original session.
         if state is None or state.status not in {"active", "paused"}:
             return False
         # Don't clobber a goal already set on the child (e.g. a resumed
         # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
+        if db.get_meta(_meta_key(new_session_id)) is not None:
             return False
         if not _persist_goal_compaction(
             old_session_id,
             new_session_id,
             state,
             reason=reason,
+            expected_parent_payload=parent_payload,
         ):
             return False
         logger.debug(
@@ -1708,6 +1804,29 @@ class GoalManager:
         """
         return self._last_persistence_succeeded
 
+    def _snapshot_state(self) -> Optional[str]:
+        return self._state.to_json() if self._state is not None else None
+
+    def _restore_snapshot(self, snapshot: Optional[str]) -> None:
+        self._state = GoalState.from_json(snapshot) if snapshot is not None else None
+
+    def _persist_or_raise(self, action: str, snapshot: Optional[str]) -> None:
+        """Commit the current mutation or restore its exact prior state.
+
+        All public GoalManager mutations use this boundary.  Returning a
+        mutated object after an unavailable DB would let callers enqueue a
+        continuation or print a successful acknowledgement for work that
+        vanishes on restart.
+        """
+        state = self._state
+        self._last_persistence_succeeded = bool(
+            state is not None and save_goal(self.session_id, state)
+        )
+        if self._last_persistence_succeeded:
+            return
+        self._restore_snapshot(snapshot)
+        raise GoalDurabilityError(action)
+
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
 
@@ -1751,6 +1870,7 @@ class GoalManager:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        snapshot = self._snapshot_state()
         state = GoalState(
             goal=goal,
             status="active",
@@ -1761,7 +1881,7 @@ class GoalManager:
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
-        self._last_persistence_succeeded = save_goal(self.session_id, state)
+        self._persist_or_raise("goal set", snapshot)
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1771,13 +1891,15 @@ class GoalManager:
         """
         if self._state is None:
             return None
+        snapshot = self._snapshot_state()
         self._state.contract = contract or GoalContract()
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal contract update", snapshot)
         return self._state
 
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
+        snapshot = self._snapshot_state()
         self._state.status = "paused"
         self._state.paused_reason = reason
         # A wait barrier is meaningless once paused — drop it.
@@ -1786,12 +1908,13 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal pause", snapshot)
         return self._state
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
+        snapshot = self._snapshot_state()
         self._state.status = "active"
         self._state.paused_reason = None
         # Resuming starts fresh — clear any stale barrier.
@@ -1802,7 +1925,7 @@ class GoalManager:
         self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal resume", snapshot)
         return self._state
 
     def clear(self, *, reason: str = "cleared by user") -> bool:
@@ -1812,29 +1935,25 @@ class GoalManager:
         if _is_achieved_goal_state(self._state):
             self._last_persistence_succeeded = False
             return False
-        previous_status = self._state.status
-        previous_outcome = self._state.terminal_outcome
+        snapshot = self._snapshot_state()
         _record_cleared_outcome(
             self._state,
             origin="user_clear",
             reason=reason,
         )
         self._state.status = "cleared"
-        self._last_persistence_succeeded = save_goal(self.session_id, self._state)
-        if not self._last_persistence_succeeded:
-            self._state.status = previous_status
-            self._state.terminal_outcome = previous_outcome
-            return False
+        self._persist_or_raise("goal clear", snapshot)
         self._state = None
         return True
 
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
+        snapshot = self._snapshot_state()
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal completion", snapshot)
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1849,8 +1968,9 @@ class GoalManager:
         text = (text or "").strip()
         if not text:
             raise ValueError("subgoal text is empty")
+        snapshot = self._snapshot_state()
         self._state.subgoals.append(text)
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("subgoal add", snapshot)
         return text
 
     def remove_subgoal(self, index_1based: int) -> str:
@@ -1862,8 +1982,9 @@ class GoalManager:
             raise IndexError(
                 f"index out of range (1..{len(self._state.subgoals)})"
             )
+        snapshot = self._snapshot_state()
         removed = self._state.subgoals.pop(idx)
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("subgoal remove", snapshot)
         return removed
 
     def clear_subgoals(self) -> int:
@@ -1871,8 +1992,9 @@ class GoalManager:
         if self._state is None or not self.has_goal():
             raise RuntimeError("no active goal")
         prev = len(self._state.subgoals)
+        snapshot = self._snapshot_state()
         self._state.subgoals = []
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("subgoal clear", snapshot)
         return prev
 
     def render_subgoals(self) -> str:
@@ -1907,8 +2029,9 @@ class GoalManager:
             timeout_seconds=int(timeout_seconds) if timeout_seconds else DEFAULT_GATE_TIMEOUT_SECONDS,
             max_retries=int(max_retries) if max_retries else DEFAULT_GATE_MAX_RETRIES,
         )
+        snapshot = self._snapshot_state()
         self._state.gates.append(gate)
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal gate add", snapshot)
         return gate
 
     def remove_gate(self, index_1based: int) -> str:
@@ -1918,8 +2041,9 @@ class GoalManager:
         idx = int(index_1based) - 1
         if idx < 0 or idx >= len(self._state.gates):
             raise IndexError(f"index out of range (1..{len(self._state.gates)})")
+        snapshot = self._snapshot_state()
         removed = self._state.gates.pop(idx)
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal gate remove", snapshot)
         return removed.command
 
     def clear_gates(self) -> int:
@@ -1927,8 +2051,9 @@ class GoalManager:
         if self._state is None or not self.has_goal():
             raise RuntimeError("no active goal")
         prev = len(self._state.gates)
+        snapshot = self._snapshot_state()
         self._state.gates = []
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal gate clear", snapshot)
         return prev
 
     def render_gates(self) -> str:
@@ -1964,6 +2089,7 @@ class GoalManager:
         state = self._state
         if state is None or not state.gates:
             return None
+        snapshot = self._snapshot_state()
 
         fingerprint = workspace_fingerprint()
         for gate in state.gates:
@@ -1992,7 +2118,7 @@ class GoalManager:
                 state.paused_reason = (
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}"
                 )
-                save_goal(self.session_id, state)
+                self._persist_or_raise("goal gate evaluation", snapshot)
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -2007,7 +2133,7 @@ class GoalManager:
                     ),
                 }
 
-            save_goal(self.session_id, state)
+            self._persist_or_raise("goal gate evaluation", snapshot)
             prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                 goal=state.goal,
                 command=gate.command,
@@ -2028,7 +2154,7 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        self._persist_or_raise("goal gate evaluation", snapshot)
         return None
 
     # --- /goal wait barrier -------------------------------------------
@@ -2049,12 +2175,13 @@ class GoalManager:
         pid = int(pid)
         if pid <= 0:
             raise ValueError("pid must be a positive integer")
+        snapshot = self._snapshot_state()
         self._state.waiting_on_pid = pid
         self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal wait", snapshot)
         return self._state
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
@@ -2071,12 +2198,13 @@ class GoalManager:
         session_id = str(session_id or "").strip()
         if not session_id:
             raise ValueError("session_id must be a non-empty string")
+        snapshot = self._snapshot_state()
         self._state.waiting_on_session = session_id
         self._state.waiting_on_pid = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal wait", snapshot)
         return self._state
 
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
@@ -2092,12 +2220,13 @@ class GoalManager:
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
+        snapshot = self._snapshot_state()
         self._state.waiting_on_pid = None
         self._state.waiting_on_session = None
         self._state.waiting_until = time.time() + seconds
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal wait", snapshot)
         return self._state
 
     def stop_waiting(self) -> bool:
@@ -2111,12 +2240,13 @@ class GoalManager:
             and not self._state.waiting_until
         ):
             return False
+        snapshot = self._snapshot_state()
         self._state.waiting_on_pid = None
         self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
+        self._persist_or_raise("goal unwait", snapshot)
         return True
 
     def is_waiting(self) -> bool:
@@ -2157,6 +2287,34 @@ class GoalManager:
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        """Evaluate after a turn without scheduling from an uncommitted state."""
+        snapshot = self._snapshot_state()
+        try:
+            return self._evaluate_after_turn_impl(
+                last_response,
+                user_initiated=user_initiated,
+                background_processes=background_processes,
+            )
+        except GoalDurabilityError as exc:
+            self._restore_snapshot(snapshot)
+            self._last_persistence_succeeded = False
+            state = self._state
+            return {
+                "status": state.status if state else None,
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "persistence_failed",
+                "reason": exc.action,
+                "message": "⚠ Goal state was not saved; no continuation was scheduled. Retry the command.",
+            }
+
+    def _evaluate_after_turn_impl(
+        self,
+        last_response: str,
+        *,
+        user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
         ``user_initiated`` distinguishes a real user prompt (True) from a
@@ -2186,6 +2344,7 @@ class GoalManager:
                 "reason": "no active goal",
                 "message": "",
             }
+        rollback_snapshot = self._snapshot_state()
 
         # Wait barrier: if the loop is parked (on a live process OR a time
         # deadline that hasn't passed), quiesce — do NOT burn a turn or call
@@ -2221,7 +2380,7 @@ class GoalManager:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
                 state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                save_goal(self.session_id, state)
+                self._persist_or_raise("goal evaluation", rollback_snapshot)
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -2291,7 +2450,7 @@ class GoalManager:
 
         if verdict == "done":
             state.status = "done"
-            save_goal(self.session_id, state)
+            self._persist_or_raise("goal completion", rollback_snapshot)
             return {
                 "status": "done",
                 "should_continue": False,
@@ -2312,7 +2471,7 @@ class GoalManager:
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
                 f"(check auxiliary.goal_judge provider/key in config.yaml)"
             )
-            save_goal(self.session_id, state)
+            self._persist_or_raise("goal evaluation", rollback_snapshot)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -2342,7 +2501,7 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            save_goal(self.session_id, state)
+            self._persist_or_raise("goal evaluation", rollback_snapshot)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -2364,7 +2523,7 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
+            self._persist_or_raise("goal evaluation", rollback_snapshot)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -2377,7 +2536,7 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        self._persist_or_raise("goal evaluation", rollback_snapshot)
         return {
             "status": "active",
             "should_continue": True,

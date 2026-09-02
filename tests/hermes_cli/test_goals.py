@@ -348,6 +348,84 @@ class TestGoalTerminalOutcome:
         assert state.status == "active"
         assert state.terminal_outcome is None
 
+    @pytest.mark.parametrize("raw_timestamp", ["NaN", "Infinity", "-Infinity", -1, -0.1])
+    def test_terminal_and_archive_reject_invalid_timestamps(self, raw_timestamp):
+        from hermes_cli.goals import GoalCompactionArchive, GoalTerminalOutcome
+
+        terminal = GoalTerminalOutcome.from_dict(
+            {"state": "cleared", "origin": "test", "timestamp": raw_timestamp}
+        )
+        archive = GoalCompactionArchive.from_dict(
+            {"origin": "compaction", "timestamp": raw_timestamp}
+        )
+        assert terminal is None
+        assert archive is None
+
+
+class TestGoalStateSchema:
+    @pytest.mark.parametrize("schema_version", [None, 0, 1])
+    def test_legacy_schema_versions_normalize_to_current(self, schema_version):
+        from hermes_cli.goals import GOAL_STATE_SCHEMA_VERSION, GoalState
+
+        raw = {"goal": "legacy", "status": "active"}
+        if schema_version is not None:
+            raw["schema_version"] = schema_version
+        state = GoalState.from_json(json.dumps(raw))
+        assert state.schema_version == GOAL_STATE_SCHEMA_VERSION
+        assert json.loads(state.to_json())["schema_version"] == GOAL_STATE_SCHEMA_VERSION
+
+    @pytest.mark.parametrize(
+        "schema_version",
+        [-1, 2, "bad", "1", True, 1.0, 1.5, -0.5],
+    )
+    def test_invalid_schema_versions_fail_closed(self, schema_version):
+        from hermes_cli.goals import GoalState
+
+        with pytest.raises(ValueError):
+            GoalState.from_json(json.dumps({"goal": "bad", "schema_version": schema_version}))
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("created_at", "NaN"),
+            ("last_turn_at", "Infinity"),
+            ("waiting_until", -1),
+            ("waiting_since", "-Infinity"),
+            ("created_at", True),
+        ],
+    )
+    def test_full_state_rejects_nonfinite_or_negative_timestamps(self, field, value):
+        from hermes_cli.goals import GoalState
+
+        with pytest.raises(ValueError):
+            GoalState.from_json(json.dumps({"goal": "bad timestamp", field: value}))
+
+    def test_nonfinite_state_cannot_be_serialized(self):
+        from hermes_cli.goals import GoalState
+
+        with pytest.raises(ValueError):
+            GoalState(goal="bad timestamp", created_at=float("nan")).to_json()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '{"goal": "bad", "created_at": NaN}',
+            '{"goal": "bad", "last_turn_at": Infinity}',
+            '{"goal": "bad", "terminal_outcome": {"state": "cleared", "origin": "x", "timestamp": NaN}}',
+            '{"goal": "bad", "compaction_archive": {"origin": "compaction", "timestamp": Infinity}}',
+        ],
+    )
+    def test_json_numeric_nonfinite_values_never_become_durable_state(self, raw):
+        from hermes_cli.goals import GoalState
+
+        state = GoalState.from_json(raw) if "created_at" not in raw and "last_turn_at" not in raw else None
+        if state is None:
+            with pytest.raises(ValueError):
+                GoalState.from_json(raw)
+        else:
+            assert state.terminal_outcome is None
+            assert state.compaction_archive is None
+
     def test_existing_achieved_record_is_coherent_and_cannot_be_cleared(self, hermes_home):
         from hermes_cli.goals import GoalManager, GoalTerminalOutcome, clear_goal, save_goal
 
@@ -406,19 +484,128 @@ class TestGoalPersistenceFailures:
 
     def test_manager_set_and_clear_expose_failed_durability(self, hermes_home, monkeypatch):
         from hermes_cli import goals
-        from hermes_cli.goals import GoalManager
+        from hermes_cli.goals import GoalDurabilityError, GoalManager
 
         mgr = GoalManager(session_id="manager-write-fail")
         monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
 
-        state = mgr.set("keep local state")
-        assert state.status == "active"
+        with pytest.raises(GoalDurabilityError):
+            mgr.set("keep local state")
         assert mgr.last_persistence_succeeded is False
-        assert mgr.clear() is False
+        assert mgr.state is None
+
+    def test_mutation_failure_restores_prior_state(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalDurabilityError, GoalManager
+
+        mgr = GoalManager(session_id="manager-mutation-fail")
+        mgr.set("keep durable state")
+        before = mgr.state.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        with pytest.raises(GoalDurabilityError):
+            mgr.pause("storage unavailable")
         assert mgr.last_persistence_succeeded is False
-        assert mgr.state is state
-        assert mgr.state.status == "active"
-        assert mgr.state.terminal_outcome is None
+        assert mgr.state is not None
+        assert mgr.state.to_json() == before
+
+    def test_terminal_evaluation_failure_never_claims_achievement_or_continues(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="manager-terminal-fail")
+        mgr.set("finish safely")
+        before = mgr.state.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            goals, "judge_goal", lambda *_args, **_kwargs: ("done", "verified", False, None, False)
+        )
+
+        decision = mgr.evaluate_after_turn("final answer")
+
+        assert decision["verdict"] == "persistence_failed"
+        assert decision["should_continue"] is False
+        assert "not saved" in decision["message"]
+        assert mgr.state is not None and mgr.state.to_json() == before
+
+    @pytest.mark.parametrize(
+        "judge_result, max_turns",
+        [
+            (("done", "verified", False, None, False), 5),
+            (("continue", "more work", False, None, False), 1),
+        ],
+    )
+    def test_evaluation_terminal_transitions_roll_back_on_write_failure(
+        self, hermes_home, monkeypatch, judge_result, max_turns
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id=f"evaluation-{max_turns}", default_max_turns=max_turns)
+        mgr.set("keep evaluating")
+        before = mgr.state.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(goals, "judge_goal", lambda *_args, **_kwargs: judge_result)
+
+        decision = mgr.evaluate_after_turn("one more turn")
+
+        assert decision["verdict"] == "persistence_failed"
+        assert decision["should_continue"] is False
+        assert mgr.state is not None and mgr.state.to_json() == before
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "set", "set_contract", "pause", "resume", "clear", "mark_done",
+            "add_subgoal", "remove_subgoal", "clear_subgoals",
+            "add_gate", "remove_gate", "clear_gates",
+            "wait_on", "wait_on_session", "wait_for_seconds", "stop_waiting",
+        ],
+    )
+    def test_every_goal_mutation_rolls_back_when_durability_fails(
+        self, hermes_home, monkeypatch, operation
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalContract, GoalDurabilityError, GoalManager
+
+        mgr = GoalManager(session_id=f"mutation-{operation}")
+        mgr.set("durable original")
+        if operation == "resume":
+            mgr.pause()
+        elif operation in {"remove_subgoal", "clear_subgoals"}:
+            mgr.add_subgoal("existing criterion")
+        elif operation in {"remove_gate", "clear_gates"}:
+            mgr.add_gate("true")
+        elif operation == "stop_waiting":
+            mgr.wait_for_seconds(60)
+        before = mgr.state.to_json()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        actions = {
+            "set": lambda: mgr.set("replacement"),
+            "set_contract": lambda: mgr.set_contract(GoalContract(verification="pytest -q")),
+            "pause": lambda: mgr.pause(),
+            "resume": lambda: mgr.resume(),
+            "clear": lambda: mgr.clear(),
+            "mark_done": lambda: mgr.mark_done("judge decision"),
+            "add_subgoal": lambda: mgr.add_subgoal("new criterion"),
+            "remove_subgoal": lambda: mgr.remove_subgoal(1),
+            "clear_subgoals": lambda: mgr.clear_subgoals(),
+            "add_gate": lambda: mgr.add_gate("true"),
+            "remove_gate": lambda: mgr.remove_gate(1),
+            "clear_gates": lambda: mgr.clear_gates(),
+            "wait_on": lambda: mgr.wait_on(12345),
+            "wait_on_session": lambda: mgr.wait_on_session("background-session"),
+            "wait_for_seconds": lambda: mgr.wait_for_seconds(60),
+            "stop_waiting": lambda: mgr.stop_waiting(),
+        }
+        with pytest.raises(GoalDurabilityError):
+            actions[operation]()
+
+        assert mgr.last_persistence_succeeded is False
+        assert mgr.state is not None and mgr.state.to_json() == before
 
 
 class TestMigrateGoalToSession:
@@ -514,6 +701,44 @@ class TestMigrateGoalToSession:
         parent = load_goal("archive-fail-parent")
         assert parent is not None and parent.status == "active"
         assert load_goal("archive-fail-child") is None
+
+    @pytest.mark.parametrize("interleaving", ["parent", "child"])
+    def test_compaction_cas_rejects_interleaving_without_partial_move(
+        self, hermes_home, monkeypatch, interleaving
+    ):
+        """The transactional CAS keeps a concurrent parent/child authoritative."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalState, load_goal, migrate_goal_to_session, save_goal
+
+        parent_id = f"cas-{interleaving}-parent"
+        child_id = f"cas-{interleaving}-child"
+        assert save_goal(parent_id, GoalState(goal="original parent"))
+        db = goals._get_session_db()
+        assert db is not None
+        real_execute = db._execute_write
+        real_set_meta = db.set_meta
+
+        def _interleaved_execute(callback):
+            if interleaving == "parent":
+                replacement = GoalState(goal="concurrent parent").to_json()
+                real_execute(lambda conn: real_set_meta(f"goal:{parent_id}", replacement, cursor=conn))
+            else:
+                replacement = GoalState(goal="concurrent child").to_json()
+                real_execute(lambda conn: real_set_meta(f"goal:{child_id}", replacement, cursor=conn))
+            return real_execute(callback)
+
+        monkeypatch.setattr(db, "_execute_write", _interleaved_execute)
+
+        assert migrate_goal_to_session(parent_id, child_id, reason="race") is False
+        if interleaving == "parent":
+            parent = load_goal(parent_id)
+            assert parent is not None and parent.goal == "concurrent parent"
+            assert load_goal(child_id) is None
+        else:
+            parent = load_goal(parent_id)
+            child = load_goal(child_id)
+            assert parent is not None and parent.goal == "original parent"
+            assert child is not None and child.goal == "concurrent child"
 
 
     def test_does_not_clobber_existing_child_goal(self, hermes_home):

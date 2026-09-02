@@ -231,6 +231,19 @@ def test_goal_resume_without_goal_stays_exec(server, session):
     assert "No goal to resume" in r["result"]["output"]
 
 
+def test_goal_set_write_failure_returns_error_without_send(server, session, monkeypatch):
+    from hermes_cli import goals
+
+    sid, _, _ = session
+    monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+    r = _call(server, "command.dispatch", name="goal", arg="persist this", session_id=sid)
+
+    assert "error" in r
+    assert "not persisted" in r["error"]["message"]
+    assert "result" not in r
+
+
 # ── slash.exec /goal routing ──────────────────────────────────────────
 
 

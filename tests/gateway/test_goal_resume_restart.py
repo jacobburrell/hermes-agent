@@ -116,6 +116,21 @@ class TestCliResumeRestartsWork:
 
         assert cli._pending_input.empty()
 
+    def test_set_write_failure_never_acknowledges_or_queues_kickoff(
+        self, hermes_home, monkeypatch
+    ):
+        sid = f"sid-cli-goal-write-fail-{uuid.uuid4().hex}"
+        cli = _make_cli(sid)
+        lines = []
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr("cli._cprint", lines.append)
+
+        cli._handle_goal_command("goal persist this")
+
+        assert cli._pending_input.empty()
+        assert any("not persisted" in line for line in lines)
+        assert not any("Goal set" in line for line in lines)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Messaging gateway
@@ -171,6 +186,18 @@ def _resume_event() -> MessageEvent:
     )
 
 
+def _set_event() -> MessageEvent:
+    event = _resume_event()
+    event.text = "/goal persist this"
+    return event
+
+
+def _clear_event() -> MessageEvent:
+    event = _resume_event()
+    event.text = "/goal clear"
+    return event
+
+
 class TestGatewayResumeRestartsWork:
     @pytest.mark.asyncio
     async def test_resume_after_budget_exhaustion_enqueues_continuation(
@@ -204,3 +231,33 @@ class TestGatewayResumeRestartsWork:
 
         assert "No goal to resume" in response
         assert adapter._pending_messages == {}
+
+    @pytest.mark.asyncio
+    async def test_set_write_failure_never_acknowledges_or_enqueues_kickoff(
+        self, hermes_home, monkeypatch
+    ):
+        runner, adapter = _make_runner()
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        response = await GatewayRunner._handle_goal_command(runner, _set_event())
+
+        assert "not persisted" in response
+        assert "Goal set" not in response
+        assert adapter._pending_messages == {}
+
+    @pytest.mark.asyncio
+    async def test_clear_write_failure_never_acknowledges_or_cleans_pending_work(
+        self, hermes_home, monkeypatch
+    ):
+        runner, adapter = _make_runner()
+        goals.GoalManager(_GW_SID).set("keep the prior goal")
+        sentinel = MessageEvent(text="ordinary queued work", source=_clear_event().source)
+        adapter._pending_messages[_GW_KEY] = sentinel
+        monkeypatch.setattr(goals, "save_goal", lambda *_args, **_kwargs: False)
+
+        response = await GatewayRunner._handle_goal_command(runner, _clear_event())
+
+        assert "not persisted" in response
+        assert "cleared" not in response.lower()
+        assert adapter._pending_messages[_GW_KEY] is sentinel
+        assert goals.GoalManager(_GW_SID).is_active()

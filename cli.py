@@ -13691,10 +13691,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 mgr.pause(reason="user-interrupted (Ctrl+C)")
             except Exception as exc:
                 logging.debug("goal pause-on-interrupt failed: %s", exc)
-            _cprint(
-                f"  {_DIM}⏸ Goal paused — turn was interrupted. "
-                f"Use /goal resume to continue, or /goal clear to stop.{_RST}"
-            )
+                _cprint(f"  {_DIM}⚠ Goal state was not saved; no continuation was scheduled.{_RST}")
+            else:
+                _cprint(
+                    f"  {_DIM}⏸ Goal paused — turn was interrupted. "
+                    f"Use /goal resume to continue, or /goal clear to stop.{_RST}"
+                )
             return
 
         # Extract the agent's final response for this turn.

@@ -12738,7 +12738,7 @@ def _plan_goal_compression_recovery(
             session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
         return None, None
 
-    from hermes_cli.goals import GoalManager
+    from hermes_cli.goals import GoalDurabilityError, GoalManager
 
     sid_key = str(session.get("session_key") or "")
     if not sid_key:
@@ -12783,7 +12783,12 @@ def _plan_goal_compression_recovery(
             "Context compression was exhausted. Retrying the active goal once.",
         )
 
-    goal_mgr.pause(reason="context compression exhausted twice consecutively")
+    try:
+        goal_mgr.pause(reason="context compression exhausted twice consecutively")
+    except GoalDurabilityError:
+        # A failed pause must not be reported as durable or be followed by a
+        # synthetic continuation. The original active row remains intact.
+        return None, "Goal state was not saved; no continuation was scheduled."
     # A later explicit /goal resume gets a fresh bounded recovery cycle.
     session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
     return (

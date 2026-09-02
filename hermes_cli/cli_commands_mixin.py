@@ -3059,6 +3059,7 @@ class CLICommandsMixin:
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""
         from cli import _DIM, _RST, _cprint
+        from hermes_cli.goals import GoalDurabilityError
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
@@ -3094,7 +3095,11 @@ class CLICommandsMixin:
             return
 
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            try:
+                state = mgr.pause(reason="user-paused")
+            except GoalDurabilityError as exc:
+                _cprint(f"  ⚠ {exc}")
+                return
             if state is None:
                 _cprint(f"  {_DIM}No goal set.{_RST}")
             else:
@@ -3102,7 +3107,11 @@ class CLICommandsMixin:
             return
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except GoalDurabilityError as exc:
+                _cprint(f"  ⚠ {exc}")
+                return
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
@@ -3129,8 +3138,12 @@ class CLICommandsMixin:
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
-            if had:
+            try:
+                cleared = mgr.clear()
+            except GoalDurabilityError as exc:
+                _cprint(f"  ⚠ {exc}")
+                return
+            if had and cleared:
                 _cprint("  ✓ Goal cleared.")
             else:
                 _cprint(f"  {_DIM}No active goal.{_RST}")
@@ -3153,7 +3166,7 @@ class CLICommandsMixin:
             reason = wtokens[1].strip() if len(wtokens) > 1 else ""
             try:
                 mgr.wait_on(pid, reason=reason)
-            except (RuntimeError, ValueError) as exc:
+            except (RuntimeError, ValueError, GoalDurabilityError) as exc:
                 _cprint(f"  /goal wait: {exc}")
                 return
             rtxt = f" ({reason})" if reason else ""
@@ -3162,7 +3175,12 @@ class CLICommandsMixin:
 
         # /goal unwait — drop the wait barrier and resume normal looping.
         if lower == "unwait":
-            if mgr.stop_waiting():
+            try:
+                stopped = mgr.stop_waiting()
+            except GoalDurabilityError as exc:
+                _cprint(f"  ⚠ {exc}")
+                return
+            if stopped:
                 _cprint("  ▶ Wait barrier cleared — goal loop resumes.")
             else:
                 _cprint(f"  {_DIM}No wait barrier set.{_RST}")
@@ -3182,7 +3200,7 @@ class CLICommandsMixin:
                 command = gate_arg[len("add"):].strip()
                 try:
                     gate = mgr.add_gate(command)
-                except (RuntimeError, ValueError) as exc:
+                except (RuntimeError, ValueError, GoalDurabilityError) as exc:
                     _cprint(f"  /goal gate add: {exc}")
                     return
                 _cprint(
@@ -3195,7 +3213,7 @@ class CLICommandsMixin:
                 idx_text = gate_arg.split(None, 1)[1].strip()
                 try:
                     removed = mgr.remove_gate(int(idx_text))
-                except (RuntimeError, ValueError, IndexError) as exc:
+                except (RuntimeError, ValueError, IndexError, GoalDurabilityError) as exc:
                     _cprint(f"  /goal gate remove: {exc}")
                     return
                 _cprint(f"  ✓ Gate removed: $ {removed}")
@@ -3203,7 +3221,7 @@ class CLICommandsMixin:
             if gate_lower == "clear":
                 try:
                     prev = mgr.clear_gates()
-                except RuntimeError as exc:
+                except (RuntimeError, GoalDurabilityError) as exc:
                     _cprint(f"  /goal gate clear: {exc}")
                     return
                 _cprint(f"  ✓ Cleared {prev} gate{'s' if prev != 1 else ''}.")
@@ -3221,7 +3239,7 @@ class CLICommandsMixin:
         goal_text = headline or arg
         try:
             state = mgr.set(goal_text, contract=contract if not contract.is_empty() else None)
-        except ValueError as exc:
+        except (ValueError, GoalDurabilityError) as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
 
@@ -3248,7 +3266,7 @@ class CLICommandsMixin:
         set it as the active goal. Falls back to a bare goal if the aux model
         can't produce a contract."""
         from cli import _DIM, _RST, _cprint
-        from hermes_cli.goals import draft_contract
+        from hermes_cli.goals import GoalDurabilityError, draft_contract
 
         mgr = self._get_goal_manager()
         if mgr is None:
@@ -3265,7 +3283,7 @@ class CLICommandsMixin:
 
         try:
             state = mgr.set(objective, contract=contract)
-        except ValueError as exc:
+        except (ValueError, GoalDurabilityError) as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
 
@@ -3338,6 +3356,7 @@ class CLICommandsMixin:
         judge call includes them.
         """
         from cli import _DIM, _RST, _cprint
+        from hermes_cli.goals import GoalDurabilityError
         parts = (cmd or "").strip().split(None, 2)
         arg = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
 
@@ -3371,7 +3390,7 @@ class CLICommandsMixin:
                 return
             try:
                 removed = mgr.remove_subgoal(idx)
-            except (IndexError, RuntimeError) as exc:
+            except (IndexError, RuntimeError, GoalDurabilityError) as exc:
                 _cprint(f"  /subgoal remove: {exc}")
                 return
             _cprint(f"  ✓ Removed subgoal {idx}: {removed}")
@@ -3380,7 +3399,7 @@ class CLICommandsMixin:
         if verb == "clear":
             try:
                 prev = mgr.clear_subgoals()
-            except RuntimeError as exc:
+            except (RuntimeError, GoalDurabilityError) as exc:
                 _cprint(f"  /subgoal clear: {exc}")
                 return
             if prev:
@@ -3392,7 +3411,7 @@ class CLICommandsMixin:
         # Otherwise — append the whole arg as a new subgoal.
         try:
             text = mgr.add_subgoal(arg)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, GoalDurabilityError) as exc:
             _cprint(f"  /subgoal: {exc}")
             return
         idx = len(mgr.state.subgoals) if mgr.state else 0
