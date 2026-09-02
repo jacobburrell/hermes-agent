@@ -7,7 +7,7 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
@@ -15,6 +15,7 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import {
   buildPollPayload,
   buildTextSendPayload,
+  canonicalSessionPath,
   createBoundedMessageStore,
   appendMediaFailureNote,
   extractBridgeEvent,
@@ -34,6 +35,25 @@ import {
   assert.equal(first, equivalent);
   assert.notEqual(first, other);
   console.log('  ✓ bridge health exposes only a stable session fingerprint');
+}
+
+{
+  const root = mkdtempSync(path.join(tmpdir(), 'hermes-session-path-'));
+  const canonical = path.join(root, 'canonical');
+  const alias = path.join(root, 'alias');
+  mkdirSync(canonical);
+  symlinkSync(canonical, alias, 'dir');
+  const missingViaAlias = path.join(alias, 'not-created-yet');
+  const missingCanonical = path.join(canonical, 'not-created-yet');
+  assert.equal(
+    canonicalSessionPath(missingViaAlias),
+    canonicalSessionPath(missingCanonical),
+  );
+  assert.equal(
+    sessionPathFingerprint(missingViaAlias),
+    sessionPathFingerprint(missingCanonical),
+  );
+  console.log('  ✓ bridge health canonicalizes existing symlink parents');
 }
 
 // -- inbound read receipts ------------------------------------------------

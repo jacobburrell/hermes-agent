@@ -6,6 +6,9 @@ response from another profile must never be reused or killed.
 """
 
 import asyncio
+import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,6 +132,45 @@ def _clear_in_process_port_owners():
 
 
 class TestBridgePortOwnership:
+    def test_session_fingerprint_matches_node_through_symlink_and_missing_leaf(self, tmp_path):
+        """Python and Node canonicalize the same not-yet-created session path."""
+        from plugins.platforms.whatsapp.adapter import (
+            _canonical_session_path,
+            _session_path_fingerprint,
+        )
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("Node is required for the cross-language bridge contract")
+        canonical_parent = tmp_path / "canonical-parent"
+        canonical_parent.mkdir()
+        alias_parent = tmp_path / "session-alias"
+        try:
+            alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+        missing_session = alias_parent / "not-created-yet"
+        helper = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/whatsapp-bridge/bridge_helpers.js"
+        )
+        script = (
+            "import { sessionPathFingerprint } from "
+            f"{json.dumps(helper.as_uri())}; "
+            "console.log(sessionPathFingerprint(process.argv[1]));"
+        )
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script, str(missing_session)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert _canonical_session_path(missing_session) == str(
+            canonical_parent / "not-created-yet"
+        )
+        assert result.stdout.strip() == _session_path_fingerprint(missing_session)
+
     def test_foreign_port_lock_is_retryable_without_implicit_takeover(self, tmp_path):
         """An ordinary port conflict does not signal the bridge owner."""
         bridge, session_path = _bridge_tree(tmp_path, "profile-a")
@@ -145,7 +187,9 @@ class TestBridgePortOwnership:
 
     def test_explicit_replace_can_take_over_port_lock_once(self, tmp_path):
         """The established ``--replace`` authority remains the only takeover."""
-        bridge, session_path = _bridge_tree(tmp_path, "profile-a")
+        bridge, canonical_session = _bridge_tree(tmp_path, "profile-a")
+        session_path = tmp_path / "profile-a-alias"
+        session_path.symlink_to(canonical_session, target_is_directory=True)
         adapter = _adapter(session_path, bridge)
         adapter._platform_lock_takeover_allowed = True
         adapter._platform_lock_takeover_attempted = False
@@ -196,16 +240,13 @@ class TestBridgePortOwnership:
             return_value=True,
         ), patch.dict(sys.modules, {"aiohttp": _fake_aiohttp({})}), patch(
             "subprocess.Popen"
-        ) as popen, patch(
-            "plugins.platforms.whatsapp.adapter._kill_port_process"
-        ) as kill_port, patch.object(
+        ) as popen, patch.object(
             second, "_acquire_platform_lock", return_value=True
         ) as session_lock:
             assert first._acquire_bridge_port_lock() is True
             assert await second.connect() is False
 
         popen.assert_not_called()
-        kill_port.assert_not_called()
         session_lock.assert_not_called()
         assert first._bridge_port_local_claim is True
         first._release_bridge_port_lock()
@@ -218,7 +259,9 @@ class TestBridgePortOwnership:
             _session_path_fingerprint,
         )
 
-        bridge, session_path = _bridge_tree(tmp_path, "profile-a")
+        bridge, canonical_session = _bridge_tree(tmp_path, "profile-a")
+        session_path = tmp_path / "profile-a-alias-for-reuse"
+        session_path.symlink_to(canonical_session, target_is_directory=True)
         adapter = _adapter(session_path, bridge)
         health = {
             "status": "connected",
@@ -233,9 +276,7 @@ class TestBridgePortOwnership:
             return_value=True,
         ), patch.dict(sys.modules, {"aiohttp": _fake_aiohttp(health)}), patch(
             "subprocess.Popen"
-        ) as popen, patch(
-            "plugins.platforms.whatsapp.adapter._kill_port_process"
-        ) as kill_port, patch.object(
+        ) as popen, patch.object(
             adapter, "_acquire_bridge_port_lock", return_value=True
         ), patch.object(
             adapter, "_acquire_platform_lock", return_value=True
@@ -246,7 +287,6 @@ class TestBridgePortOwnership:
             assert await adapter.connect() is True
 
         popen.assert_not_called()
-        kill_port.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mismatched_health_never_reuses_or_kills_other_profile(self, tmp_path):
@@ -268,8 +308,6 @@ class TestBridgePortOwnership:
         ), patch.dict(sys.modules, {"aiohttp": _fake_aiohttp(foreign_health)}), patch(
             "subprocess.Popen"
         ) as popen, patch(
-            "plugins.platforms.whatsapp.adapter._kill_port_process"
-        ) as kill_port, patch(
             "plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"
         ) as kill_pidfile, patch.object(
             adapter, "_acquire_bridge_port_lock", return_value=True
@@ -279,14 +317,15 @@ class TestBridgePortOwnership:
             assert await adapter.connect() is False
 
         popen.assert_not_called()
-        kill_port.assert_not_called()
         kill_pidfile.assert_not_called()
         assert adapter._fatal_error_code is None
 
     @pytest.mark.asyncio
     async def test_missing_health_fingerprint_fails_closed_without_kill(self, tmp_path):
         """A legacy or malformed health response cannot be reused or restarted."""
-        bridge, session_path = _bridge_tree(tmp_path, "profile-a")
+        bridge, canonical_session = _bridge_tree(tmp_path, "profile-a")
+        session_path = tmp_path / "profile-a-alias-for-reuse"
+        session_path.symlink_to(canonical_session, target_is_directory=True)
         adapter = _adapter(session_path, bridge)
         legacy_health = {"status": "connected", "pid": 42124}
 
@@ -296,8 +335,6 @@ class TestBridgePortOwnership:
         ), patch.dict(sys.modules, {"aiohttp": _fake_aiohttp(legacy_health)}), patch(
             "subprocess.Popen"
         ) as popen, patch(
-            "plugins.platforms.whatsapp.adapter._kill_port_process"
-        ) as kill_port, patch(
             "plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"
         ) as kill_pidfile, patch.object(
             adapter, "_acquire_bridge_port_lock", return_value=True
@@ -307,7 +344,6 @@ class TestBridgePortOwnership:
             assert await adapter.connect() is False
 
         popen.assert_not_called()
-        kill_port.assert_not_called()
         kill_pidfile.assert_not_called()
 
     @pytest.mark.asyncio
@@ -348,9 +384,7 @@ class TestBridgePortOwnership:
             "plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock
         ), patch(
             "subprocess.Popen", return_value=child
-        ) as popen, patch(
-            "plugins.platforms.whatsapp.adapter._kill_port_process"
-        ) as kill_port, patch.object(
+        ) as popen, patch.object(
             adapter, "_acquire_bridge_port_lock", return_value=True
         ), patch.object(
             adapter, "_acquire_platform_lock", return_value=True
@@ -358,24 +392,4 @@ class TestBridgePortOwnership:
             assert await adapter.connect() is False
 
         popen.assert_called_once()
-        kill_port.assert_not_called()
         assert adapter._running is False
-
-    def test_guard_mismatch_never_kills_listener(self):
-        """A listener PID different from health ownership is never signalled."""
-        from plugins.platforms.whatsapp import adapter as whatsapp_adapter
-
-        kills = []
-        with patch(
-            "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-            return_value=[5002],
-        ), patch(
-            "plugins.platforms.whatsapp.adapter._pid_looks_like_node_bridge",
-            return_value=True,
-        ), patch(
-            "plugins.platforms.whatsapp.adapter.os.kill",
-            side_effect=lambda pid, signal: kills.append((pid, signal)),
-        ):
-            assert whatsapp_adapter._kill_port_process(19876, expected_pid=5001) is False
-
-        assert kills == []

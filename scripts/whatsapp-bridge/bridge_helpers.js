@@ -1,13 +1,33 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, realpathSync, writeFileSync } from 'fs';
 import { createHash, randomBytes } from 'crypto';
+
+export function canonicalSessionPath(sessionDir) {
+  // Match Python's Path.resolve(strict=False): resolve every existing parent
+  // (including symlinks), then append any missing suffix lexically. This keeps
+  // the health identity stable before pairing has created the session dir.
+  let candidate = path.resolve(String(sessionDir || ''));
+  const missing = [];
+  while (true) {
+    try {
+      const resolved = realpathSync.native(candidate);
+      return missing.length ? path.join(resolved, ...missing.reverse()) : resolved;
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return candidate;
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return candidate;
+      missing.push(path.basename(candidate));
+      candidate = parent;
+    }
+  }
+}
 
 export function sessionPathFingerprint(sessionDir) {
   // Health responses are local-only, but never expose a profile/session path
   // or auth material. The Python adapter calculates the same digest before
   // it reuses a bridge bound to a shared local port.
   return createHash('sha256')
-    .update(path.resolve(String(sessionDir || '')))
+    .update(canonicalSessionPath(sessionDir))
     .digest('hex')
     .slice(0, 32);
 }

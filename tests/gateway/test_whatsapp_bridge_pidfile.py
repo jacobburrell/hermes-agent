@@ -9,27 +9,21 @@ the user's browser main process got SIGTERMed, closing the browser at irregular
 intervals (no crash, no coredump — a clean kill of a stranger).
 
 These tests prove the identity guard: a PID is only signalled when it is still
-our bridge (kernel start time matches, or — for legacy pidfiles — its command
-line names node + this session). A recycled PID is left alone.
+our bridge (kernel start time matches and its command line names node + this
+session; legacy pidfiles retain the command-line check). A recycled PID is
+left alone.
 """
 
 import subprocess
 import sys
 import time
 
-import pytest
-
-import os
-import socket
-
 from plugins.platforms.whatsapp.adapter import (
     _bridge_pid_is_ours,
-    _kill_port_process,
     _kill_stale_bridge_by_pidfile,
-    _listener_pids_on_port,
     _write_bridge_pidfile,
 )
-from gateway.status import get_process_start_time, _pid_exists
+from gateway.status import get_process_start_time
 
 
 def _spawn_sleeper(*extra_argv) -> subprocess.Popen:
@@ -55,8 +49,13 @@ class TestWriteAndRoundTrip:
             _write_bridge_pidfile(tmp_path, proc.pid)
             lines = (tmp_path / "bridge.pid").read_text().split("\n")
             assert int(lines[0]) == proc.pid
-            # Line 2 is the kernel start time (present on Linux).
-            assert int(lines[1]) == get_process_start_time(proc.pid)
+            # Some platforms cannot expose a process start time; the helper
+            # intentionally retains a one-line legacy-safe pidfile there.
+            start_time = get_process_start_time(proc.pid)
+            if start_time is None:
+                assert len(lines) == 1
+            else:
+                assert int(lines[1]) == start_time
         finally:
             proc.kill()
             proc.wait()
@@ -65,7 +64,7 @@ class TestWriteAndRoundTrip:
 class TestIdentityGuard:
     def test_kills_when_start_time_matches(self, tmp_path):
         """A genuine bridge (recorded start time matches) IS reaped."""
-        proc = _spawn_sleeper()
+        proc = _spawn_sleeper("node", str(tmp_path))
         try:
             _write_bridge_pidfile(tmp_path, proc.pid)
             _kill_stale_bridge_by_pidfile(tmp_path)
@@ -90,39 +89,44 @@ class TestIdentityGuard:
                 proc.kill()
                 proc.wait()
 
+    def test_recycled_node_pid_is_not_killed_when_start_time_changes(self, tmp_path, monkeypatch):
+        """A recycled PID remains unsafe even if it now names another node."""
+        from gateway import status
 
-class TestKillPortProcess:
-    """Freeing the bridge port must target only LISTENers, never clients.
+        (tmp_path / "bridge.pid").write_text("4242\n100", encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 101)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: f"node bridge.js --session {tmp_path}",
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
 
-    Root cause of the live Firefox kills: ``lsof -ti :PORT`` (and ``fuser
-    PORT/tcp``) also returned *client* sockets whose connection merely involved
-    the port number. The WhatsApp bridge uses port 3000 by default — a common
-    local dev-server port — so a browser tab on ``localhost:3000`` was matched
-    and SIGTERMed every time the (crash-looping) bridge restarted.
-    """
+        _kill_stale_bridge_by_pidfile(tmp_path)
 
-    def test_listener_lookup_excludes_client_process(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        port = srv.getsockname()[1]
-        srv.listen(5)
-        # A separate process holding a *client* connection to that port.
-        client = subprocess.Popen([
-            sys.executable, "-c",
-            "import socket,time; c=socket.create_connection(('127.0.0.1',%d)); time.sleep(0.2)" % port,
-        ])
-        try:
-            conn, _ = srv.accept()  # establish the client connection
-            pids = _listener_pids_on_port(port)
-            if os.getpid() not in pids:
-                pytest.skip("neither lsof nor ss detected the listener here")
-            # The listener (this process) is found; the client process is NOT —
-            # the LISTEN filter is what spares unrelated clients like a browser.
-            assert client.pid not in pids
-            conn.close()
-        finally:
-            client.kill()
-            client.wait()
-            srv.close()
+        assert killed == []
 
+    def test_matching_start_time_still_requires_session_command_line(self, tmp_path, monkeypatch):
+        """A PID/start-time match alone cannot authorize a signal."""
+        from gateway import status
+
+        (tmp_path / "bridge.pid").write_text("4242\n100", encoding="utf-8")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 100)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda _pid: "node unrelated.js"
+        )
+        killed = []
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+
+        _kill_stale_bridge_by_pidfile(tmp_path)
+
+        assert killed == []
