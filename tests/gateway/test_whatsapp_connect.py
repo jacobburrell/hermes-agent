@@ -140,15 +140,16 @@ class TestCloseBridgeLog:
 # ---------------------------------------------------------------------------
 
 class TestDataInitialized:
-    """Verify ``data = {}`` prevents NameError when resp.json() fails."""
+    """Malformed bridge health is fail-closed without a local exception."""
 
     @pytest.mark.asyncio
     async def test_no_name_error_when_json_always_fails(self):
-        """HTTP 200 sets http_ready but json() always raises.
+        """HTTP 200 with an invalid health body never proves bridge ownership.
 
         Without the fix, ``data`` was never assigned and the Phase 2 check
-        ``data.get("status")`` raised NameError.  With ``data = {}``, the
-        check evaluates to ``None != "connected"`` and Phase 2 runs normally.
+        ``data.get("status")`` raised NameError.  The initialized empty value
+        avoids that crash, but the managed bridge must still reject malformed
+        health: it cannot verify the spawned bridge's session identity.
         """
         adapter = _make_adapter()
 
@@ -165,12 +166,12 @@ class TestDataInitialized:
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
              patches[5], patches[6], patches[7], patches[8], \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
-            # Must NOT raise NameError
+            # Must NOT raise NameError, but malformed ownership health fails
+            # closed instead of continuing with an unverified bridge.
             result = await adapter.connect()
 
-        # connect() returns True (warn-and-proceed path)
-        assert result is True
-        assert adapter._running is True
+        assert result is False
+        assert adapter._running is False
 
 
 # ---------------------------------------------------------------------------
