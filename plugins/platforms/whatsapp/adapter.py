@@ -16,12 +16,15 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import platform
 import re
+import shlex
 import signal
 import subprocess
+import threading
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -62,120 +65,14 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
-def _listener_pids_on_port(port: int) -> list:
-    """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
-
-    This must match only LISTEN sockets. A bare ``lsof -i :PORT`` (or
-    ``fuser PORT/tcp``) also returns *clients* whose connection merely involves
-    that port number — e.g. a browser with a tab open on a local dev server
-    sharing the port. SIGTERMing those closed the user's browser at irregular
-    intervals. Restricting to LISTEN state frees the port for a new bridge
-    without ever touching an unrelated client.
-    """
-    pids: list = []
-    try:
-        result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            try:
-                pids.append(int(line))
-            except ValueError:
-                pass
-        if pids:
-            return pids
-    except FileNotFoundError:
-        pass  # lsof not installed — fall through to ss
-    # Fallback: ss (iproute2, present on virtually every modern Linux).
-    try:
-        result = subprocess.run(
-            ["ss", "-ltnHp", f"sport = :{port}"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for m in re.finditer(r"pid=(\d+)", result.stdout):
-            pids.append(int(m.group(1)))
-    except FileNotFoundError:
-        pass
-    return pids
-
-
-def _pid_looks_like_node_bridge(pid: int) -> bool:
-    """Fail-closed check that *pid* is plausibly a stale node bridge.
-
-    ``_kill_port_process`` discovers PIDs from a netstat/lsof scan of a TCP
-    port — a bare number naming a *stranger* process (#89614 class: an
-    unverified scan-time PID force-killed later can be anything, including a
-    critical system process). Before any kill, require the live process to
-    actually look like our Baileys bridge: a ``node`` executable. Any
-    ambiguity (process gone, unreadable cmdline) refuses the kill.
-    """
-    try:
-        import psutil
-
-        proc = psutil.Process(pid)
-        name = (proc.name() or "").lower()
-        cmdline = " ".join(proc.cmdline() or []).lower()
-        return "node" in name or "node" in cmdline.split(" ", 1)[0]
-    except Exception:
-        return False
-
-
-def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
-    try:
-        if _IS_WINDOWS:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            # Use netstat to find the PID bound to this port, then taskkill
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-                creationflags=windows_hide_flags(),
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
-                    local_addr = parts[1]
-                    if local_addr.endswith(f":{port}"):
-                        try:
-                            pid = int(parts[4])
-                        except ValueError:
-                            continue
-                        # Never taskkill a bare netstat-scanned PID: verify
-                        # the live process is a node bridge first (fail
-                        # closed). taskkill /F on a mistyped or recycled PID
-                        # is unrecoverable.
-                        if pid <= 0 or not _pid_looks_like_node_bridge(pid):
-                            logger.warning(
-                                "[whatsapp] Not killing PID %s on port %d: "
-                                "process is not a node bridge (or identity "
-                                "unverifiable)", pid, port)
-                            continue
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/PID", str(pid), "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=windows_hide_flags(),
-                            )
-                        except subprocess.SubprocessError:
-                            pass
-        else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
-            for pid in _listener_pids_on_port(port):
-                if not _pid_looks_like_node_bridge(pid):
-                    logger.warning(
-                        "[whatsapp] Not killing PID %s on port %d: process is "
-                        "not a node bridge (or identity unverifiable)", pid, port)
-                    continue
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-    except Exception:
-        pass
+# ``acquire_scoped_lock`` intentionally permits a process to reacquire its
+# own machine-global lock.  That is correct for a single adapter reconnect,
+# but it means two multiplexed WhatsApp profiles in one gateway could both
+# claim the same bridge port.  Track the resolved session fingerprint in this
+# process as the missing ownership dimension; the scoped lock below covers
+# separate gateway processes.
+_BRIDGE_PORT_OWNERS: dict[str, tuple[str, int]] = {}
+_BRIDGE_PORT_OWNERS_LOCK = threading.Lock()
 
 
 def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
@@ -187,26 +84,52 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     which a bare-liveness ``os.kill`` then SIGTERMed, closing the whole browser
     at irregular intervals (every time the flapping bridge restarted).
 
-    Identity is confirmed two ways: the kernel start time captured when we wrote
-    the pidfile (definitive), and — for legacy pidfiles with no baseline — the
-    command line, which must contain ``node`` and this session's unique path.
-    A recycled PID (different start time / different cmdline) is never ours.
+    Identity is confirmed by the kernel start time captured when we wrote the
+    pidfile *and* an exact Node ``--session`` argv pair.  Legacy pidfiles
+    without a start-time baseline keep that exact command-line check only. A
+    recycled PID is never ours.
     """
     from gateway.status import _pid_exists
     if not _pid_exists(pid):
         return False
     if expected_start is not None:
         from gateway.status import get_process_start_time
-        # A matching (pid, start time) pair uniquely identifies the process.
-        return get_process_start_time(pid) == expected_start
-    # Legacy pidfile (no recorded start time): fall back to a command-line
-    # signature so a recycled PID is still never signalled.  If we cannot read
-    # the cmdline we refuse to kill rather than risk a stranger.
+        if get_process_start_time(pid) != expected_start:
+            return False
+    # Do not use PID/start-time alone: confirm the live process still has the
+    # exact bridge/session command-line shape before any signal.  If the
+    # command cannot be parsed, fail closed rather than risk a stranger.  The
+    # status helper supplies a display command line on non-/proc platforms;
+    # quoted paths parse correctly there, while an ambiguous /proc rendering
+    # (for example a session path with spaces) is deliberately not killable.
     from gateway.status import _read_process_cmdline
     cmdline = _read_process_cmdline(pid)
     if not cmdline:
         return False
-    return ("node" in cmdline) and (str(session_path) in cmdline)
+    try:
+        argv = shlex.split(cmdline, posix=not _IS_WINDOWS)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    executable = Path(argv[0].strip('"\'')).name.casefold()
+    if executable not in {"node", "node.exe"}:
+        return False
+
+    # bridge.js reads its first ``--session`` flag.  Do not let cleanup accept
+    # a duplicate-flag argv whose selected bridge session could be different:
+    # any duplicate or missing flag value is unsafe to signal.
+    session_indexes = [
+        index for index, argument in enumerate(argv) if argument == "--session"
+    ]
+    if len(session_indexes) != 1:
+        return False
+    session_index = session_indexes[0]
+    return (
+        session_index + 1 < len(argv)
+        and argv[session_index + 1] == str(session_path)
+    )
 
 
 def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
@@ -395,6 +318,36 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _canonical_session_path(session_path: Path) -> str:
+    """Resolve existing session parents while retaining a missing suffix.
+
+    This is deliberately equivalent to the Node bridge's
+    ``canonicalSessionPath``: it follows existing symlinks but does not require
+    the session leaf to exist yet.  Do not expand a literal ``~`` here; neither
+    side treats it as shell syntax.
+    """
+    try:
+        return str(session_path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return str(session_path)
+
+
+def _session_path_fingerprint(session_path: Path) -> str:
+    """Return a non-sensitive stable identity for a canonical session path.
+
+    The bridge reports the same digest in its local-only health response.
+    It proves that a bridge on a shared port belongs to this profile without
+    exposing the profile path or any auth material.
+    """
+    import hashlib
+
+    try:
+        resolved = _canonical_session_path(session_path)
+    except (OSError, RuntimeError):
+        resolved = str(session_path)
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -458,6 +411,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
             WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
         self._bridge_process: Optional[subprocess.Popen] = None
+        self._bridge_port_lock_identity: Optional[str] = None
+        self._bridge_port_local_claim = False
         self._bridge_port: int = config.extra.get("bridge_port", 3000)
         self._bridge_script: Optional[str] = config.extra.get(
             "bridge_script",
@@ -546,6 +501,141 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return float(default)
         return parsed
 
+    def _acquire_bridge_port_lock(self) -> bool:
+        """Claim this local bridge port before probing, reusing, or starting.
+
+        This is intentionally separate from the session-path lock: two
+        profiles can have different sessions while still colliding on the
+        same local TCP port.  A conflict is retryable but deliberately does
+        not become a chat-facing fatal notice.
+        """
+        from gateway.status import (
+            acquire_scoped_lock,
+            take_over_scoped_lock_holder,
+        )
+
+        identity = f"127.0.0.1:{int(self._bridge_port)}"
+        session_fingerprint = _session_path_fingerprint(self._session_path)
+        if getattr(self, "_bridge_port_local_claim", False):
+            return True
+
+        # ``acquire_scoped_lock`` deliberately treats our own PID as a
+        # re-acquire.  Prevent a second profile in this gateway from turning
+        # that useful reconnect behavior into a shared bridge owner.
+        with _BRIDGE_PORT_OWNERS_LOCK:
+            local_owner = _BRIDGE_PORT_OWNERS.get(identity)
+            if local_owner is not None and local_owner[0] != session_fingerprint:
+                logger.warning(
+                    "[%s] WhatsApp bridge port %d is already claimed by a "
+                    "different local session; leaving its bridge untouched "
+                    "and retrying later.",
+                    self.name,
+                    self._bridge_port,
+                )
+                return False
+
+        acquired, existing = acquire_scoped_lock(
+            "whatsapp-bridge-port",
+            identity,
+            metadata={"platform": self.platform.value, "port": int(self._bridge_port)},
+        )
+        if not acquired:
+            # Match BasePlatformAdapter's deliberate --replace handoff
+            # semantics without consuming its one stored session-lock slot.
+            # Ordinary starts never signal another gateway.
+            takeover_allowed = bool(
+                getattr(self, "_platform_lock_takeover_allowed", False)
+            )
+            takeover_attempted = bool(
+                getattr(self, "_platform_lock_takeover_attempted", False)
+            )
+            if takeover_allowed and not takeover_attempted and isinstance(existing, dict):
+                self._platform_lock_takeover_allowed = False
+                self._platform_lock_takeover_attempted = True
+                if take_over_scoped_lock_holder(existing) is not None:
+                    acquired, existing = acquire_scoped_lock(
+                        "whatsapp-bridge-port",
+                        identity,
+                        metadata={"platform": self.platform.value, "port": int(self._bridge_port)},
+                    )
+        if acquired:
+            with _BRIDGE_PORT_OWNERS_LOCK:
+                local_owner = _BRIDGE_PORT_OWNERS.get(identity)
+                if local_owner is not None and local_owner[0] != session_fingerprint:
+                    # A same-PID contender claimed the port while we were
+                    # resolving the cross-process lock.  ``release_scoped_lock``
+                    # cannot distinguish two owners with one PID, so leave
+                    # that record intact for the original owner and fail this
+                    # contender closed.
+                    local_conflict = True
+                else:
+                    count = 1 if local_owner is None else local_owner[1] + 1
+                    _BRIDGE_PORT_OWNERS[identity] = (session_fingerprint, count)
+                    local_conflict = False
+            if local_conflict:
+                logger.warning(
+                    "[%s] WhatsApp bridge port %d was claimed by a different "
+                    "local session; leaving its bridge untouched and retrying later.",
+                    self.name,
+                    self._bridge_port,
+                )
+                return False
+            self._bridge_port_lock_identity = identity
+            self._bridge_port_local_claim = True
+            return True
+        logger.warning(
+            "[%s] WhatsApp bridge port %d is held by another gateway; "
+            "leaving its bridge untouched and retrying later.",
+            self.name,
+            self._bridge_port,
+        )
+        return False
+
+    def _release_bridge_port_lock(self) -> None:
+        """Release this adapter's port claim without affecting another owner."""
+        identity = getattr(self, "_bridge_port_lock_identity", None)
+        if not identity:
+            return
+        from gateway.status import release_scoped_lock
+
+        session_fingerprint = _session_path_fingerprint(self._session_path)
+        release_global_lock = True
+        with _BRIDGE_PORT_OWNERS_LOCK:
+            local_owner = _BRIDGE_PORT_OWNERS.get(identity)
+            if local_owner is not None and local_owner[0] == session_fingerprint:
+                if local_owner[1] > 1:
+                    _BRIDGE_PORT_OWNERS[identity] = (
+                        session_fingerprint,
+                        local_owner[1] - 1,
+                    )
+                    release_global_lock = False
+                else:
+                    _BRIDGE_PORT_OWNERS.pop(identity, None)
+        if release_global_lock:
+            release_scoped_lock("whatsapp-bridge-port", identity)
+        self._bridge_port_lock_identity = None
+        self._bridge_port_local_claim = False
+
+    def _bridge_health_matches_session(self, data: Dict[str, Any]) -> bool:
+        """Whether a health payload proves ownership of this session path."""
+        if not isinstance(data, dict):
+            return False
+        running = str(data.get("sessionFingerprint") or "")
+        expected = _session_path_fingerprint(self._session_path)
+        return bool(running and expected and hmac.compare_digest(running, expected))
+
+    def _bridge_health_matches_managed_process(self, data: Dict[str, Any]) -> bool:
+        """Whether startup health proves it came from our just-spawned child."""
+        expected_pid = getattr(self._bridge_process, "pid", None)
+        running_pid = data.get("pid") if isinstance(data, dict) else None
+        return bool(
+            isinstance(expected_pid, int)
+            and expected_pid > 0
+            and isinstance(running_pid, int)
+            and running_pid == expected_pid
+            and self._bridge_health_matches_session(data)
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
         Start the WhatsApp bridge.
@@ -595,14 +685,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
         
-        # Acquire scoped lock to prevent duplicate sessions
+        # Claim the port before probing/reusing/starting.  The existing
+        # session lock alone cannot prevent different profiles from sharing a
+        # bridge port and reusing or killing each other's bridge.
+        port_lock_acquired = False
         lock_acquired = False
         try:
+            if not self._acquire_bridge_port_lock():
+                return False
+            port_lock_acquired = True
             if not self._acquire_platform_lock('whatsapp-session', str(self._session_path), 'WhatsApp session'):
+                self._release_bridge_port_lock()
                 return False
             lock_acquired = True
         except Exception as e:
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
+            if port_lock_acquired:
+                self._release_bridge_port_lock()
+            return False
 
         try:
             # Auto-install npm dependencies when node_modules is missing OR
@@ -664,7 +764,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
             
-            # Check if bridge is already running and connected
+            # Check if bridge is already running and connected.  A healthy
+            # response must prove the resolved session identity as well as the
+            # bridge source/config identity before it can be reused or
+            # restarted.  An unknown or other-profile owner is never killed.
             import aiohttp
             try:
                 async with aiohttp.ClientSession() as session:
@@ -675,6 +778,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         if resp.status == 200:
                             data = await resp.json()
                             bridge_status = data.get("status", "unknown")
+                            if not self._bridge_health_matches_session(data):
+                                logger.warning(
+                                    "[%s] WhatsApp bridge port %d belongs to a "
+                                    "different or unverifiable session; leaving "
+                                    "it untouched and retrying later.",
+                                    self.name,
+                                    self._bridge_port,
+                                )
+                                return False
                             if bridge_status == "connected":
                                 # Staleness handshake: only reuse a running
                                 # bridge if it is serving the same bridge.js
@@ -714,9 +826,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except Exception:
                 pass  # Bridge not running, start a new one
             
-            # Kill any orphaned bridge from a previous gateway run
+            # Reap only a pidfile bridge that proves it belongs to this
+            # session.  Never scan/kill by port: a listener can disappear and
+            # its PID be recycled between health and signal, so even a matching
+            # health response is insufficient ownership proof.
             _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
             
             # Start the bridge process in its own process group.
@@ -809,8 +923,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             timeout=aiohttp.ClientTimeout(total=2)
                         ) as resp:
                             if resp.status == 200:
-                                http_ready = True
                                 data = await resp.json()
+                                if not self._bridge_health_matches_managed_process(data):
+                                    logger.warning(
+                                        "[%s] WhatsApp bridge startup health on port %d "
+                                        "does not belong to the spawned session/PID; "
+                                        "leaving that responder untouched.",
+                                        self.name,
+                                        self._bridge_port,
+                                    )
+                                    self._close_bridge_log()
+                                    return False
+                                http_ready = True
                                 if data.get("status") == "connected":
                                     print(f"[{self.name}] Bridge ready (status: connected)")
                                     break
@@ -842,6 +966,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             ) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
+                                    if not self._bridge_health_matches_managed_process(data):
+                                        logger.warning(
+                                            "[%s] WhatsApp bridge startup health on port %d "
+                                            "does not belong to the spawned session/PID; "
+                                            "leaving that responder untouched.",
+                                            self.name,
+                                            self._bridge_port,
+                                        )
+                                        self._close_bridge_log()
+                                        return False
                                     if data.get("status") == "connected":
                                         print(f"[{self.name}] Bridge ready (status: connected)")
                                         break
@@ -873,6 +1007,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not self._running:
                 if lock_acquired:
                     self._release_platform_lock()
+                if port_lock_acquired:
+                    self._release_bridge_port_lock()
                 self._close_bridge_log()
     
     def _close_bridge_log(self) -> None:
@@ -961,6 +1097,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._http_session = None
 
         self._release_platform_lock()
+        self._release_bridge_port_lock()
 
         self._mark_disconnected()
         self._bridge_process = None
