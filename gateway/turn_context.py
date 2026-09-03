@@ -124,6 +124,13 @@ class TurnContext:
     _voice_ack_guild: list = field(default_factory=lambda: [None])
     _voice_ack_loop: Any = None
 
+    # --- WhatsApp lookup acknowledgement wiring --------------------------
+    # The config result is snapshotted when the turn begins.  The list cell is
+    # set before scheduling so retried tool-start events cannot emit twice.
+    lookup_acknowledgement_enabled: bool = False
+    _lookup_acknowledgement_fired: list = field(default_factory=lambda: [False])
+    _lookup_acknowledgement_loop: Any = None
+
     # --- hook / status bridge wiring (published at original binding sites) -
     _loop_for_step: Any = None
     _hooks_ref: Any = None

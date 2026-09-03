@@ -1452,6 +1452,9 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Send one static WhatsApp acknowledgement before a web/browser lookup.
+        # Per-chat-type and per-platform overrides resolve in the gateway.
+        "lookup_acknowledgement": False,
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.

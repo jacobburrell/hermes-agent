@@ -5739,6 +5739,60 @@ class TurnRunner:
         except Exception as _ack_err:
             logger.debug("voice ack schedule failed: %s", _ack_err)
 
+    def lookup_acknowledgement_callback(self, call_id, tool_name, args):
+        """Send the one static WhatsApp acknowledgement before a lookup."""
+        ctx = self._ctx
+        canonical_name = str(tool_name or "")
+        if (
+            not ctx.lookup_acknowledgement_enabled
+            or ctx._lookup_acknowledgement_fired[0]
+            or getattr(ctx.source, "platform", None) != Platform.WHATSAPP
+            or (
+                canonical_name not in {"web_search", "web_extract"}
+                and not canonical_name.startswith("browser_")
+            )
+            or not ctx._run_still_current()
+        ):
+            return
+
+        # Set this before hopping from the agent worker to the gateway loop:
+        # retries (including a scheduling failure) must never send a second
+        # acknowledgement for the same turn.
+        ctx._lookup_acknowledgement_fired[0] = True
+
+        async def _send_lookup_acknowledgement() -> None:
+            # A turn can be invalidated after the tool callback fired but
+            # before the gateway loop runs this coroutine.
+            if not ctx._run_still_current():
+                return
+            adapter = self._runner._adapter_for_source(ctx.source)
+            if adapter is None:
+                return
+            await adapter.send(
+                ctx.source.chat_id,
+                "Hmm, let me check.",
+                reply_to=ctx.inbound_message_id,
+                metadata=_interim_metadata(
+                    self._runner._thread_metadata_for_source(
+                        ctx.source, ctx.inbound_message_id
+                    )
+                ),
+            )
+
+        coro = _send_lookup_acknowledgement()
+        try:
+            safe_schedule_threadsafe(
+                coro,
+                ctx._lookup_acknowledgement_loop,
+                logger=logger,
+                log_message="WhatsApp lookup acknowledgement scheduling error",
+            )
+        except Exception as ack_err:
+            # The production helper closes failed coroutines itself; keep this
+            # defensive branch leak-safe for replacement/test schedulers too.
+            coro.close()
+            logger.debug("WhatsApp lookup acknowledgement schedule failed: %s", ack_err)
+
     # ── Slack-native task cards: ID-bearing lifecycle callbacks (#29483) ──
     # These ride agent.tool_start_callback / agent.tool_complete_callback so
     # start/completion events correlate by the REAL tool-call id — the
@@ -5794,10 +5848,12 @@ class TurnRunner:
         )
 
     def combined_tool_start_callback(self, call_id, tool_name, args):
-        """Compose the voice ack + native task-card start consumers."""
+        """Compose voice, WhatsApp lookup, and native task-card consumers."""
         ctx = self._ctx
         if ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
+        if ctx.lookup_acknowledgement_enabled:
+            self.lookup_acknowledgement_callback(call_id, tool_name, args)
         if ctx._native_slack_task_cards:
             self.native_tool_start_callback(call_id, tool_name, args)
 
@@ -6403,13 +6459,14 @@ class TurnRunner:
         # subagent vanished silently there.
         agent.tool_progress_callback = ctx.progress_callback
         # Compose ID-bearing lifecycle consumers: Discord's one-time voice
-        # ack and Slack's native task cards both ride the authoritative
-        # start callback, so neither has to infer identity from tool names.
+        # ack, WhatsApp's lookup acknowledgement, and Slack's native task
+        # cards ride the authoritative start callback.
         _combined_start_cb = ctx.native_tool_start_callback or ctx.voice_ack_callback
         agent.tool_start_callback = (
             _combined_start_cb
             if (
                 ctx._voice_ack_guild[0] is not None
+                or ctx.lookup_acknowledgement_enabled
                 or ctx._native_slack_task_cards
             )
             else None
@@ -31381,7 +31438,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import (
+            resolve_display_setting,
+            resolve_lookup_acknowledgement,
+        )
 
         # Apply tool preview length config (0 = no limit)
         try:
@@ -31567,6 +31627,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # voice_ack_callback extracted to TurnRunner.voice_ack_callback
         # (published onto turn_ctx after the runner is constructed below).
 
+        # The acknowledgement is an opt-in, WhatsApp-only turn snapshot.
+        # Resolve it once before the agent worker starts so a config rewrite
+        # cannot change visibility policy mid-turn.
+        _lookup_acknowledgement_enabled = (
+            source.platform == Platform.WHATSAPP
+            and resolve_lookup_acknowledgement(user_config, platform_key, source.chat_type)
+        )
+        _lookup_acknowledgement_fired = [False]
+        _lookup_acknowledgement_loop = asyncio.get_running_loop()
+
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
@@ -31626,6 +31696,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,
             _voice_ack_loop=_voice_ack_loop,
+            lookup_acknowledgement_enabled=_lookup_acknowledgement_enabled,
+            _lookup_acknowledgement_fired=_lookup_acknowledgement_fired,
+            _lookup_acknowledgement_loop=_lookup_acknowledgement_loop,
             history=history,
             context_prompt=context_prompt,
             channel_prompt=channel_prompt,

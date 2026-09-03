@@ -1,6 +1,8 @@
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
@@ -83,6 +85,17 @@ def test_group_messages_can_require_direct_trigger_via_config():
         )
     ) is True
     assert adapter._should_process_message(_group_message("/status")) is True
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_group_is_dropped_before_an_agent_turn_can_start():
+    """A mention-gated WhatsApp group must not reach any tool callback/send."""
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    event = await adapter._build_message_event(_group_message("hello everyone"))
+
+    assert event is None
+    adapter._message_handler.assert_not_awaited()
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():
@@ -228,5 +241,4 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
 

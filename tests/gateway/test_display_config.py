@@ -52,6 +52,58 @@ class TestResolveDisplaySetting:
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp lookup acknowledgement: dedicated resolver
+# ---------------------------------------------------------------------------
+
+class TestLookupAcknowledgement:
+    """The lookup acknowledgement policy is config-only and narrowly scoped."""
+
+    def test_chat_type_platform_global_precedence(self):
+        from gateway.display_config import resolve_lookup_acknowledgement
+
+        config = {
+            "display": {
+                "lookup_acknowledgement": True,
+                "platforms": {"whatsapp": {"lookup_acknowledgement": False}},
+                "chat_types": {"group": {"lookup_acknowledgement": "yes"}},
+            }
+        }
+
+        assert resolve_lookup_acknowledgement(config, "whatsapp", "group") is True
+        assert resolve_lookup_acknowledgement(config, "whatsapp", "dm") is False
+        assert resolve_lookup_acknowledgement(config, "telegram", "dm") is True
+
+    def test_default_and_environment_are_ignored(self, monkeypatch):
+        from gateway.display_config import resolve_lookup_acknowledgement
+
+        monkeypatch.setenv("HERMES_LOOKUP_ACKNOWLEDGEMENT", "true")
+        assert resolve_lookup_acknowledgement({}, "whatsapp", "dm") is False
+
+    def test_platform_and_chat_type_are_normalised_before_lookup(self):
+        from gateway.display_config import resolve_lookup_acknowledgement
+
+        config = {
+            "display": {
+                "lookup_acknowledgement": True,
+                "platforms": {"whatsapp": {"lookup_acknowledgement": True}},
+                "chat_types": {"group": {"lookup_acknowledgement": False}},
+            }
+        }
+
+        assert resolve_lookup_acknowledgement(config, " WhatsApp ", " Group ") is False
+
+    def test_yaml_boolean_normalisation(self):
+        from gateway.display_config import resolve_lookup_acknowledgement
+
+        assert resolve_lookup_acknowledgement(
+            {"display": {"lookup_acknowledgement": "ON"}}, "whatsapp", "dm"
+        ) is True
+        assert resolve_lookup_acknowledgement(
+            {"display": {"lookup_acknowledgement": "off"}}, "whatsapp", "dm"
+        ) is False
+
+
+# ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
 # ---------------------------------------------------------------------------
 
@@ -325,5 +377,3 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
-

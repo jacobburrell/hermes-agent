@@ -260,9 +260,62 @@ def resolve_display_setting(
     return fallback
 
 
+def resolve_lookup_acknowledgement(
+    user_config: dict,
+    platform_key: str,
+    chat_type: str | None,
+) -> bool:
+    """Resolve the WhatsApp lookup acknowledgement opt-in for one turn.
+
+    This is intentionally separate from :func:`resolve_display_setting`: the
+    acknowledgement has a chat-type policy layer and must never inherit a
+    platform tier default.  It is a config.yaml-only boolean, resolved in
+    this exact order:
+
+    1. ``display.chat_types.<chat_type>.lookup_acknowledgement``
+    2. ``display.platforms.<platform>.lookup_acknowledgement``
+    3. ``display.lookup_acknowledgement``
+    4. built-in ``False``
+    """
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display_cfg, dict):
+        return False
+
+    platform_key = str(platform_key or "").strip().lower()
+    chat_type_key = str(chat_type).strip().lower() if chat_type is not None else None
+
+    chat_types = display_cfg.get("chat_types")
+    if isinstance(chat_types, dict) and chat_type_key is not None:
+        chat_type_cfg = chat_types.get(chat_type_key)
+        if isinstance(chat_type_cfg, dict):
+            value = chat_type_cfg.get("lookup_acknowledgement")
+            if value is not None:
+                return _normalise_lookup_acknowledgement(value)
+
+    platforms = display_cfg.get("platforms")
+    if isinstance(platforms, dict):
+        platform_cfg = platforms.get(platform_key)
+        if isinstance(platform_cfg, dict):
+            value = platform_cfg.get("lookup_acknowledgement")
+            if value is not None:
+                return _normalise_lookup_acknowledgement(value)
+
+    value = display_cfg.get("lookup_acknowledgement")
+    if value is not None:
+        return _normalise_lookup_acknowledgement(value)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _normalise_lookup_acknowledgement(value: Any) -> bool:
+    """Normalise a config.yaml boolean without consulting process env."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
 
 def _normalise(setting: str, value: Any) -> Any:
     """Normalise YAML quirks (bare ``off`` → False in YAML 1.1)."""

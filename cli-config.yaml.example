@@ -1775,6 +1775,13 @@ display:
   # Toggle at runtime with /busy <interrupt|queue|steer>.
   busy_input_mode: interrupt
 
+  # WhatsApp-only acknowledgement sent once before the first web/browser
+  # lookup in an admitted turn. The fixed text is "Hmm, let me check.".
+  # Resolution: display.chat_types.<chat_type>.lookup_acknowledgement,
+  # then display.platforms.whatsapp.lookup_acknowledgement, then this value.
+  # It is disabled by default.
+  lookup_acknowledgement: false
+
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use
   # terminal(background=true, notify_on_complete=true) from Telegram/Discord/etc.

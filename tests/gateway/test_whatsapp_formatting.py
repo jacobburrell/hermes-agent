@@ -149,6 +149,28 @@ class TestSendChunking:
         assert adapter._http_session.post.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_normal_send_keeps_static_reply_anchor_and_strips_interim_metadata(self):
+        """Gateway-internal interim metadata never crosses the native /send wire."""
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "msg1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send(
+            "chat1",
+            "Hmm, let me check.",
+            reply_to="inbound-message-id",
+            metadata={"_interim_send": True, "hermes_profile": "routed-profile"},
+        )
+
+        assert result.success
+        payload = adapter._http_session.post.call_args.kwargs["json"]
+        assert payload["message"] == "Hmm, let me check."
+        assert payload["replyTo"] == "inbound-message-id"
+        assert "_interim_send" not in payload
+        assert "hermes_profile" not in payload
+
+    @pytest.mark.asyncio
     async def test_long_message_chunked(self):
         adapter = _make_adapter()
         resp = MagicMock(status=200)
@@ -228,4 +250,3 @@ class TestWhatsAppTier:
         from gateway.display_config import resolve_display_setting
         # TIER_MEDIUM has streaming: None (follow global), not False
         assert resolve_display_setting({}, "whatsapp", "streaming") is None
-
