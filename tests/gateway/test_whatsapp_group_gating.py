@@ -107,6 +107,79 @@ def test_group_reply_to_other_participant_remains_ignored():
     ) is False
 
 
+def test_group_gate_accepts_canonical_phone_and_lid_reply_aliases():
+    """The bridge emits suffix-free IDs for both raw and native reply forms."""
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    for bot_id in ("123456789@lid", "15551234567@s.whatsapp.net"):
+        message = _group_message(
+            "replying",
+            botIds=[bot_id],
+            quotedParticipant=bot_id,
+        )
+        assert adapter._message_is_reply_to_bot(message) is True
+        assert adapter._should_process_message(message) is True
+
+
+def test_group_gate_accepts_canonical_phone_and_lid_mentions():
+    """A suffix-free mention stays an explicit group-admission signal."""
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    for bot_id in ("123456789@lid", "15551234567@s.whatsapp.net"):
+        message = _group_message(
+            "please help",
+            botIds=[bot_id],
+            mentionedIds=[bot_id],
+        )
+        assert adapter._message_mentions_bot(message) is True
+        assert adapter._should_process_message(message) is True
+
+
+def test_group_gate_rejects_non_numeric_or_malformed_device_forms():
+    """Only the bridge recognizes valid numeric device aliases."""
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    for invalid_bot_id, expected_canonical_id in (
+        ("123456789:worker@lid", "123456789@lid"),
+        ("bot.name-42:worker@s.whatsapp.net", "bot.name-42@s.whatsapp.net"),
+        (":1@lid", "@lid"),
+        ("123456789:1@lid@extra", "123456789@lid"),
+    ):
+        reply = _group_message(
+            "replying",
+            botIds=[invalid_bot_id],
+            quotedParticipant=expected_canonical_id,
+        )
+        mention = _group_message(
+            "please help",
+            botIds=[invalid_bot_id],
+            mentionedIds=[expected_canonical_id],
+        )
+        assert adapter._message_is_reply_to_bot(reply) is False
+        assert adapter._message_mentions_bot(mention) is False
+        assert adapter._should_process_message(reply) is False
+        assert adapter._should_process_message(mention) is False
+
+
+def test_group_gate_blocks_foreign_reply_and_mention_after_normalization():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    reply = _group_message(
+        "replying",
+        botIds=["123456789@lid", "15551234567@s.whatsapp.net"],
+        quotedParticipant="987654321@lid",
+    )
+    mention = _group_message(
+        "please help",
+        botIds=["123456789@lid", "15551234567@s.whatsapp.net"],
+        mentionedIds=["987654321@lid"],
+    )
+    assert adapter._message_is_reply_to_bot(reply) is False
+    assert adapter._message_mentions_bot(mention) is False
+    assert adapter._should_process_message(reply) is False
+    assert adapter._should_process_message(mention) is False
+
+
 def test_regex_mention_patterns_allow_custom_wake_words():
     adapter = _make_adapter(
         require_mention=True,
@@ -250,5 +323,4 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
 

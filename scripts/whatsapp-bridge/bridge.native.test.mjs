@@ -48,23 +48,35 @@ import {
 
 // -- WhatsApp identifier normalization ------------------------------------
 {
-  const deviceSuffixedLid = '123456789:1@lid';
-  const suffixFreeLid = '123456789@lid';
-  assert.equal(normalizeWhatsAppId(deviceSuffixedLid), suffixFreeLid);
-  assert.equal(normalizeWhatsAppId(suffixFreeLid), suffixFreeLid);
-  assert.equal(
-    normalizeWhatsAppId(deviceSuffixedLid),
-    normalizeWhatsAppId(suffixFreeLid),
-  );
-  assert.equal(
-    normalizeWhatsAppId('15551234567:47@s.whatsapp.net'),
-    '15551234567@s.whatsapp.net',
-  );
+  const numericDeviceAliases = [
+    ['123456789:1@lid', '123456789@lid'],
+    ['15551234567:47@s.whatsapp.net', '15551234567@s.whatsapp.net'],
+    ['bot.name-42:8@lid', 'bot.name-42@lid'],
+  ];
+  for (const [raw, canonical] of numericDeviceAliases) {
+    assert.equal(normalizeWhatsAppId(raw), canonical);
+    assert.equal(normalizeWhatsAppId(canonical), canonical);
+    assert.equal(normalizeWhatsAppId(normalizeWhatsAppId(raw)), canonical);
+  }
   assert.notEqual(
-    normalizeWhatsAppId(deviceSuffixedLid),
+    normalizeWhatsAppId('123456789:1@lid'),
     normalizeWhatsAppId('987654321@lid'),
   );
-  console.log('  ✓ device-suffixed JIDs canonicalize without collapsing accounts');
+
+  for (const malformedOrNonDeviceJid of [
+    '123456789:worker@lid',
+    'bot.name-42:worker@s.whatsapp.net',
+    ':1@lid',
+    '123456789:1@',
+    '123456789:1@lid@extra',
+    ' 123456789:1@lid',
+  ]) {
+    assert.equal(
+      normalizeWhatsAppId(malformedOrNonDeviceJid),
+      malformedOrNonDeviceJid,
+    );
+  }
+  console.log('  ✓ only complete numeric device JIDs canonicalize idempotently');
 }
 
 // -- quoted outbound text -------------------------------------------------
