@@ -15,7 +15,14 @@ export const MIME_MAP = {
 
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(/:[^@]+(?=@)/, '');
+  const raw = String(value);
+  // Baileys can report a linked-device identity as
+  // `local-part:<numeric-device>@domain`, while reply and mention metadata
+  // commonly carries the suffix-free identity. Only that complete wire form
+  // is an alias: malformed values and non-numeric intermediate segments must
+  // remain distinct so they cannot accidentally satisfy group admission.
+  const deviceJid = raw.match(/^([^@:\s]+):(\d+)@([^@:\s]+)$/);
+  return deviceJid ? `${deviceJid[1]}@${deviceJid[3]}` : raw;
 }
 
 export function getMessageContent(msg) {
