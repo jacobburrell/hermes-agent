@@ -10826,7 +10826,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli import managed_scope
 
             raw = read_user_config_raw(config_path)
-            raw = managed_scope.apply_managed_overlay(raw)
+            raw, managed_config_valid = managed_scope.apply_managed_overlay_with_status(raw)
+            if not managed_config_valid:
+                raise RuntimeError("managed config overlay is unavailable")
             expanded = _expand_env_vars(raw)
             if not isinstance(expanded, dict):
                 expanded = {}

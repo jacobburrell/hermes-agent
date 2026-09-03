@@ -154,6 +154,47 @@ def test_live_profile_config_managed_overlay_and_lkg(tmp_path, monkeypatch):
     )
 
 
+def test_malformed_managed_config_before_busy_ack_snapshot_fails_closed(tmp_path, monkeypatch):
+    """A corrupt managed policy cannot fall through to a user-enabled ack."""
+    from hermes_cli.managed_scope import invalidate_managed_cache
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
+    _write_config(tmp_path, "display:\n  busy_ack_enabled: true\n")
+    managed = tmp_path / "managed"
+    _write_config(managed, "display: [broken")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    invalidate_managed_cache()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+
+    assert runner._busy_ack_enabled_for_source(_source()) is False
+
+
+def test_malformed_managed_config_retains_combined_busy_ack_snapshot(tmp_path, monkeypatch):
+    """A corrupt managed edit retains the prior overlay instead of re-enabling acks."""
+    from hermes_cli.managed_scope import invalidate_managed_cache
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
+    _write_config(tmp_path, "display:\n  busy_ack_enabled: true\n")
+    managed = tmp_path / "managed"
+    _write_config(managed, "display:\n  busy_ack_enabled: false\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    invalidate_managed_cache()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    source = _source()
+    assert runner._busy_ack_enabled_for_source(source) is False
+
+    _write_config(managed, "display: [broken")
+    invalidate_managed_cache()
+
+    assert runner._busy_ack_enabled_for_source(source) is False
+
+
 def test_multiplex_busy_ack_rejects_unserved_or_mismatched_profile_homes(
     tmp_path, monkeypatch
 ):

@@ -112,17 +112,58 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     return parsed
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+def load_managed_config_with_status() -> tuple[dict, bool]:
+    """Return managed config plus whether its current source is valid.
+
+    The boolean is ``False`` only when an existing managed ``config.yaml``
+    cannot be inspected, parsed, or is not a mapping.  A missing managed
+    scope (or a scope with no ``config.yaml``) is a valid empty overlay.  Most
+    callers should continue using :func:`load_managed_config`, whose existing
+    fail-open contract is unchanged.  A policy boundary that needs to retain a
+    last-known-good *combined* configuration can use this status to avoid
+    treating a malformed managed file as an intentional empty overlay.
+    """
     managed_dir = get_managed_dir()
     if managed_dir is None:
-        return {}
-    parsed = _cached_read(
-        managed_dir / "config.yaml",
-        _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
-    )
-    return parsed if isinstance(parsed, dict) else {}
+        return {}, True
+
+    path = managed_dir / "config.yaml"
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return {}, True
+    except OSError as exc:
+        logger.warning("managed scope: failed to inspect %s: %s", path, exc)
+        return {}, False
+
+    key = (st.st_mtime_ns, st.st_size)
+    path_key = str(path)
+    with _CACHE_LOCK:
+        hit = _CONFIG_CACHE.get(path_key)
+        if hit is not None and hit[:2] == key:
+            parsed = copy.deepcopy(hit[2])
+            return (parsed, True) if isinstance(parsed, dict) else ({}, False)
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            parsed = yaml.safe_load(f) or {}
+    except Exception as exc:  # noqa: BLE001 — callers choose fail-open/LKG behavior
+        logger.warning("managed scope: failed to parse %s: %s", path, exc)
+        return {}, False
+
+    if not isinstance(parsed, dict):
+        logger.warning("managed scope: expected a mapping in %s", path)
+        return {}, False
+
+    with _CACHE_LOCK:
+        _CONFIG_CACHE[path_key] = (key[0], key[1], copy.deepcopy(parsed))
+    return parsed, True
+
+
+def load_managed_config() -> dict:
+    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+    parsed, _valid = load_managed_config_with_status()
+    return parsed
 
 
 def load_managed_env() -> Dict[str, str]:
@@ -154,10 +195,24 @@ def apply_managed_overlay(config: dict) -> dict:
     any error — managed scope must never break a caller's startup. Mutates and
     returns ``config`` (callers pass a dict they own).
     """
+    merged, _valid = apply_managed_overlay_with_status(config)
+    return merged
+
+
+def apply_managed_overlay_with_status(config: dict) -> tuple[dict, bool]:
+    """Overlay managed config and report whether its source was valid.
+
+    This is intentionally narrower than :func:`apply_managed_overlay`: callers
+    that need a last-known-good policy can distinguish a malformed managed file
+    from a valid empty overlay.  The ordinary helper keeps its established
+    fail-open behavior by discarding this status.
+    """
     try:
-        managed = load_managed_config()
+        managed, managed_valid = load_managed_config_with_status()
+        if not managed_valid:
+            return config, False
         if not managed:
-            return config
+            return config, True
         # Imported lazily to avoid an import cycle (config imports managed_scope).
         from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
 
@@ -171,10 +226,10 @@ def apply_managed_overlay(config: dict) -> dict:
         if isinstance(managed_expanded.get("model"), str):
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
-        return _deep_merge(config, managed_expanded)
+        return _deep_merge(config, managed_expanded), True
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
-        return config
+        return config, False
 
 
 def _parse_env(f) -> Dict[str, str]:

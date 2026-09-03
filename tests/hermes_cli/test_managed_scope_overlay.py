@@ -42,3 +42,15 @@ def test_overlay_preserves_user_siblings(managed):
     assert out["display"]["show_reasoning"] is True
 
 
+def test_status_overlay_reports_malformed_managed_config_without_changing_fail_open_api(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "display: [broken")
+    source = {"display": {"busy_ack_enabled": True}}
+
+    overlaid, valid = managed_scope.apply_managed_overlay_with_status(source.copy())
+
+    assert overlaid == source
+    assert valid is False
+    assert managed_scope.apply_managed_overlay(source.copy()) == source
+
