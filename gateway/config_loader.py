@@ -337,19 +337,44 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
 
 
 def load_yaml_layer(home: Path, gw_data: dict) -> None:
-    """Overlay ``config.yaml`` onto *gw_data* in place. Raises on any failure (caller warns + falls back)."""
+    """Overlay user and managed ``config.yaml`` mappings onto *gw_data* in place.
+
+    A missing or unreadable user layer is treated as empty so a valid managed
+    layer can still apply. Later processing errors still reach the caller's
+    warning-and-fallback boundary.
+    """
     import yaml
 
     config_yaml_path = home / "config.yaml"
-    if not config_yaml_path.exists():
-        return
-    with open(config_yaml_path, encoding="utf-8") as f:
-        yaml_cfg = yaml.safe_load(f) or {}
+    yaml_cfg: dict = {}
+    if config_yaml_path.exists():
+        try:
+            with open(config_yaml_path, encoding="utf-8") as f:
+                loaded_yaml = yaml.safe_load(f)
+            if loaded_yaml is None:
+                loaded_yaml = {}
+            if not isinstance(loaded_yaml, dict):
+                raise TypeError(
+                    "top-level config.yaml value must be a mapping, got "
+                    f"{type(loaded_yaml).__name__}"
+                )
+            yaml_cfg = loaded_yaml
+        except Exception as exc:  # noqa: BLE001 - keep managed policy usable
+            # A broken user layer must not discard valid administrator policy. Treat it as absent;
+            # without a managed layer, the caller's legacy gateway.json base remains unchanged.
+            logger.warning(
+                "Failed to parse %s; ignoring the user config layer but retaining any valid "
+                "managed gateway overlay: %s",
+                config_yaml_path,
+                exc,
+            )
 
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so a managed session_reset / quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
     yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+    if not yaml_cfg:
+        return
 
     gateway_section = yaml_cfg.get("gateway")
     bridge_toplevel_keys(yaml_cfg, gateway_section, gw_data)
