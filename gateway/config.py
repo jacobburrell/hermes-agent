@@ -1414,8 +1414,30 @@ def load_gateway_config() -> GatewayConfig:
         config_yaml_path = _home / "config.yaml"
         yaml_cfg: dict = {}
         if config_yaml_path.exists():
-            with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
+            try:
+                with open(config_yaml_path, encoding="utf-8") as f:
+                    loaded_yaml = yaml.safe_load(f)
+                if loaded_yaml is None:
+                    loaded_yaml = {}
+                if not isinstance(loaded_yaml, dict):
+                    raise TypeError(
+                        "top-level config.yaml value must be a mapping, got "
+                        f"{type(loaded_yaml).__name__}"
+                    )
+                yaml_cfg = loaded_yaml
+            except Exception as exc:  # noqa: BLE001 - keep managed policy usable
+                # A user-layer parse failure must not discard a valid
+                # process-managed policy.  In particular, dropping a managed
+                # WhatsApp dm_policy here can widen intake after a torn user
+                # config write.  Treat the user layer as absent, then apply
+                # the managed overlay below.  With no managed layer this keeps
+                # the historical .env/gateway.json fallback.
+                logger.warning(
+                    "Failed to parse %s; ignoring the user config layer but "
+                    "retaining any valid managed gateway overlay: %s",
+                    config_yaml_path,
+                    exc,
+                )
 
         # Managed scope: overlay administrator-pinned values so the gateway
         # honors them too. This loader builds its own dict instead of going
