@@ -2990,8 +2990,6 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
             if "busy_text_mode" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
-            if "busy_ack_enabled" in _display_cfg:
-                os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
             # This process-level env var is documented as an override for
             # service managers, so preserve it when already set. Other display
             # bridges stay config-authoritative for backwards compatibility.
@@ -10751,6 +10749,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         modes = getattr(self, "_busy_text_modes_by_profile", None)
         return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
 
+    def _busy_ack_config_for_source(self, source: SessionSource) -> tuple[dict, bool]:
+        """Read one source profile's live busy-ack policy with an LKG fallback.
+
+        Unlike the startup-only busy-mode snapshots, the visibility policy is
+        deliberately re-read at each possible send boundary.  A source's
+        profile home is explicit here rather than inferred from process env so
+        multiplexed adapters cannot borrow another profile's setting.  The
+        managed overlay is applied to the same profile-local raw YAML before
+        caching.  On a torn or malformed edit, the prior valid *combined*
+        policy remains authoritative; the first such failure is reported to
+        the resolver so WhatsApp can fail closed.
+        """
+        try:
+            profile_home = Path(self._resolve_profile_home_for_source(source))
+            if getattr(self.config, "multiplex_profiles", False):
+                # ``source.profile`` is untrusted event metadata at this
+                # boundary.  A multiplex runner may only read policy from one
+                # of its own served homes; otherwise an adapter event could
+                # borrow an arbitrary local profile's visibility setting.
+                from hermes_cli.profiles import (
+                    normalize_profile_name,
+                    validate_profile_name,
+                )
+
+                served_homes = {
+                    name: Path(home) for name, home in _multiplex_profile_homes(self.config)
+                }
+                requested_profile = str(getattr(source, "profile", "") or "").strip()
+                expected_home = None
+                if requested_profile:
+                    requested_profile = normalize_profile_name(requested_profile)
+                    validate_profile_name(requested_profile)
+                    expected_home = served_homes.get(requested_profile)
+                    if expected_home is None:
+                        logger.warning(
+                            "Rejecting busy-ack policy lookup for unserved profile %r",
+                            requested_profile,
+                        )
+                        return {}, True
+
+                resolved_home = profile_home.resolve(strict=False)
+                served_home_values = {
+                    home.resolve(strict=False) for home in served_homes.values()
+                }
+                if (
+                    resolved_home not in served_home_values
+                    or (
+                        expected_home is not None
+                        and resolved_home != expected_home.resolve(strict=False)
+                    )
+                ):
+                    logger.warning(
+                        "Rejecting busy-ack policy lookup outside its served profile home"
+                    )
+                    return {}, True
+        except Exception:
+            if getattr(self.config, "multiplex_profiles", False):
+                logger.warning(
+                    "Could not validate multiplex busy-ack policy home; "
+                    "failing closed for transient WhatsApp notices.",
+                    exc_info=True,
+                )
+                return {}, True
+            profile_home = _gateway_config_home()
+        config_path = profile_home / "config.yaml"
+        cache_key = str(config_path)
+        snapshots = self.__dict__.setdefault("_busy_ack_config_snapshots", {})
+
+        try:
+            # This raw reader intentionally raises on malformed YAML. The
+            # canonical fail-open loader turns that condition into {}, which
+            # would make a live editor's partial write indistinguishable from
+            # an intentional empty config and defeat last-known-good policy.
+            from hermes_cli.config import _expand_env_vars, read_user_config_raw
+            from hermes_cli import managed_scope
+
+            raw = read_user_config_raw(config_path)
+            raw = managed_scope.apply_managed_overlay(raw)
+            expanded = _expand_env_vars(raw)
+            if not isinstance(expanded, dict):
+                expanded = {}
+        except Exception:
+            cached = snapshots.get(cache_key)
+            if isinstance(cached, dict):
+                logger.warning(
+                    "Busy-ack policy read failed for profile config %s; "
+                    "retaining its last known-good policy.",
+                    config_path,
+                )
+                return cached, False
+            logger.warning(
+                "Busy-ack policy read failed for profile config %s before "
+                "any valid snapshot exists.",
+                config_path,
+            )
+            return {}, True
+
+        snapshots[cache_key] = expanded
+        return expanded, False
+
+    def _busy_ack_enabled_for_source(self, source: SessionSource) -> bool:
+        """Return whether this source may receive a transient busy notice.
+
+        The legacy environment variable remains a compatibility fallback, not
+        a configuration bridge: source YAML (including a managed overlay)
+        always wins, and a service's stale startup environment cannot shadow a
+        live edit.
+        """
+        from gateway.display_config import resolve_busy_ack_enabled
+
+        config, first_invalid_config = self._busy_ack_config_for_source(source)
+        return resolve_busy_ack_enabled(
+            config,
+            _platform_config_key(source.platform),
+            chat_type=getattr(source, "chat_type", None),
+            legacy_env=os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED"),
+            first_invalid_config=first_invalid_config,
+        )
+
     @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
@@ -11303,6 +11420,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
+            # Preserve the queue/reject decision above, then suppress only the
+            # transient notice. A restart/drain must not bypass the same
+            # WhatsApp policy that silences ordinary busy acknowledgments.
+            if not self._busy_ack_enabled_for_source(event.source):
+                logger.debug("Drain busy ack suppressed for session %s", session_key)
+                return True
+
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
@@ -11561,8 +11685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
-        busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        if not self._busy_ack_enabled_for_source(event.source):
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
@@ -19513,6 +19636,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
+                # The priority fast-path returns its message to the platform
+                # dispatcher rather than sending it directly. Make the same
+                # decision after state mutation so a muted WhatsApp profile
+                # cannot leak a restart/drain status through this rail.
+                if not self._busy_ack_enabled_for_source(source):
+                    logger.debug("Priority drain busy ack suppressed for session %s", _quick_key)
+                    return None
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -20334,6 +20464,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
+            if not self._busy_ack_enabled_for_source(source):
+                logger.debug("External-drain busy ack suppressed for session %s", _quick_key)
+                return None
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "

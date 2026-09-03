@@ -1775,6 +1775,19 @@ display:
   # Toggle at runtime with /busy <interrupt|queue|steer>.
   busy_input_mode: interrupt
 
+  # Whether a busy follow-up emits a transient ⚡/⏳/⏩ acknowledgment after
+  # its queue/steer/interrupt state change. WhatsApp and WhatsApp Cloud are
+  # false by built-in default so group chats stay final-answer-first; other
+  # platforms remain true by default. Override by chat type, platform, then
+  # globally (the first matching setting wins):
+  # chat_types:
+  #   group:
+  #     busy_ack_enabled: false
+  # platforms:
+  #   whatsapp:
+  #     busy_ack_enabled: true
+  # busy_ack_enabled: true
+
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use
   # terminal(background=true, notify_on_complete=true) from Telegram/Discord/etc.

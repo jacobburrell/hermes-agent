@@ -413,12 +413,23 @@ By default, messaging a busy agent redirects its active turn. Two other modes ar
 ```yaml
 display:
   busy_input_mode: steer   # or queue, or interrupt (default)
-  busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
+  busy_ack_enabled: true   # optional global override (also enables WhatsApp)
+  platforms:
+    whatsapp:
+      busy_ack_enabled: true  # WhatsApp defaults false; opt in deliberately
+  chat_types:
+    group:
+      busy_ack_enabled: false # optional per-chat-type override
 ```
 
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.
 
-If you find the busy acknowledgment noisy, set `display.busy_ack_enabled: false`. Input handling is unchanged; only the confirmation message is hidden.
+Busy acknowledgments are deliberately **off by default** for WhatsApp and
+WhatsApp Cloud because every status line becomes a lasting chat message. They
+remain on by default for other platforms. Resolution is: chat type → platform
+→ global → legacy `HERMES_GATEWAY_BUSY_ACK_ENABLED` → built-in default. Input
+handling is unchanged in every case; only the transient confirmation message
+is hidden.
 
 ## Clarify Questions (Multi-Select)
 

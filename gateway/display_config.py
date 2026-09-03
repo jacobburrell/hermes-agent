@@ -46,6 +46,11 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
     "long_running_notifications": True,
+    # Whether a follow-up received while a session is busy gets a transient
+    # queue/steer/interrupt acknowledgment.  This deliberately remains true
+    # as the generic default for existing installations; WhatsApp transports
+    # override it below because a status bubble is a permanent chat message.
+    "busy_ack_enabled": True,
     "busy_ack_detail": True,
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
     # acknowledgment after successfully injecting the user's mid-turn message.
@@ -158,13 +163,16 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # A busy acknowledgment is not a progress bubble and cannot be safely
+    # edited away.  Make WhatsApp final-answer-first by default; users may
+    # opt in with display.platforms.whatsapp.busy_ack_enabled: true.
+    "whatsapp":        {**_TIER_MEDIUM, "busy_ack_enabled": False},
     # WhatsApp Cloud API: Meta added message editing in 2023 but the
     # Hermes Cloud adapter doesn't implement edit_message yet, so we
     # stay on TIER_LOW (tool_progress off) to avoid spamming each
     # status update as a separate message. Promote to TIER_MEDIUM once
     # Cloud's edit_message lands.
-    "whatsapp_cloud":  _TIER_LOW,
+    "whatsapp_cloud":  {**_TIER_LOW, "busy_ack_enabled": False},
     # Photon (managed iMessage over the gRPC sidecar) and BlueBubbles are both
     # permanent-message iMessage inboxes with no message-edit support, so both
     # stay TIER_LOW. This keeps tool progress, interim scratch commentary,
@@ -260,6 +268,70 @@ def resolve_display_setting(
     return fallback
 
 
+def resolve_busy_ack_enabled(
+    user_config: dict,
+    platform_key: str,
+    *,
+    chat_type: str | None = None,
+    legacy_env: str | None = None,
+    first_invalid_config: bool = False,
+) -> bool:
+    """Resolve the busy-ack visibility policy for one inbound source.
+
+    This is intentionally separate from :func:`resolve_display_setting`:
+    busy acknowledgments are runtime notices, so their legacy process
+    environment compatibility tier belongs *after* all YAML settings and
+    before built-in defaults.  It also has a narrow chat-type override tier.
+
+    Resolution order (first explicit value wins):
+
+    1. ``display.chat_types.<chat_type>.busy_ack_enabled``
+    2. ``display.platforms.<platform>.busy_ack_enabled``
+    3. ``display.busy_ack_enabled``
+    4. ``HERMES_GATEWAY_BUSY_ACK_ENABLED`` (legacy compatibility)
+    5. built-in platform then global defaults
+
+    A malformed *first* config read fails closed for WhatsApp transports.
+    Once a caller has a last-known-good snapshot, it passes that snapshot with
+    ``first_invalid_config=False`` so a torn live edit cannot change policy.
+    """
+    platform_key = str(platform_key or "").strip().lower()
+    if first_invalid_config and platform_key in {"whatsapp", "whatsapp_cloud"}:
+        return False
+
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display_cfg, dict):
+        display_cfg = {}
+
+    if chat_type:
+        chat_types = display_cfg.get("chat_types")
+        chat_cfg = chat_types.get(str(chat_type).strip().lower()) if isinstance(chat_types, dict) else None
+        if (
+            isinstance(chat_cfg, dict)
+            and chat_cfg.get("busy_ack_enabled") is not None
+        ):
+            return bool(_normalise("busy_ack_enabled", chat_cfg["busy_ack_enabled"]))
+
+    platforms = display_cfg.get("platforms")
+    platform_cfg = platforms.get(platform_key) if isinstance(platforms, dict) else None
+    if (
+        isinstance(platform_cfg, dict)
+        and platform_cfg.get("busy_ack_enabled") is not None
+    ):
+        return bool(_normalise("busy_ack_enabled", platform_cfg["busy_ack_enabled"]))
+
+    if display_cfg.get("busy_ack_enabled") is not None:
+        return bool(_normalise("busy_ack_enabled", display_cfg["busy_ack_enabled"]))
+
+    if legacy_env is not None:
+        return bool(_normalise("busy_ack_enabled", legacy_env))
+
+    platform_defaults = _PLATFORM_DEFAULTS.get(platform_key)
+    if platform_defaults and "busy_ack_enabled" in platform_defaults:
+        return bool(platform_defaults["busy_ack_enabled"])
+    return bool(_GLOBAL_DEFAULTS["busy_ack_enabled"])
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -282,6 +354,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "streaming",
         "interim_assistant_messages",
         "long_running_notifications",
+        "busy_ack_enabled",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
