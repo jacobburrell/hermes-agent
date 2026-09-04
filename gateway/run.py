@@ -1081,16 +1081,74 @@ def _build_replay_entry(
 
 
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_WHATSAPP_OBSERVED_CONTEXT_PROMPT_MARKER = "observed WhatsApp group context"
+_TELEGRAM_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_WHATSAPP_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed WhatsApp group context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
+_WHATSAPP_OBSERVED_CONTEXT_MAX_ROWS = 20
+_WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES = 8192
 
 
-def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
-    """Return True for Telegram group turns that may include observed chatter.
+def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True when an adapter opts into the separate observed-context lane.
 
     Observed rows must not replay as ordinary user turns, or a weak wake word makes old chatter look like work.
     """
-    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+    return bool(channel_prompt and (
+        _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
+        or _WHATSAPP_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
+    ))
+
+
+def _uses_whatsapp_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Whether the source opted into WhatsApp's bounded, API-only observation lane."""
+    return bool(channel_prompt and _WHATSAPP_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+
+
+def _observed_group_context_header(channel_prompt: Optional[str]) -> str:
+    """Source-specific provenance line for the API-only observed block."""
+    return (
+        _WHATSAPP_OBSERVED_GROUP_CONTEXT_HEADER
+        if _uses_whatsapp_observed_group_context(channel_prompt)
+        else _TELEGRAM_OBSERVED_GROUP_CONTEXT_HEADER
+    )
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Byte-bound *text* without splitting UTF-8; marker keeps a partial row explicit."""
+    marker = "\n[truncated]"
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = text.encode("utf-8")[:max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return f"{prefix}{marker}"
+
+
+def _bounded_whatsapp_observed_context(rows: List[str], *, max_bytes: int = _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES) -> List[str]:
+    """Most-recent WhatsApp observations within fixed row/byte limits, oldest-first.
+
+    The source adapter stores an attributed, bounded row.  This second bound
+    prevents a long-lived group transcript from becoming an unbounded API-only
+    current-message prefix while preserving the retained rows' chronology.
+    """
+    selected_reversed: List[str] = []
+    used_bytes = 0
+    for row in reversed(rows[-_WHATSAPP_OBSERVED_CONTEXT_MAX_ROWS:]):
+        separator_bytes = 1 if selected_reversed else 0  # final join uses "\n"
+        available = max_bytes - used_bytes - separator_bytes
+        if available <= 0:
+            break
+        bounded = _truncate_utf8(row, available)
+        encoded_len = len(bounded.encode("utf-8"))
+        if not bounded or encoded_len > available:
+            break
+        selected_reversed.append(bounded)
+        used_bytes += separator_bytes + encoded_len
+        if used_bytes >= max_bytes:
+            break
+    return list(reversed(selected_reversed))
 
 
 def _csv_or_list_to_set(raw: Any) -> set[str]:
@@ -1155,7 +1213,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -1200,7 +1258,17 @@ def _build_gateway_agent_history(
     # Strip expired dangerous-confirmation phrases; replayed, a follow-up could read as a fresh confirmation.
     agent_history = strip_stale_dangerous_confirmations(agent_history, now=time.time())
 
-    observed_context = "\n".join(observed_group_context).strip() or None
+    header = _observed_group_context_header(channel_prompt)
+    if _uses_whatsapp_observed_group_context(channel_prompt):
+        # The documented byte cap covers the complete API-only block, including
+        # its source-provenance header and separating newline.
+        available = max(0, _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES - len(header.encode("utf-8")) - 1)
+        observed_group_context = _bounded_whatsapp_observed_context(observed_group_context, max_bytes=available)
+    observed_content = "\n".join(observed_group_context).strip()
+    observed_context = (
+        f"{header}\n{observed_content}"
+        if observed_content else None
+    )
     return agent_history, observed_context
 
 
@@ -1229,11 +1297,11 @@ def _select_cached_agent_history(
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed Telegram context to the API-only current user turn."""
+    """Prepend adapter-selected observed group context to the API-only current user turn."""
     if not observed_context:
         return message
 
-    prefix = f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n{observed_context}\n\n{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+    prefix = f"{observed_context}\n\n{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
 
     if isinstance(message, str):
         return f"{prefix}{message}"
