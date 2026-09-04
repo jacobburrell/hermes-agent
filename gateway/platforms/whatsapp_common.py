@@ -95,6 +95,19 @@ class WhatsAppBehaviorMixin:
             return configured.lower() in _TRUTHY
         return bool(configured)
 
+    def _whatsapp_observe_unmentioned_group_messages(self) -> bool:
+        """Whether allowed, unaddressed group chatter is durably observed.
+
+        This is a ``config.yaml`` intake policy, deliberately not another
+        user-facing environment switch.  Missing or malformed values fail
+        closed so existing WhatsApp installations retain their current drop
+        behavior.
+        """
+        configured = self.config.extra.get("observe_unmentioned_group_messages")
+        if isinstance(configured, str):
+            return configured.strip().lower() in _TRUTHY
+        return configured is True
+
     def _whatsapp_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
