@@ -1829,6 +1829,52 @@ class GatewayTurnMixin:
         persist_user_timestamp: Any
         persist_user_display_kind: Optional[str]
 
+    async def _hmwa_load_whatsapp_observed_group_rows(self, event, source) -> List[Dict[str, Any]]:
+        """Read only this WhatsApp group's un-repaired observed rows for API-only context.
+
+        Addressed WhatsApp group traffic keeps the configured sender-scoped
+        session key.  The adapter places ambient observations in one canonical
+        group-scoped lane, so this bounded secondary read is the only bridge
+        between the two.  It never changes routing, authorization, or cached
+        conversation history, and it refuses any source/profile/chat mismatch.
+        """
+        from gateway.run import _uses_whatsapp_observed_group_context
+
+        observed_source = getattr(event, "_whatsapp_observed_group_source", None)
+        if not (
+            _uses_whatsapp_observed_group_context(getattr(event, "channel_prompt", None))
+            and isinstance(observed_source, SessionSource)
+            and observed_source.platform == Platform.WHATSAPP
+            and observed_source.chat_type == "group"
+            and observed_source.user_id is None
+            and getattr(source, "platform", None) == Platform.WHATSAPP
+            and getattr(source, "chat_type", None) == "group"
+            and observed_source.chat_id == source.chat_id
+            and observed_source.profile == getattr(source, "profile", None)
+        ):
+            return []
+        try:
+            observed_key = self._session_key_for_source(observed_source)
+            observed_entry = await self.async_session_store.lookup_by_session_key(observed_key)
+            if observed_entry is None:
+                return []
+            rows = await self.async_session_store.load_transcript(
+                observed_entry.session_id, repair_alternation=False,
+            )
+        except TranscriptReadError:
+            # A failed archival context read must not silently become an empty
+            # ordinary conversation.  The operating session's canonical read
+            # remains the authoritative fail-closed boundary.
+            logger.warning("WhatsApp observed-context read failed for group %s", source.chat_id)
+            return []
+        except Exception:
+            logger.warning("Could not load WhatsApp observed context for group %s", source.chat_id, exc_info=True)
+            return []
+        return [
+            row for row in rows
+            if row.get("observed") is True and row.get("role") == "user" and row.get("content")
+        ]
+
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
@@ -1882,6 +1928,14 @@ class GatewayTurnMixin:
         history = await self._hmwa_run_session_hygiene(
             event, source, session_entry, session_key, history, _quick_key, run_generation,
         )
+
+        # Keep observed rows separate from the normal replay session until
+        # TurnRunner extracts its bounded API-only block.  In particular, do
+        # not let SessionStore's normal alternation repair merge ambient
+        # group chatter into ordinary user history.
+        observed_rows = await self._hmwa_load_whatsapp_observed_group_rows(event, source)
+        if observed_rows:
+            history = [*history, *observed_rows]
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
 

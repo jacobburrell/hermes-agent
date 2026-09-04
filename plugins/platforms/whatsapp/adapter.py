@@ -4,13 +4,14 @@ client; messages are polled over a local HTTP API and responses are posted back 
 import asyncio
 import dataclasses
 import logging
+import math
 import os
 import platform
 import re
 import signal
 import subprocess
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import wraps
 from pathlib import Path
@@ -44,6 +45,14 @@ class _WhatsAppInboundAdmission(str, Enum):
 _OBSERVED_TEXT_LIMIT = 4096
 _OBSERVED_ID_LIMIT = 256
 _OBSERVED_LABEL_LIMIT = 256
+
+# Baileys timestamps describe live WhatsApp ingress.  2009-01-01 is a
+# deliberately conservative floor: it predates WhatsApp's public launch, but
+# still avoids rejecting any plausible early account data.  A bridge clock may
+# be a little ahead of this adapter, so allow five minutes, not arbitrary
+# future-dated messages.
+_WHATSAPP_LIVE_INGRESS_EPOCH_FLOOR = 1_230_768_000
+_WHATSAPP_LIVE_INGRESS_FUTURE_SKEW = timedelta(minutes=5)
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
@@ -825,26 +834,65 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return _WhatsAppInboundAdmission.OBSERVE
         return _WhatsAppInboundAdmission.DROP
 
-    def _observe_unmentioned_group_message(self, data: Dict[str, Any]) -> bool:
+    def _observed_group_source(self, data: Dict[str, Any]):
+        """The one canonical, group-scoped lane used only for observed rows.
+
+        Normal addressed group turns retain Hermes's configured per-sender
+        session isolation.  This source intentionally removes the sender so a
+        later addressed turn can load observations from the same group without
+        changing command authorization or its operational session key.
+        """
+        chat_id = self._observed_chat_id(data)
+        if chat_id is None:
+            return None
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=self._bounded_observed_value(data.get("chatName"), _OBSERVED_LABEL_LIMIT) or None,
+            chat_type="group",
+            user_id=None,
+            user_name=None,
+        )
+        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+
+    @staticmethod
+    def _validated_bridge_timestamp(data: Dict[str, Any], received_at: datetime) -> datetime:
+        """Use a finite, representable bridge epoch or one captured receive time.
+
+        Baileys emits epoch seconds, but a malformed JSON bridge payload must
+        never turn ``True``, NaN/Inf, a pre-WhatsApp value, an implausibly
+        future value, or an unrepresentable numeric value into a fabricated
+        event time.  ``received_at`` is captured once per inbound event so all
+        fallback consumers see the same UTC instant.  The floor deliberately
+        predates WhatsApp's public launch; the five-minute future allowance is
+        only for small bridge/adapter clock skew.
+        """
+        value = data.get("timestamp")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return received_at
+        try:
+            epoch = float(value)
+            if (
+                not math.isfinite(epoch)
+                or epoch < _WHATSAPP_LIVE_INGRESS_EPOCH_FLOOR
+                or epoch > received_at.timestamp() + _WHATSAPP_LIVE_INGRESS_FUTURE_SKEW.total_seconds()
+            ):
+                return received_at
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return received_at
+
+    def _observe_unmentioned_group_message(self, data: Dict[str, Any], *, timestamp: datetime) -> bool:
         """Persist one chat-scoped, attributed observation with no operational side effects."""
         store = getattr(self, "_session_store", None)
         message_id = self._observed_message_id(data)
         if store is None or message_id is None:
             return False
         try:
-            chat_id = self._observed_chat_id(data)
-            if chat_id is None:
+            source = self._observed_group_source(data)
+            if source is None:
                 return False
-            source = self.build_source(
-                chat_id=chat_id,
-                chat_name=self._bounded_observed_value(data.get("chatName"), _OBSERVED_LABEL_LIMIT) or None,
-                chat_type="group",
-                user_id=None,
-                user_name=None,
-            )
             # Observations share precisely the group chat's session, never a
             # sender-specific group lane; avoid resetting user activity.
-            source = dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
             session_entry = store.get_or_create_session(source, touch_activity=False)
             if store.has_platform_message_id(session_entry.session_id, message_id):
                 return True
@@ -860,7 +908,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             store.append_to_transcript(session_entry.session_id, {
                 "role": "user",
                 "content": content,
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                # SessionDB's canonical timestamp column is a numeric epoch;
+                # pass an aware UTC datetime so its existing coercer retains
+                # the bridge instant rather than treating an ISO string as
+                # malformed and replacing it with write time.
+                "timestamp": timestamp,
                 "observed": True,
                 "platform_message_id": message_id,
             })
@@ -916,11 +968,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return body
 
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
-        """Build a MessageEvent from bridge message data, downloading images to cache."""
+        """Classify bridge metadata before a potential operating event."""
         try:
+            received_at = datetime.now(tz=timezone.utc)
+            event_timestamp = self._validated_bridge_timestamp(data, received_at)
             admission = self._classify_inbound_admission(data)
             if admission is _WhatsAppInboundAdmission.OBSERVE:
-                self._observe_unmentioned_group_message(data)
+                self._observe_unmentioned_group_message(data, timestamp=event_timestamp)
                 return None
             if admission is _WhatsAppInboundAdmission.DROP:
                 return None
@@ -950,7 +1004,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 metadata["whatsapp_from_owner"] = True
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
-            return MessageEvent(
+            event = MessageEvent(
                 text=body, message_type=msg_type, source=source, raw_message=data, message_id=data.get("messageId"),
                 media_urls=cached_urls, media_types=media_types, metadata=metadata,
                 reply_to_message_id=str(raw_reply_id) if raw_reply_id is not None else None,
@@ -958,7 +1012,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_author_id=(self._normalize_whatsapp_id(data.get("quotedParticipant")) or None) if quoted else None,
                 reply_to_is_own_message=self._message_is_reply_to_bot(data) if quoted else False,
                 channel_prompt=channel_prompt,
+                timestamp=event_timestamp,
             )
+            # Keep this source private to the live event.  GatewayTurnMixin
+            # uses it solely to retrieve the matching group's observed rows;
+            # it never rewrites the normal sender-scoped operational lane.
+            if channel_prompt:
+                event._whatsapp_observed_group_source = self._observed_group_source(data)
+            return event
+
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
