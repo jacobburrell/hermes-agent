@@ -106,6 +106,7 @@ async def test_observe_persists_bounded_attribution_without_operational_activity
     store = _store(hermes_home)
     adapter = _adapter(store=store)
     adapter._collect_bridge_media = AsyncMock(side_effect=AssertionError("observe must not collect media"))
+    adapter._materialize_admitted_bridge_media = AsyncMock(side_effect=AssertionError("observe must not materialize media"))
     adapter.handle_message = AsyncMock()
     adapter._enqueue_text_event = MagicMock()
     raw_url = "https://bridge.invalid/private-media.jpg"
@@ -120,6 +121,7 @@ async def test_observe_persists_bounded_attribution_without_operational_activity
 
     assert event is None
     adapter._collect_bridge_media.assert_not_awaited()
+    adapter._materialize_admitted_bridge_media.assert_not_awaited()
     adapter.handle_message.assert_not_awaited()
     adapter._enqueue_text_event.assert_not_called()
     [session] = store._entries.values()
@@ -144,6 +146,7 @@ async def test_observe_does_not_read_receipt_queue_or_dispatch(hermes_home):
     adapter._enqueue_text_event = MagicMock()
     adapter.handle_message = AsyncMock()
     adapter._collect_bridge_media = AsyncMock(side_effect=AssertionError("observe must not collect media"))
+    adapter._materialize_admitted_bridge_media = AsyncMock(side_effect=AssertionError("observe must not materialize media"))
 
     class _Response:
         status = 200
@@ -165,6 +168,7 @@ async def test_observe_does_not_read_receipt_queue_or_dispatch(hermes_home):
     adapter._enqueue_text_event.assert_not_called()
     adapter.handle_message.assert_not_awaited()
     adapter._collect_bridge_media.assert_not_awaited()
+    adapter._materialize_admitted_bridge_media.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -447,6 +451,92 @@ async def test_operational_routes_remain_operational(payload):
 
     assert event is not None
     assert event.message_type is MessageType.TEXT
+
+
+@pytest.mark.asyncio
+async def test_operating_media_materializes_once_after_admission_and_never_from_poll_payload(hermes_home):
+    """The authenticated request is the sole media ingress after OPERATE."""
+    from gateway.platforms.base import get_image_cache_dir
+    from plugins.platforms.whatsapp.adapter import _BRIDGE_MATERIALIZE_CAPABILITY_HEADER
+
+    adapter = _adapter()
+    adapter._http_session = object()
+    # A runtime-only token proves it travels in the header, not the JSON body
+    # or a test fixture/config file.
+    import secrets
+    adapter._bridge_materialization_capability = secrets.token_urlsafe(32)
+    cache_path = get_image_cache_dir() / "materialized-image.jpg"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"test image")
+    seen = {}
+
+    class _Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {
+                "chatId": "120363001234567890@g.us",
+                "messageId": "wa-addressed-media",
+                "mediaUrls": [str(cache_path)],
+                "mediaType": "image",
+                "mime": "image/jpeg",
+                "fileName": "materialized-image.jpg",
+                # This must never become an event or persistence field.
+                "nativeMetadata": {"must": "not be exposed"},
+            }
+
+    def _request(method, path, timeout, **kwargs):
+        seen.update(method=method, path=path, timeout=timeout, **kwargs)
+        return _Response()
+
+    adapter._bridge_req = _request
+    payload = _group_payload(
+        "please inspect", messageId="wa-addressed-media",
+        mentionedIds=["15551230000@s.whatsapp.net"], hasMedia=True,
+        mediaType="image", mediaUrls=["https://untrusted.invalid/never-use.jpg"],
+    )
+    event = await adapter._build_message_event(payload)
+
+    assert event is not None
+    assert event.media_urls == [str(cache_path)]
+    assert seen["method"] == "post"
+    assert seen["path"] == "materialize-inbound-media"
+    assert seen["json"] == {"chatId": payload["chatId"], "messageId": payload["messageId"]}
+    assert set(seen["headers"]) == {_BRIDGE_MATERIALIZE_CAPABILITY_HEADER}
+    assert adapter._bridge_materialization_capability not in repr(seen["json"])
+    assert "must" not in event.metadata.get("whatsapp_native", {})
+
+
+@pytest.mark.asyncio
+async def test_operating_media_materialization_failure_preserves_caption(hermes_home):
+    adapter = _adapter()
+    adapter._materialize_admitted_bridge_media = AsyncMock(return_value=[])
+    adapter._collect_bridge_media = AsyncMock(return_value=([], []))
+    event = await adapter._build_message_event(_group_payload(
+        "caption survives", messageId="wa-materialize-fails",
+        mentionedIds=["15551230000@s.whatsapp.net"], hasMedia=True, mediaType="image",
+    ))
+
+    assert event is not None
+    assert event.text == "caption survives"
+    assert event.media_urls == []
+    adapter._materialize_admitted_bridge_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_drop_never_materializes_media():
+    adapter = _adapter()
+    adapter._materialize_admitted_bridge_media = AsyncMock(side_effect=AssertionError("drop must not materialize media"))
+    assert await adapter._build_message_event(_group_payload(
+        messageId="wa-drop-media", fromMe=True, hasMedia=True, mediaType="image",
+    )) is None
+    adapter._materialize_admitted_bridge_media.assert_not_awaited()
 
 
 @pytest.mark.asyncio
