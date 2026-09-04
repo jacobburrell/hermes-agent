@@ -105,7 +105,8 @@ def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_req
 
 def assemble_api_request(
     agent: Any, *, messages: Any, current_turn_user_idx: Any, _ext_prefetch_cache: Any,
-    _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    _plugin_user_context: Any, _gateway_ephemeral_current_user_prefix: Any,
+    moa_config: Any, active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
 ) -> AssembledRequest:
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
@@ -120,6 +121,7 @@ def assemble_api_request(
     api_messages, effective_system = build_api_messages(
         agent, messages, current_turn_user_idx=current_turn_user_idx,
         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
+        gateway_ephemeral_current_user_prefix=_gateway_ephemeral_current_user_prefix,
         moa_config=moa_config, active_system_prompt=active_system_prompt,
     )
 

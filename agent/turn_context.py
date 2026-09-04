@@ -113,6 +113,36 @@ def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
     return v if isinstance(v, str) else None
 
 
+def prepend_gateway_ephemeral_current_user_prefix(prefix: Any, content: Any) -> Any:
+    """Attach a gateway-private prefix to this call's cloned current user payload.
+
+    The prefix is threaded as an explicit turn-local value, rather than stored
+    on the agent, transcript message, or its ``api_content`` sidecar. Gateway
+    admission can therefore provide contextual material to every provider
+    request in the current turn without making it durable or replayable.
+
+    This is deliberately a request-copy operation: ``content`` belongs to an
+    ``api_msg`` clone constructed by :func:`build_api_messages`, never to
+    ``messages`` or a persisted history row.
+    """
+    if not isinstance(prefix, str) or not prefix:
+        return content
+
+    if isinstance(content, str):
+        return f"{prefix}{content}"
+
+    if isinstance(content, list):
+        # ``api_msg`` is already a structural clone, so editing this text part
+        # cannot mutate the transcript's native-media message.
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = f"{prefix}{part.get('text', '')}"
+                return content
+        return [{"type": "text", "text": prefix.rstrip()}] + content
+
+    return content
+
+
 def consume_gateway_turn_context_notes(agent: Any) -> str:
     """Pop the gateway's per-turn must-deliver notes off the agent (one-shot, so the
     system prompt stays byte-stable and a cached agent never replays a stale note)."""
@@ -342,6 +372,9 @@ class TurnContext:
     should_review_memory: bool = False  # post-turn memory review should fire
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
+    # Gateway-only prefix applied to the cloned current user payload at API
+    # assembly. It is intentionally never written into ``messages``.
+    gateway_ephemeral_current_user_prefix: Optional[str] = None
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
 
 
@@ -746,7 +779,8 @@ def build_turn_context(
     conversation_history: Optional[List[Dict[str, Any]]], task_id: Optional[str], stream_callback,
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
-    persist_user_display_metadata: Optional[Dict[str, Any]]=None, restore_or_build_system_prompt,
+    persist_user_display_metadata: Optional[Dict[str, Any]]=None,
+    gateway_ephemeral_current_user_prefix: Optional[str]=None, restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
 ) -> TurnContext:
@@ -891,6 +925,7 @@ def build_turn_context(
         effective_task_id=effective_task_id, turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
+        gateway_ephemeral_current_user_prefix=gateway_ephemeral_current_user_prefix,
         preflight_compression_blocked=compaction.blocked,
     )
 
@@ -917,6 +952,7 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    gateway_ephemeral_current_user_prefix: Any = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
@@ -958,6 +994,13 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+            # Some gateway context is intentionally current-call-only: it
+            # must not become ``api_content`` (which records/replays durable
+            # wire bytes). Apply it only after normal sidecar composition, to
+            # the request clone made above.
+            api_msg["content"] = prepend_gateway_ephemeral_current_user_prefix(
+                gateway_ephemeral_current_user_prefix, api_msg.get("content")
+            )
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")
