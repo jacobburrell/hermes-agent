@@ -39,6 +39,10 @@ class TurnContext:
     message: Optional[str] = None  # the only rebindable field
     # turn parameters / config snapshots (read-only in run_sync)
     history: Any = None
+    # WhatsApp ambient-group observations are deliberately not transcript
+    # history. They are a per-turn, API-only carrier appended to the current
+    # addressed message after normal-history/recovery/onboarding processing.
+    whatsapp_observed_context_rows: List[dict] = field(default_factory=list)
     context_prompt: Optional[str] = None
     channel_prompt: Optional[str] = None
     session_id: Optional[str] = None
