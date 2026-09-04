@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -220,6 +221,149 @@ async def test_observed_whatsapp_row_is_api_only_context_not_conversation_histor
     api_message = _wrap_current_message_with_observed_context("what should we open?", observed_context)
     assert "ambient fact: open A" in api_message
     assert api_message.endswith("what should we open?")
+
+
+@pytest.mark.asyncio
+async def test_prepare_turn_keeps_ambient_rows_out_of_first_contact_and_normal_history(hermes_home, monkeypatch):
+    """Ambient WhatsApp context reaches only the API-current-message carrier.
+
+    The operating session is deliberately empty here: if an observed row were
+    appended before first-contact/home logic, that logic would incorrectly
+    think this is an existing conversation.
+    """
+    from gateway.run import _build_gateway_agent_history, _last_transcript_timestamp, _wrap_current_message_with_observed_context
+
+    store = _store(hermes_home)
+    adapter = _adapter(store=store)
+    addressed = await adapter._build_message_event(_group_payload(
+        "@Jack Assistant what should we open?",
+        messageId="wa-addressed-prepare", mentionedIds=["15551230000@s.whatsapp.net"],
+    ))
+    assert addressed is not None
+    session_entry = store.get_or_create_session(addressed.source)
+    observed_rows = [{
+        "role": "user", "observed": True, "timestamp": 9_999_999_999,
+        "content": "[Alice|alice@lid]\\nambient fact: open A",
+    }]
+    first_contact_notes = []
+
+    async def _first_contact(_source, history, notes):
+        # The empty operational transcript must retain its native onboarding
+        # behavior despite a separately available ambient observation.
+        assert history == []
+        notes.extend(["first-contact", "home-sidecar"])
+        first_contact_notes.extend(notes)
+
+    runner = SimpleNamespace(
+        _PreparedTurn=GatewayTurnMixin._PreparedTurn,
+        config=GatewayConfig(),
+        async_session_store=AsyncSessionStore(store),
+        _hmwa_open_session=AsyncMock(return_value=(False, True)),
+        _set_session_env=MagicMock(return_value=[]),
+        _pinned_session_context_prompt=MagicMock(return_value="stable context"),
+        _hmwa_acquire_turn_lease=AsyncMock(),
+        _mark_durable_active_turn=AsyncMock(),
+        _hmwa_run_session_hygiene=AsyncMock(side_effect=lambda *_args: _args[4]),
+        _hmwa_load_whatsapp_observed_group_rows=AsyncMock(return_value=copy.deepcopy(observed_rows)),
+        _hmwa_first_contact_notes=AsyncMock(side_effect=_first_contact),
+        _voice_channel_sidecar_note=MagicMock(return_value=None),
+        _prepare_profile_scoped_inbound_message_text=AsyncMock(return_value="what should we open?"),
+        _hmwa_apply_message_timestamp=MagicMock(return_value=("what should we open?", None, None)),
+        _set_pending_turn_sidecar_notes=MagicMock(),
+        _bind_adapter_run_generation=MagicMock(),
+        _adapter_for_source=MagicMock(return_value=adapter),
+    )
+    monkeypatch.setattr("gateway.run_turn.build_session_context", lambda *_args: object())
+
+    prepared, _tokens = await GatewayTurnMixin._hmwa_prepare_turn(
+        runner, addressed, addressed.source, session_entry, session_entry.session_key, "quick", 1,
+    )
+
+    assert isinstance(prepared, GatewayTurnMixin._PreparedTurn)
+    assert prepared.history == []
+    assert prepared.whatsapp_observed_context_rows == observed_rows
+    assert _last_transcript_timestamp(prepared.history) is None
+    assert first_contact_notes == ["first-contact", "home-sidecar"]
+
+    normal_history, observed_context = _build_gateway_agent_history(
+        prepared.history, channel_prompt=addressed.channel_prompt,
+        whatsapp_observed_context_rows=prepared.whatsapp_observed_context_rows,
+    )
+    assert normal_history == []
+    assert observed_context is not None and "ambient fact: open A" in observed_context
+    api_message = _wrap_current_message_with_observed_context("what should we open?", observed_context)
+    assert api_message.count("ambient fact: open A") == 1
+
+
+def test_whatsapp_carrier_keeps_normal_history_and_recovery_watermark_byte_stable():
+    """Observation must not contaminate cached/recovery transcript inputs."""
+    import json
+
+    from gateway.run import _build_gateway_agent_history, _last_transcript_timestamp
+
+    normal = [
+        {"role": "user", "content": "ordinary request", "timestamp": 100.0},
+        {"role": "assistant", "content": "ordinary answer"},
+    ]
+    before = json.dumps(normal, ensure_ascii=False, separators=(",", ":"))
+    carrier = [{
+        "role": "user", "observed": True, "content": "[Alice|a]\\nnew ambient fact", "timestamp": 9_999.0,
+    }]
+
+    replay, observed_context = _build_gateway_agent_history(
+        normal, channel_prompt="observed WhatsApp group context",
+        whatsapp_observed_context_rows=carrier,
+    )
+
+    assert json.dumps(normal, ensure_ascii=False, separators=(",", ":")) == before
+    assert [row["content"] for row in replay] == ["ordinary request", "ordinary answer"]
+    assert _last_transcript_timestamp(normal) is None  # ordinary final row controls recovery as before
+    assert observed_context is not None and "new ambient fact" in observed_context
+
+
+@pytest.mark.asyncio
+async def test_queued_addressed_event_loads_its_own_carrier_without_history_pollution():
+    """Queued/interrupting WhatsApp events must not reuse or append ambient rows."""
+    from gateway.session import SessionSource
+
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="group@g.us", chat_type="group")
+    pending_event = SimpleNamespace(
+        source=source,
+        channel_prompt="observed WhatsApp group context",
+        message_type=MessageType.TEXT,
+        text="queued addressed request",
+    )
+    normal_history = [{"role": "assistant", "content": "first answer"}]
+    carrier = [{"role": "user", "observed": True, "content": "[Alice|a]\\nqueued ambient"}]
+    adapter = SimpleNamespace(_active_sessions={}, send_typing=AsyncMock())
+    runner = SimpleNamespace(
+        _MAX_INTERRUPT_DEPTH=3,
+        _is_goal_continuation_event=MagicMock(return_value=False),
+        _session_key_for_source=MagicMock(return_value="whatsapp:group"),
+        _prepare_profile_scoped_inbound_message_text=AsyncMock(return_value="queued addressed request"),
+        _reply_anchor_for_event=MagicMock(return_value="pending-id"),
+        _hmwa_load_whatsapp_observed_group_rows=AsyncMock(return_value=carrier),
+        _adapter_for_source=MagicMock(return_value=adapter),
+        _refresh_agent_cache_message_count=AsyncMock(),
+        _run_agent=AsyncMock(return_value={"messages": normal_history, "final_response": "done"}),
+    )
+    turn_ctx = SimpleNamespace(
+        source=source, session_id="session", session_key="whatsapp:group", run_generation=1,
+        _interrupt_depth=0, history=normal_history, _status_thread_metadata=None,
+        context_prompt="stable", result_holder=[{"messages": normal_history}],
+    )
+
+    result = await GatewayTurnMixin._run_agent_queued_followup(
+        runner, turn_ctx, adapter, "queued addressed request", pending_event,
+        response="discarded", result={"interrupted": True, "messages": normal_history}, stream_task=None,
+    )
+
+    assert result["final_response"] == "done"
+    runner._hmwa_load_whatsapp_observed_group_rows.assert_awaited_once_with(pending_event, source)
+    kwargs = runner._run_agent.await_args.kwargs
+    assert kwargs["history"] == normal_history
+    assert kwargs["whatsapp_observed_context_rows"] == carrier
+    assert "queued ambient" not in repr(kwargs["history"])
 
 
 @pytest.mark.asyncio

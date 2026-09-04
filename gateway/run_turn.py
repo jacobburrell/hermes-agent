@@ -1823,6 +1823,7 @@ class GatewayTurnMixin:
         """Inputs to the agent run assembled by ``_hmwa_prepare_turn``."""
 
         history: Any
+        whatsapp_observed_context_rows: List[Dict[str, Any]]
         context_prompt: str
         message_text: Any
         persist_user_message: Any
@@ -1929,13 +1930,11 @@ class GatewayTurnMixin:
             event, source, session_entry, session_key, history, _quick_key, run_generation,
         )
 
-        # Keep observed rows separate from the normal replay session until
-        # TurnRunner extracts its bounded API-only block.  In particular, do
-        # not let SessionStore's normal alternation repair merge ambient
-        # group chatter into ordinary user history.
+        # Keep observed rows out of the normal turn history entirely. The
+        # separate carrier reaches only TurnRunner's API-only current-message
+        # boundary; no onboarding, hygiene, recovery, cache, or transcript
+        # consumer may see ambient group chatter as an ordinary user turn.
         observed_rows = await self._hmwa_load_whatsapp_observed_group_rows(event, source)
-        if observed_rows:
-            history = [*history, *observed_rows]
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
 
@@ -1965,7 +1964,7 @@ class GatewayTurnMixin:
         # by the run that registered them.
         self._bind_adapter_run_generation(self._adapter_for_source(source), session_key, run_generation)
         return self._PreparedTurn(
-            history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
+            history, observed_rows, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind,
         ), _session_env_tokens
 
@@ -2017,6 +2016,7 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
+                whatsapp_observed_context_rows=prepared.whatsapp_observed_context_rows,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -3483,6 +3483,7 @@ class GatewayTurnMixin:
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
+        next_whatsapp_observed_context_rows: List[Dict[str, Any]] = []
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
         # See #60671.
@@ -3511,6 +3512,12 @@ class GatewayTurnMixin:
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
             next_message_type = getattr(pending_event, "message_type", None)
+            # A queued/interrupting addressed WhatsApp event owns its own
+            # API-only ambient-context carrier. Never fold it into the prior
+            # turn's normal/cached transcript or reuse the prior carrier.
+            next_whatsapp_observed_context_rows = await self._hmwa_load_whatsapp_observed_group_rows(
+                pending_event, next_source,
+            )
 
         # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.
         # See #60671.
@@ -3545,6 +3552,7 @@ class GatewayTurnMixin:
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
+            whatsapp_observed_context_rows=next_whatsapp_observed_context_rows,
             message_type=next_message_type,
         )
         return _preserve_queued_followup_history_offset(result, followup_result)
@@ -3832,7 +3840,9 @@ class GatewayTurnMixin:
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
-        persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
+        persist_user_display_kind: Optional[str] = None,
+        whatsapp_observed_context_rows: Optional[List[Dict[str, Any]]] = None,
+        message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3856,6 +3866,7 @@ class GatewayTurnMixin:
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            whatsapp_observed_context_rows=list(whatsapp_observed_context_rows or []),
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

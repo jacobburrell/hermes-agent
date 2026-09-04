@@ -200,6 +200,35 @@ class TestConnectCleanup:
     """Verify failure paths release the scoped session lock."""
 
     @pytest.mark.asyncio
+    async def test_lock_acquisition_exception_never_manages_an_unowned_bridge(self):
+        """An indeterminate lock must fail before any bridge side effect.
+
+        A lock backend error is not a stale-bridge signal.  Regression coverage
+        protects the dangerous old fall-through into bridge probing, pidfile or
+        port cleanup, capability rotation, spawn, and lock release.
+        """
+        adapter = _make_adapter()
+        adapter._preflight = MagicMock(return_value=True)
+        adapter._acquire_platform_lock = MagicMock(side_effect=RuntimeError("lock backend unavailable"))
+        adapter._ensure_bridge_deps = MagicMock()
+        adapter._reuse_running_bridge = AsyncMock()
+        adapter._rotate_bridge_materialization_capability = MagicMock()
+        adapter._release_platform_lock = MagicMock()
+
+        with patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile") as kill_pidfile, \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process") as kill_port, \
+             patch("subprocess.Popen") as popen:
+            assert await adapter.connect() is False
+
+        adapter._ensure_bridge_deps.assert_not_called()
+        adapter._reuse_running_bridge.assert_not_awaited()
+        adapter._rotate_bridge_materialization_capability.assert_not_called()
+        adapter._release_platform_lock.assert_not_called()
+        kill_pidfile.assert_not_called()
+        kill_port.assert_not_called()
+        popen.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_releases_lock_when_npm_install_fails(self):
         adapter = _make_adapter()
 

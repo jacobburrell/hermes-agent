@@ -506,7 +506,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             lock_acquired = True
         except Exception as e:
-            logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
+            # A lock failure is never evidence that this process owns the
+            # bridge/session.  In particular, do not probe, adopt, rotate, or
+            # clean up a potentially live bridge after an indeterminate lock
+            # error: those operations can disrupt the actual owner.
+            logger.warning("[%s] Could not acquire session lock; refusing bridge management: %s", self.name, e)
+            return False
         try:
             if not self._ensure_bridge_deps(bridge_path.parent):
                 return False

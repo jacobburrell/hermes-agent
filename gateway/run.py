@@ -1203,7 +1203,9 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
 
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]], *, channel_prompt: Optional[str] = None,
-    inject_timestamps: bool = False) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    inject_timestamps: bool = False,
+    whatsapp_observed_context_rows: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
@@ -1244,6 +1246,21 @@ def _build_gateway_agent_history(
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             agent_history.append(entry)
+
+    # WhatsApp ambient observations are not part of ``history``. Their carrier
+    # is populated only by the WhatsApp turn edge and consumed only here,
+    # immediately before API-message wrapping. This keeps ordinary transcript,
+    # first-contact, recovery, interruption, cached-history, and persistence
+    # behavior byte-stable.
+    if _uses_whatsapp_observed_group_context(channel_prompt):
+        for msg in whatsapp_observed_context_rows or []:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("observed") is not True or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if content:
+                observed_group_context.append(str(content).strip())
 
     # Strip interrupted tool-call tails so the LLM doesn't re-execute tools killed mid-flight.
     agent_history = strip_interrupted_tool_tails(agent_history)
