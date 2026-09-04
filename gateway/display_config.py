@@ -61,7 +61,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "feishu": _TIER_MEDIUM,
     "buzz": _TIER_MEDIUM,  # Nostr: edits in place but channels are shared community spaces
     "signal": _TIER_LOW,
-    "whatsapp": _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # WhatsApp is final-answer-first for transient memory-review notices. An explicit
+    # profile override remains useful as defense in depth, but malformed/missing YAML
+    # must not turn this operational chatter back on.
+    "whatsapp": {**_TIER_MEDIUM, "memory_notifications": "off"},  # Baileys bridge supports /edit
     "whatsapp_cloud": _TIER_LOW,  # adapter lacks edit_message; promote once it lands
     "photon": _TIER_LOW,  # permanent-message iMessage inboxes (no edit)
     "bluebubbles": _TIER_LOW,
@@ -90,13 +93,17 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
     display_cfg = user_config.get("display") or {}
     plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
     if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
-        return _normalise(setting, plat_overrides[setting])
+        value = plat_overrides[setting]
+        if _valid_display_value(setting, value):
+            return _normalise(setting, value)
     if setting == "tool_progress":  # legacy display.tool_progress_overrides.<platform>
         legacy = display_cfg.get("tool_progress_overrides")
         if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
             return _normalise(setting, legacy[platform_key])
     if setting != "streaming" and display_cfg.get(setting) is not None:  # display.streaming is CLI-only
-        return _normalise(setting, display_cfg[setting])
+        value = display_cfg[setting]
+        if _valid_display_value(setting, value):
+            return _normalise(setting, value)
     val = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
     if val is None:
         val = _GLOBAL_DEFAULTS.get(setting)
@@ -107,6 +114,23 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
 
 _TRUTHY = {"true", "1", "yes", "on"}
 _FALSY = {"false", "0", "no"}
+
+
+def _valid_display_value(setting: str, value: Any) -> bool:
+    """Whether a config value can override the setting's built-in policy.
+
+    ``memory_notifications`` is intentionally stricter than historical
+    tri-state settings: an unknown value should fall through to the platform
+    default. That keeps WhatsApp quiet if an operator's YAML value is malformed
+    while retaining the generic default on other platforms. This resolver does
+    not retain a last-known-good config value; that config-resilience work
+    belongs to the later typed-notice follow-up.
+    """
+    if setting != "memory_notifications" or isinstance(value, bool):
+        return True
+    return isinstance(value, str) and value.strip().lower() in (
+        _TRUTHY | _FALSY | {"off", "verbose"}
+    )
 
 
 def _norm_tristate(on: str, off: str, choices: set, extra_truthy: set = frozenset()):
