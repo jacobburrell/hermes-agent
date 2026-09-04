@@ -5,6 +5,8 @@ import importlib
 import sys
 import time
 import types
+from collections import OrderedDict
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -970,6 +972,29 @@ class BackgroundReviewAgent:
         }
 
 
+class ReviewNotificationAgent:
+    """Captures the per-turn review callback after the cached-agent wiring step."""
+
+    callbacks = []
+    notification_modes = []
+
+    def __init__(self, **kwargs):
+        self.background_review_callback = kwargs.get("background_review_callback")
+        self.memory_notifications = kwargs.get("memory_notifications", "on")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).callbacks.append(self.background_review_callback)
+        type(self).notification_modes.append(self.memory_notifications)
+        if self.background_review_callback:
+            self.background_review_callback("💾 Memory updated")
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class VerboseAgent:
     """Agent that emits a tool call with args whose JSON exceeds 200 chars."""
     LONG_CODE = "x" * 300
@@ -999,6 +1024,7 @@ async def _run_with_agent(
     session_id,
     pending_text=None,
     config_data=None,
+    raw_config=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
     chat_type="group",
@@ -1007,7 +1033,9 @@ async def _run_with_agent(
     user_id=None,
     scope_id=None,
 ):
-    if config_data:
+    if raw_config is not None:
+        (tmp_path / "config.yaml").write_text(raw_config, encoding="utf-8")
+    elif config_data:
         import yaml
 
         (tmp_path / "config.yaml").write_text(yaml.dump(config_data), encoding="utf-8")
@@ -1393,6 +1421,222 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 
     assert result["final_response"] == "done"
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_memory_notifications_platform_off_keeps_final_delivery_and_skips_review_callback(
+    monkeypatch, tmp_path,
+):
+    """A WhatsApp-specific mute must not suppress the ordinary final answer."""
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id="sess-whatsapp-memory-off",
+        config_data={
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        },
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert ReviewNotificationAgent.callbacks == [None]
+    assert ReviewNotificationAgent.notification_modes == ["off"]
+    assert adapter.pop_post_delivery_callback("agent:main:whatsapp:group:-1001:17585") is None
+    await adapter.send("-1001", result["final_response"])
+    assert [call["content"] for call in adapter.sent] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_global_memory_notifications_off_skips_review_callback(monkeypatch, tmp_path):
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id="sess-global-memory-off",
+        config_data={"display": {"memory_notifications": False}},
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert ReviewNotificationAgent.callbacks == [None]
+    assert ReviewNotificationAgent.notification_modes == ["off"]
+    assert adapter.pop_post_delivery_callback("agent:main:whatsapp:group:-1001:17585") is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_memory_notifications_config_fails_open_to_existing_default(monkeypatch, tmp_path):
+    """An unreadable config must retain the established notification default instead of crashing."""
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id="sess-malformed-memory-notifications",
+        raw_config="display:\n  memory_notifications: [unterminated\n",
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert callable(ReviewNotificationAgent.callbacks[0])
+    assert ReviewNotificationAgent.notification_modes == ["on"]
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_memory_notifications_on_to_whatsapp_off_clears_callback(monkeypatch, tmp_path):
+    """A live config edit clears the reused agent's prior callback on its next turn."""
+    import yaml
+
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"memory_notifications": "on"}}), encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = ReviewNotificationAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.WHATSAPP)
+    runner = _make_runner(adapter)
+    # Normal production runners retain agents for prompt caching; enable that same path here.
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.WHATSAPP, chat_id="-1001", chat_type="group", thread_id="17585",
+    )
+    session_key = "agent:main:whatsapp:group:-1001:17585"
+
+    first = await runner._run_agent(
+        message="first", context_prompt="", history=[], source=source,
+        session_id="sess-cached-memory", session_key=session_key,
+    )
+    cached_agent = runner._agent_cache[session_key][0]
+    assert first["final_response"] == "done"
+    assert callable(cached_agent.background_review_callback)
+    # The first turn's release is its already-selected, post-final-delivery policy.
+    first_release = adapter.pop_post_delivery_callback(session_key)
+    assert callable(first_release)
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    second = await runner._run_agent(
+        message="second", context_prompt="", history=[], source=source,
+        session_id="sess-cached-memory", session_key=session_key,
+    )
+
+    assert second["final_response"] == "done"
+    assert runner._agent_cache[session_key][0] is cached_agent
+    assert ReviewNotificationAgent.notification_modes == ["on", "off"]
+    assert callable(ReviewNotificationAgent.callbacks[0])
+    assert ReviewNotificationAgent.callbacks[1] is None
+    assert cached_agent.background_review_callback is None
+    assert adapter.pop_post_delivery_callback(session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_memory_review_already_selected_for_a_delivered_turn_is_not_retroactively_cancelled(
+    monkeypatch, tmp_path,
+):
+    """A release held after a final answer retains that completed turn's policy.
+
+    A config edit applies at the next turn's callback wiring boundary.  It intentionally does not
+    attempt to cancel a callback that was already selected for a final answer that has been delivered.
+    """
+    import yaml
+
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id="sess-late-memory-review",
+        config_data={"display": {"memory_notifications": "on"}},
+        platform=Platform.WHATSAPP,
+    )
+    await adapter.send("-1001", result["final_response"])
+    release = adapter.pop_post_delivery_callback("agent:main:whatsapp:group:-1001:17585")
+    assert callable(release)
+    # A disk edit alone cannot retroactively retract an already-authorized post-final delivery.
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    release()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if len(adapter.sent) == 2:
+            break
+    assert [call["content"] for call in adapter.sent] == ["done", "💾 Memory updated"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["on", "verbose"])
+async def test_memory_notifications_deliver_review_after_final_response(monkeypatch, tmp_path, mode):
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id=f"sess-whatsapp-memory-{mode}",
+        config_data={"display": {"platforms": {"whatsapp": {"memory_notifications": mode}}}},
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert callable(ReviewNotificationAgent.callbacks[0])
+    assert ReviewNotificationAgent.notification_modes == [mode]
+    await adapter.send("-1001", result["final_response"])
+    release = adapter.pop_post_delivery_callback("agent:main:whatsapp:group:-1001:17585")
+    assert callable(release)
+    release()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if len(adapter.sent) == 2:
+            break
+    assert [call["content"] for call in adapter.sent] == ["done", "💾 Memory updated"]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_memory_notifications_override_does_not_change_other_platforms(monkeypatch, tmp_path):
+    ReviewNotificationAgent.callbacks = []
+    ReviewNotificationAgent.notification_modes = []
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReviewNotificationAgent,
+        session_id="sess-discord-memory-on",
+        config_data={
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-channel",
+        thread_id="discord-thread",
+    )
+
+    assert result["final_response"] == "done"
+    assert callable(ReviewNotificationAgent.callbacks[0])
+    assert ReviewNotificationAgent.notification_modes == ["on"]
 
 
 @pytest.mark.asyncio
