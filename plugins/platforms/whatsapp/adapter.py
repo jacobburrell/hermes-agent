@@ -8,6 +8,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
 from contextlib import suppress
@@ -258,6 +259,8 @@ _MEDIA_INFO = {
     MessageType.PHOTO: ("image", "image/jpeg"), MessageType.VOICE: ("audio", "audio/ogg"), MessageType.AUDIO: ("audio", "audio/mpeg"),
     MessageType.VIDEO: ("video", "video/mp4"), MessageType.DOCUMENT: ("document", ""),
 }
+_BRIDGE_MATERIALIZE_CAPABILITY_HEADER = "X-Hermes-WhatsApp-Materialize-Capability"
+_BRIDGE_MATERIALIZE_MAX_URLS = 16
 
 
 def _needs_bridge(method):
@@ -296,6 +299,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
+        # Generated only for a bridge process that this adapter launches.
+        # This is process-private transport state, not user configuration.
+        self._bridge_materialization_capability: Optional[str] = None
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
@@ -379,6 +385,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
+            if data.get("inboundMediaMaterialization") == "capability":
+                # Capabilities are intentionally per bridge process and never
+                # persisted.  A newly constructed adapter cannot safely adopt
+                # an old bridge, even on loopback, because that would require
+                # exposing or reusing the prior process's secret.
+                print(f"[{self.name}] Running bridge requires a private inbound-media capability; restarting")
+                return False
             if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                 self._mark_connected()
@@ -404,7 +417,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Without these the bridge hardcodes ~/.hermes/{image,audio,document}_cache (wrong under HERMES_HOME/profiles/cache layout).
         img_dir, audio_dir, _video_dir, doc_dir = _cache_dirs()
         bridge_env.update(HERMES_IMAGE_CACHE_DIR=str(img_dir), HERMES_AUDIO_CACHE_DIR=str(audio_dir), HERMES_DOCUMENT_CACHE_DIR=str(doc_dir))
+        capability = getattr(self, "_bridge_materialization_capability", None)
+        if capability:
+            # The child deletes this private bootstrap value immediately after
+            # startup.  It is never read from YAML, user .env, logs, payloads,
+            # or the health response.
+            bridge_env["HERMES_INTERNAL_WHATSAPP_BRIDGE_CAPABILITY"] = capability
         return bridge_env
+
+    def _rotate_bridge_materialization_capability(self) -> None:
+        """Make a fresh cryptographic bridge capability for one child process."""
+        self._bridge_materialization_capability = secrets.token_urlsafe(32)
 
     def _bridge_died(self, detail: str) -> bool:
         print(f"[{self.name}] {detail}")
@@ -493,6 +516,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             _kill_stale_bridge_by_pidfile(self._session_path)
             _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
+            self._rotate_bridge_materialization_capability()
             # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
             self._bridge_log = self._session_path.parent / "bridge.log"
             self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
@@ -947,6 +971,49 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 accepted.append((url, "unknown"))
         return [u for u, _ in accepted], [m for _, m in accepted]
 
+    async def _materialize_admitted_bridge_media(self, data: Dict[str, Any]) -> list[str]:
+        """One authenticated, one-shot materialization for an already-operating event.
+
+        The bridge owns the raw Baileys message in a bounded process-local
+        store.  This adapter sends only the current chat/message identity and
+        a private request header; it accepts only bridge-cache paths back.
+        Observation/drop paths return before this method is reachable.
+        """
+        capability = getattr(self, "_bridge_materialization_capability", None)
+        message_id = str(data.get("messageId") or "").strip()
+        chat_id = str(data.get("chatId") or "").strip()
+        if not capability or not message_id or not chat_id or not self._http_session:
+            return []
+        try:
+            headers = {_BRIDGE_MATERIALIZE_CAPABILITY_HEADER: capability}
+            async with self._bridge_req(
+                "post", "materialize-inbound-media", 45,
+                json={"chatId": chat_id, "messageId": message_id}, headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("[%s] Inbound media materialization unavailable (HTTP %s)", self.name, resp.status)
+                    return []
+                result = await resp.json()
+        except Exception:
+            logger.warning("[%s] Inbound media materialization failed", self.name, exc_info=True)
+            return []
+        if not isinstance(result, dict):
+            return []
+        # The bridge echoes its stored origin so a malformed or stale response
+        # cannot be attached to a different operating message.
+        if str(result.get("messageId") or "") != message_id or str(result.get("chatId") or "") != chat_id:
+            logger.warning("[%s] Rejected mismatched inbound media materialization response", self.name)
+            return []
+        urls = result.get("mediaUrls")
+        if not isinstance(urls, list):
+            return []
+        # The new bridge materializes locally.  Never re-open a remote URL
+        # from bridge output; this keeps attachment fetching capability-bound.
+        return [
+            url for url in urls[:_BRIDGE_MATERIALIZE_MAX_URLS]
+            if isinstance(url, str) and os.path.isabs(url) and _is_allowed_bridge_path(url)
+        ]
+
     def _inject_document_text(self, cached_urls: list, body: str) -> str:
         """Prepend text-readable document contents (≤100KB) so the agent reads them inline."""
         for doc_path in cached_urls:
@@ -968,7 +1035,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return body
 
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
-        """Classify bridge metadata before a potential operating event."""
+        """Classify bridge metadata, then materialize media only for an operating event."""
         try:
             received_at = datetime.now(tz=timezone.utc)
             event_timestamp = self._validated_bridge_timestamp(data, received_at)
@@ -981,7 +1048,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             msg_type = self._classify_bridge_message(data)
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",
                                        user_id=data.get("senderId"), user_name=data.get("senderName"))
-            cached_urls, media_types = await self._collect_bridge_media(data, msg_type)
+            # Treat /messages as metadata-only even when a stale or malicious
+            # bridge response contains mediaUrls.  The sole ingress for a
+            # cached attachment is the private, chat/message-bound endpoint
+            # after this event has been admitted as OPERATE.
+            media_data = dict(data)
+            media_data["mediaUrls"] = []
+            if data.get("hasMedia"):
+                media_data["mediaUrls"] = await self._materialize_admitted_bridge_media(data)
+            cached_urls, media_types = await self._collect_bridge_media(media_data, msg_type)
             body = data.get("body", "")
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
@@ -1020,7 +1095,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if channel_prompt:
                 event._whatsapp_observed_group_source = self._observed_group_source(data)
             return event
-
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None

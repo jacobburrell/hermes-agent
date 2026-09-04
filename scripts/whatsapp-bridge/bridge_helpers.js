@@ -1,6 +1,6 @@
 import path from 'path';
 import { mkdirSync, writeFileSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { randomBytes, timingSafeEqual } from 'crypto';
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
@@ -63,6 +63,160 @@ export function createBoundedMessageStore(limit = 512) {
   }
 
   return { remember, get };
+}
+
+/**
+ * Canonical key material for the *private, in-memory* inbound-media store.
+ *
+ * This deliberately is not the more permissive display normalizer used by
+ * older bridge payloads.  The store has one job: make a materialization
+ * request prove it refers to the exact chat/message pair that entered this
+ * bridge process.  Device JIDs are canonicalized without ever turning a
+ * device suffix into a second ``@``.
+ */
+export function canonicalInboundMediaChatId(value) {
+  const raw = String(value || '').trim();
+  const firstAt = raw.indexOf('@');
+  const lastAt = raw.lastIndexOf('@');
+  if (firstAt <= 0 || lastAt === raw.length - 1) return '';
+  // Older bridge normalization could turn ``user:device@domain`` into
+  // ``user@device@domain``.  A JID local part cannot itself contain ``@``;
+  // taking the first local and final domain safely canonicalizes both forms.
+  const user = raw.slice(0, firstAt).split(':', 1)[0].trim();
+  const domain = raw.slice(lastAt + 1).trim().toLowerCase();
+  return user && domain ? `${user}@${domain}` : '';
+}
+
+function boundedInboundMediaMessageId(value) {
+  const id = String(value || '').trim();
+  return id && id.length <= 512 ? id : '';
+}
+
+function inboundMediaKey(chatId, messageId) {
+  const canonicalChatId = canonicalInboundMediaChatId(chatId);
+  const boundedMessageId = boundedInboundMediaMessageId(messageId);
+  return canonicalChatId && boundedMessageId
+    ? `${canonicalChatId}\u0000${boundedMessageId}`
+    : '';
+}
+
+/**
+ * Bounded, process-local raw Baileys retention for deferred media download.
+ *
+ * ``/messages`` exposes only a metadata event.  The raw message stays here
+ * until the authenticated adapter makes one exact chat/message request.  A
+ * take consumes the entry, so retry/replay cannot turn this into a general
+ * media download service.  It is intentionally not a receipt spool: process
+ * exit, TTL expiry, and capacity eviction discard entries.
+ */
+export function createBoundedInboundMediaStore({
+  limit = 128,
+  ttlMs = 120000,
+  now = () => Date.now(),
+} = {}) {
+  const entries = new Map();
+  const boundedLimit = Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 128);
+  const boundedTtlMs = Math.max(1, Number.isFinite(ttlMs) ? Math.floor(ttlMs) : 120000);
+
+  function prune() {
+    const cutoff = now() - boundedTtlMs;
+    for (const [key, entry] of entries) {
+      if (entry.createdAt <= cutoff) entries.delete(key);
+    }
+  }
+
+  function remember({ chatId, messageId, msg, context = {} }) {
+    const key = inboundMediaKey(chatId, messageId);
+    const rawKey = msg?.key || {};
+    // Retention must be rooted in the actual Baileys message, not in the
+    // derived event supplied to /messages.  This is the origin check that
+    // prevents a caller from naming another chat or message ID later.
+    if (
+      !key
+      || canonicalInboundMediaChatId(rawKey.remoteJid) !== canonicalInboundMediaChatId(chatId)
+      || boundedInboundMediaMessageId(rawKey.id) !== boundedInboundMediaMessageId(messageId)
+    ) return false;
+    entries.delete(key);
+    entries.set(key, {
+      chatId: canonicalInboundMediaChatId(chatId),
+      requestChatId: String(chatId).trim(),
+      messageId: boundedInboundMediaMessageId(messageId),
+      msg,
+      context,
+      createdAt: now(),
+    });
+    prune();
+    while (entries.size > boundedLimit) {
+      entries.delete(entries.keys().next().value);
+    }
+    return true;
+  }
+
+  function take({ chatId, messageId }) {
+    prune();
+    const key = inboundMediaKey(chatId, messageId);
+    if (!key) return null;
+    const entry = entries.get(key);
+    if (!entry) return null;
+    entries.delete(key); // one-shot materialization: replay is always rejected.
+    return entry;
+  }
+
+  return { remember, take, size: () => { prune(); return entries.size; } };
+}
+
+/** Constant-time comparison for the bridge's private materialization capability. */
+export function matchesBridgeMaterializationCapability(expected, supplied) {
+  if (typeof expected !== 'string' || typeof supplied !== 'string') return false;
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  const suppliedBytes = Buffer.from(supplied, 'utf8');
+  return expectedBytes.length === suppliedBytes.length
+    && expectedBytes.length > 0
+    && timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
+/**
+ * Authenticate and consume one deferred inbound-media entry.
+ *
+ * The caller receives only materialized media transport fields.  Raw Baileys
+ * message data, native metadata, cache directories, and capability material
+ * never leave this helper.  It is deliberately a tiny, chat/message-bound
+ * operation rather than a generic downloader.
+ */
+export function createInboundMediaMaterializer({ capability, inboundMediaStore, materialize }) {
+  return async function materializeInboundMedia({ suppliedCapability, chatId, messageId }) {
+    if (!matchesBridgeMaterializationCapability(capability, suppliedCapability)) {
+      return { ok: false, status: 403 };
+    }
+    const entry = inboundMediaStore?.take({ chatId, messageId });
+    if (!entry) return { ok: false, status: 404 };
+    try {
+      const result = await materialize(entry);
+      const urls = Array.isArray(result?.mediaUrls)
+        ? result.mediaUrls.filter(url => typeof url === 'string' && url.length > 0).slice(0, 16)
+        : [];
+      return {
+        ok: true,
+        status: 200,
+        result: {
+          // Echo the exact metadata event spelling back to the adapter for
+          // response correlation.  The lookup itself always uses the
+          // canonical ``entry.chatId`` above, so this does not weaken origin
+          // binding for device/LID aliases.
+          chatId: entry.requestChatId,
+          messageId: entry.messageId,
+          mediaUrls: urls,
+          mediaType: String(result?.mediaType || ''),
+          mime: String(result?.mime || ''),
+          fileName: String(result?.fileName || ''),
+        },
+      };
+    } catch {
+      // The one-shot entry remains consumed.  The adapter still delivers any
+      // caption/text from /messages; it never retries into a download oracle.
+      return { ok: false, status: 409 };
+    }
+  };
 }
 
 export function pollCreationMessageSecret(pollCreation) {
@@ -306,6 +460,10 @@ export async function extractBridgeEvent({
   downloadMedia,
   writeMediaFile,
   cacheDirs = {},
+  // The bridge's initial /messages event is metadata-only.  Existing helper
+  // callers retain the historical eager-materialization default; bridge.js
+  // opts out and performs the one authenticated operation later.
+  materializeMedia = true,
 }) {
   const messageContent = getMessageContent(msg);
   const contextInfo = getContextInfo(messageContent);
@@ -362,7 +520,7 @@ export async function extractBridgeEvent({
     mediaType = 'image';
     nativeType = 'imageMessage';
     mime = item.mimetype || 'image/jpeg';
-    await saveMedia({ mediaMessage: item, dir: cacheDirs.image, prefix: 'img', fallbackExt: '.jpg', type: 'image' });
+    if (materializeMedia) await saveMedia({ mediaMessage: item, dir: cacheDirs.image, prefix: 'img', fallbackExt: '.jpg', type: 'image' });
   } else if (messageContent.videoMessage) {
     const item = messageContent.videoMessage;
     body = item.caption || '';
@@ -371,7 +529,7 @@ export async function extractBridgeEvent({
     nativeType = 'videoMessage';
     mime = item.mimetype || 'video/mp4';
     nativeMetadata.video = { gifPlayback: !!item.gifPlayback };
-    await saveMedia({ mediaMessage: item, dir: cacheDirs.document, prefix: 'vid', fallbackExt: '.mp4', type: mediaType });
+    if (materializeMedia) await saveMedia({ mediaMessage: item, dir: cacheDirs.document, prefix: 'vid', fallbackExt: '.mp4', type: mediaType });
   } else if (messageContent.audioMessage || messageContent.pttMessage) {
     const item = messageContent.pttMessage || messageContent.audioMessage;
     hasMedia = true;
@@ -379,7 +537,7 @@ export async function extractBridgeEvent({
     nativeType = messageContent.pttMessage ? 'pttMessage' : 'audioMessage';
     mime = item.mimetype || 'audio/ogg';
     nativeMetadata.audio = { ptt: mediaType === 'ptt' };
-    await saveMedia({ mediaMessage: item, dir: cacheDirs.audio, prefix: 'aud', fallbackExt: '.ogg', type: 'audio' });
+    if (materializeMedia) await saveMedia({ mediaMessage: item, dir: cacheDirs.audio, prefix: 'aud', fallbackExt: '.ogg', type: 'audio' });
   } else if (messageContent.documentMessage) {
     const item = messageContent.documentMessage;
     body = item.caption || '';
@@ -388,7 +546,7 @@ export async function extractBridgeEvent({
     nativeType = 'documentMessage';
     mime = item.mimetype || 'application/octet-stream';
     fileName = item.fileName || 'document';
-    await saveMedia({ mediaMessage: item, dir: cacheDirs.document, prefix: 'doc', fallbackExt: '.bin', fileName, type: 'document' });
+    if (materializeMedia) await saveMedia({ mediaMessage: item, dir: cacheDirs.document, prefix: 'doc', fallbackExt: '.bin', fileName, type: 'document' });
   } else if (messageContent.stickerMessage) {
     hasMedia = true;
     mediaType = 'sticker';
@@ -399,7 +557,7 @@ export async function extractBridgeEvent({
       animated: !!messageContent.stickerMessage.isAnimated,
       mimetype: mime,
     };
-    await saveMedia({ mediaMessage: messageContent.stickerMessage, dir: cacheDirs.image, prefix: 'sticker', fallbackExt: '.webp', type: 'sticker' });
+    if (materializeMedia) await saveMedia({ mediaMessage: messageContent.stickerMessage, dir: cacheDirs.image, prefix: 'sticker', fallbackExt: '.webp', type: 'sticker' });
   } else if (messageContent.locationMessage || messageContent.liveLocationMessage) {
     const isLive = !!messageContent.liveLocationMessage;
     const item = messageContent.liveLocationMessage || messageContent.locationMessage;
@@ -455,7 +613,11 @@ export async function extractBridgeEvent({
   // attachment. Applied before the generic "[<type> received]" fallback so an
   // uncaptioned message whose download failed reads "[image could not be
   // downloaded]" rather than claiming the media arrived.
-  body = appendMediaFailureNote(body, mediaFailures);
+  // Metadata-only events have not attempted a download, so their caption is
+  // truthful and neutral.  A later authenticated materialization failure is
+  // deliberately not exposed as a runtime notice; the adapter keeps the
+  // caption/text delivery path intact.
+  if (materializeMedia) body = appendMediaFailureNote(body, mediaFailures);
 
   if (hasMedia && !body) {
     body = `[${mediaType} received]`;

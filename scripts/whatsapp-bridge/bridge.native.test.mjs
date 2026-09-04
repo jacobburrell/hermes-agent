@@ -6,7 +6,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,7 +15,9 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import {
   buildPollPayload,
   buildTextSendPayload,
+  createBoundedInboundMediaStore,
   createBoundedMessageStore,
+  createInboundMediaMaterializer,
   appendMediaFailureNote,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -43,6 +45,201 @@ import {
   assert.equal(receiptKeys[0], groupKey);
   assert.equal(receiptKeys[0].participant, groupKey.participant);
   console.log('  ✓ inbound read receipts preserve the original group message key');
+}
+
+// -- deferred inbound media materialization ------------------------------
+{
+  let downloads = 0;
+  let cacheWrites = 0;
+  let materializations = 0;
+  let clock = 10_000;
+  const rawMessage = {
+    key: { id: 'deferred-image-1', remoteJid: '120363001234567890@g.us', fromMe: false },
+    messageTimestamp: 123,
+    message: { imageMessage: { caption: 'addressed image', mimetype: 'image/jpeg' } },
+  };
+  const eventArgs = {
+    msg: rawMessage,
+    chatId: '120363001234567890@g.us',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    isGroup: true,
+    downloadMedia: async () => { downloads += 1; return Buffer.from('image'); },
+    writeMediaFile: async () => { cacheWrites += 1; return '/private/cache/img.jpg'; },
+  };
+
+  // This is the /messages representation used by both DROP and OBSERVE
+  // before Python classification: no downloader, writer, or raw path leaks.
+  const metadataOnly = await extractBridgeEvent({ ...eventArgs, materializeMedia: false });
+  assert.equal(metadataOnly.hasMedia, true);
+  assert.deepEqual(metadataOnly.mediaUrls, []);
+  assert.equal(metadataOnly.body, 'addressed image');
+  assert.equal(downloads, 0);
+  assert.equal(cacheWrites, 0);
+
+  const inboundStore = createBoundedInboundMediaStore({
+    limit: 1,
+    ttlMs: 100,
+    now: () => clock,
+  });
+  assert.equal(inboundStore.remember({
+    chatId: eventArgs.chatId,
+    messageId: rawMessage.key.id,
+    msg: rawMessage,
+    context: eventArgs,
+  }), true);
+
+  const capability = randomBytes(32).toString('base64url');
+  const materializeEntry = async (entry) => {
+    materializations += 1;
+    const full = await extractBridgeEvent({ ...entry.context, msg: entry.msg, materializeMedia: true });
+    return {
+      mediaUrls: full.mediaUrls,
+      mediaType: full.mediaType,
+      mime: full.mime,
+      fileName: full.fileName,
+      // Deliberately ignored by the helper response shaping.
+      nativeMetadata: full.nativeMetadata,
+    };
+  };
+  const materializer = createInboundMediaMaterializer({ capability, inboundMediaStore: inboundStore, materialize: materializeEntry });
+
+  const wrongCapability = await materializer({
+    suppliedCapability: randomBytes(32).toString('base64url'),
+    chatId: eventArgs.chatId,
+    messageId: rawMessage.key.id,
+  });
+  assert.equal(wrongCapability.status, 403);
+  assert.equal(downloads, 0);
+  assert.equal(cacheWrites, 0);
+  assert.equal(materializations, 0);
+
+  // Correctly authenticated requests are still exact-origin-bound; a wrong
+  // chat or message does not consume or disclose the retained raw media.
+  const wrongChat = await materializer({
+    suppliedCapability: capability,
+    chatId: '120363009999999999@g.us',
+    messageId: rawMessage.key.id,
+  });
+  assert.equal(wrongChat.status, 404);
+  const wrongMessage = await materializer({
+    suppliedCapability: capability,
+    chatId: eventArgs.chatId,
+    messageId: 'different-message',
+  });
+  assert.equal(wrongMessage.status, 404);
+  assert.equal(downloads, 0);
+  assert.equal(cacheWrites, 0);
+
+  const materialized = await materializer({
+    suppliedCapability: capability,
+    chatId: eventArgs.chatId,
+    messageId: rawMessage.key.id,
+  });
+  assert.equal(materialized.status, 200);
+  assert.deepEqual(Object.keys(materialized.result).sort(), ['chatId', 'fileName', 'mediaType', 'mediaUrls', 'messageId', 'mime']);
+  assert.deepEqual(materialized.result.mediaUrls, ['/private/cache/img.jpg']);
+  assert.equal(downloads, 1);
+  assert.equal(cacheWrites, 1);
+  assert.equal(materializations, 1);
+  assert.equal((await materializer({
+    suppliedCapability: capability, chatId: eventArgs.chatId, messageId: rawMessage.key.id,
+  })).status, 404);
+
+  // Retention is bounded and expires without materializing either raw entry.
+  assert.equal(inboundStore.remember({ chatId: eventArgs.chatId, messageId: 'old', msg: { key: { id: 'old', remoteJid: eventArgs.chatId } } }), true);
+  assert.equal(inboundStore.remember({ chatId: eventArgs.chatId, messageId: 'new', msg: { key: { id: 'new', remoteJid: eventArgs.chatId } } }), true);
+  assert.equal(inboundStore.take({ chatId: eventArgs.chatId, messageId: 'old' }), null);
+  clock += 101;
+  assert.equal(inboundStore.take({ chatId: eventArgs.chatId, messageId: 'new' }), null);
+  assert.equal(downloads, 1);
+  assert.equal(cacheWrites, 1);
+
+  // Device JIDs and an older bridge's accidental double-@ display spelling
+  // resolve to the same private origin key without exposing the raw message.
+  const aliasStore = createBoundedInboundMediaStore();
+  const deviceRaw = { key: { id: 'device-message', remoteJid: '120363001234567890:47@g.us' } };
+  assert.equal(aliasStore.remember({
+    chatId: '120363001234567890@47@g.us', messageId: 'device-message', msg: deviceRaw,
+  }), true);
+  const deviceEntry = aliasStore.take({ chatId: '120363001234567890:99@g.us', messageId: 'device-message' });
+  assert.equal(deviceEntry?.chatId, '120363001234567890@g.us');
+  console.log('  ✓ deferred inbound media is capability-bound, origin-bound, one-shot, and metadata-only before admission');
+}
+
+// A direct-message LID has the same deferred-materialization contract as a
+// group.  In particular, its raw Baileys route—not a derived display label—is
+// what establishes origin, and an unrelated phone JID must not download it.
+{
+  let downloads = 0;
+  const rawDirectLid = {
+    key: { id: 'deferred-direct-lid-1', remoteJid: '19876543210:42@lid', fromMe: false },
+    message: { imageMessage: { caption: 'direct LID image', mimetype: 'image/jpeg' } },
+  };
+  const directMetadata = await extractBridgeEvent({
+    msg: rawDirectLid,
+    chatId: rawDirectLid.key.remoteJid,
+    senderId: rawDirectLid.key.remoteJid,
+    senderNumber: '19876543210',
+    isGroup: false,
+    materializeMedia: false,
+    downloadMedia: async () => { downloads += 1; return Buffer.from('direct-image'); },
+    writeMediaFile: async () => '/private/cache/direct-lid.jpg',
+  });
+  assert.equal(directMetadata.chatId, rawDirectLid.key.remoteJid);
+  assert.deepEqual(directMetadata.mediaUrls, []);
+  assert.equal(downloads, 0);
+
+  const directStore = createBoundedInboundMediaStore();
+  assert.equal(directStore.remember({
+    chatId: directMetadata.chatId,
+    messageId: directMetadata.messageId,
+    msg: rawDirectLid,
+    context: { chatId: directMetadata.chatId },
+  }), true);
+  const directCapability = randomBytes(32).toString('base64url');
+  let internalCanonicalChatId = '';
+  const directMaterializer = createInboundMediaMaterializer({
+    capability: directCapability,
+    inboundMediaStore: directStore,
+    materialize: async (entry) => {
+      downloads += 1;
+      internalCanonicalChatId = entry.chatId;
+      return {
+        mediaUrls: ['/private/cache/direct-lid.jpg'],
+        mediaType: 'image', mime: 'image/jpeg', fileName: '',
+      };
+    },
+  });
+
+  // A different direct-message identity cannot consume or download the raw
+  // LID message, even with the capability and message ID.
+  assert.equal((await directMaterializer({
+    suppliedCapability: directCapability,
+    chatId: '19876543210@s.whatsapp.net',
+    messageId: directMetadata.messageId,
+  })).status, 404);
+  assert.equal(downloads, 0);
+
+  // The API request uses the exact queued raw LID route.  The store may
+  // canonicalize only internally for its bounded binding key; the response
+  // must echo the original queued spelling that Python correlates.
+  const directMaterialized = await directMaterializer({
+    suppliedCapability: directCapability,
+    chatId: directMetadata.chatId,
+    messageId: directMetadata.messageId,
+  });
+  assert.equal(directMaterialized.status, 200);
+  assert.equal(internalCanonicalChatId, '19876543210@lid');
+  assert.equal(directMaterialized.result.chatId, directMetadata.chatId);
+  assert.deepEqual(directMaterialized.result.mediaUrls, ['/private/cache/direct-lid.jpg']);
+  assert.equal(downloads, 1);
+  assert.equal((await directMaterializer({
+    suppliedCapability: directCapability,
+    chatId: directMetadata.chatId,
+    messageId: directMetadata.messageId,
+  })).status, 404);
+  console.log('  ✓ direct-message LID media binds raw route, internal canonical key, and one-shot download');
 }
 
 // -- quoted outbound text -------------------------------------------------

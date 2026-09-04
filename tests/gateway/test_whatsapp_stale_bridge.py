@@ -116,6 +116,31 @@ class TestFileContentHash:
 
 class TestStaleBridgeHandshake:
 
+    @pytest.mark.asyncio
+    async def test_capability_bridge_is_not_adopted_without_its_private_secret(self, tmp_path):
+        """A fresh adapter restarts a capability bridge only after its normal owner lock.
+
+        The per-process inbound-media capability is intentionally not exposed
+        by /health or persisted.  Reusing another adapter's bridge would make
+        the authenticated materialization rail unavailable (or tempt an
+        unsafe fallback), so ``_reuse_running_bridge`` must refuse adoption.
+        """
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        adapter = _make_adapter(bridge_script=str(bridge_dir / "bridge.js"))
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        with patch.object(adapter, "_probe_bridge_health", AsyncMock(return_value=(True, {
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sendReadReceipts": False,
+            "inboundMediaMaterialization": "capability",
+        }))), patch.object(adapter, "_attach_to_bridge") as attach:
+            assert await adapter._reuse_running_bridge(bridge_dir / "bridge.js") is False
+
+        attach.assert_not_called()
+        assert adapter._http_session is None
+
 
     @pytest.mark.asyncio
     async def test_restarts_bridge_when_read_receipt_config_changed(self, tmp_path):
@@ -211,3 +236,6 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+        # Private process bootstrap only: value is generated during spawn and
+        # is intentionally not asserted or printed as a user credential.
+        assert "HERMES_INTERNAL_WHATSAPP_BRIDGE_CAPABILITY" in env
