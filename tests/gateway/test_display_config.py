@@ -53,6 +53,7 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
     def test_memory_notifications_platform_override_wins_and_is_scoped(self):
+        """A profile-local WhatsApp ``off`` remains necessary when global is explicitly ``on``."""
         from gateway.display_config import resolve_display_setting
 
         config = {
@@ -63,6 +64,20 @@ class TestResolveDisplaySetting:
         }
         assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
         assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
+
+        # A valid platform mapping without this setting is not an invalid override:
+        # it must retain the ordinary global value for both WhatsApp and Discord.
+        config = {
+            "display": {
+                "memory_notifications": "verbose",
+                "platforms": {
+                    "whatsapp": {"tool_progress": "off"},
+                    "discord": {"tool_progress": "off"},
+                },
+            }
+        }
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "verbose"
+        assert resolve_display_setting(config, "discord", "memory_notifications") == "verbose"
 
     def test_memory_notifications_whatsapp_default_is_silent_but_other_platforms_keep_on(self):
         from gateway.display_config import resolve_display_setting

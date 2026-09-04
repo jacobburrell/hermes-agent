@@ -113,7 +113,7 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
             # deliberately quiet; platforms without a specialised value retain
             # the generic built-in ``on`` default.
             return _builtin_display_default(platform_key, setting, fallback)
-    elif has_platform_stanza and setting == "memory_notifications":
+    elif has_platform_stanza and not isinstance(plat_overrides, dict) and setting == "memory_notifications":
         # The platform stanza itself was present but malformed (rather than a
         # mapping with a malformed value).  Treat it like a present invalid
         # memory-notification override, so a generic setting cannot make
