@@ -1,5 +1,7 @@
 """Tests for gateway.display_config — per-platform display/verbosity resolver."""
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Resolver: resolution order
@@ -67,6 +69,48 @@ class TestResolveDisplaySetting:
 
         assert resolve_display_setting({}, "whatsapp", "memory_notifications") == "off"
         assert resolve_display_setting({}, "discord", "memory_notifications") == "on"
+
+    @pytest.mark.parametrize("invalid_override", ["banana", None, ["off"]])
+    def test_invalid_whatsapp_memory_override_fails_closed_before_global_setting(
+        self, invalid_override,
+    ):
+        """A present malformed WhatsApp override cannot reveal review chatter."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": invalid_override}},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+
+    def test_invalid_generic_platform_memory_override_uses_its_builtin_default(self):
+        """A present invalid override skips generic config for every platform."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "verbose",
+                "platforms": {"discord": {"memory_notifications": "banana"}},
+            }
+        }
+
+        assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
+
+    def test_malformed_whatsapp_platform_stanza_fails_closed_before_global_setting(self):
+        """A present non-mapping WhatsApp stanza is also an invalid override."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": "banana"},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
 
     def test_memory_notifications_malformed_value_falls_back_to_platform_default(self):
         from gateway.display_config import resolve_display_setting
