@@ -1713,6 +1713,22 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
+  # Background self-improvement / memory-review notices sent after a successful
+  # final response. This keeps the established cross-platform default enabled.
+  #   on:      Send the ordinary concise notice (default)
+  #   verbose: Send the detailed review summary when available
+  #   off:     Run the review silently; final answers still deliver normally
+  # Quote "on" and "off" in YAML 1.1 files so they remain strings rather than booleans.
+  memory_notifications: "on"
+
+  # WhatsApp is final-answer-first for these transient notices by built-in
+  # platform default. Keep this explicit profile setting in a deployment as
+  # defense in depth; it does not change the global or other-platform policy:
+  #
+  # platforms:
+  #   whatsapp:
+  #     memory_notifications: "off"
+
   # Per-platform defaults can be quieter than the global setting. Telegram
   # tunes for mobile: tool_progress and busy_ack_detail default off (no
   # per-tool breadcrumb stream, no "iteration 21/60" debug detail in busy

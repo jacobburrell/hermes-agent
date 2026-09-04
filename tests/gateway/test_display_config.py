@@ -62,13 +62,23 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
         assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
 
-    def test_memory_notifications_default_and_malformed_value_fail_open_to_on(self):
+    def test_memory_notifications_whatsapp_default_is_silent_but_other_platforms_keep_on(self):
         from gateway.display_config import resolve_display_setting
 
-        assert resolve_display_setting({}, "whatsapp", "memory_notifications") == "on"
+        assert resolve_display_setting({}, "whatsapp", "memory_notifications") == "off"
+        assert resolve_display_setting({}, "discord", "memory_notifications") == "on"
+
+    def test_memory_notifications_malformed_value_falls_back_to_platform_default(self):
+        from gateway.display_config import resolve_display_setting
+
         assert resolve_display_setting(
             {"display": {"memory_notifications": ["off"]}},
             "whatsapp",
+            "memory_notifications",
+        ) == "off"
+        assert resolve_display_setting(
+            {"display": {"memory_notifications": ["off"]}},
+            "discord",
             "memory_notifications",
         ) == "on"
 
@@ -356,4 +366,3 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
