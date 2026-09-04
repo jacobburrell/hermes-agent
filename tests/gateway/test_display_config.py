@@ -50,6 +50,28 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_memory_notifications_platform_override_wins_and_is_scoped(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        }
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+        assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
+
+    def test_memory_notifications_default_and_malformed_value_fail_open_to_on(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "whatsapp", "memory_notifications") == "on"
+        assert resolve_display_setting(
+            {"display": {"memory_notifications": ["off"]}},
+            "whatsapp",
+            "memory_notifications",
+        ) == "on"
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
@@ -88,6 +110,15 @@ class TestYAMLNormalisation:
 
         config = {"display": {"tool_progress": False}}
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
+
+    def test_memory_notifications_false_normalised_to_off(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting(
+            {"display": {"memory_notifications": False}},
+            "whatsapp",
+            "memory_notifications",
+        ) == "off"
 
 
     def test_only_long_running_visibility_accepts_generic_mode(self):
@@ -325,5 +356,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 
