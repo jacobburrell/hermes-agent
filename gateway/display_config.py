@@ -84,6 +84,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
+def _builtin_display_default(platform_key: str, setting: str, fallback: Any) -> Any:
+    """Return the platform policy, falling back to the generic built-in default."""
+    value = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
+    if value is None:
+        value = _GLOBAL_DEFAULTS.get(setting)
+    return fallback if value is None else value
+
+
 def resolve_display_setting(user_config: dict, platform_key: str, setting: str, fallback: Any = None) -> Any:
     """Resolve a display setting with per-platform override support (see module docstring for order).
 
@@ -91,11 +99,26 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
     gateway/run.py). Returns *fallback* when nothing is configured.
     """
     display_cfg = user_config.get("display") or {}
-    plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
-    if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
+    platforms_cfg = display_cfg.get("platforms") or {}
+    has_platform_stanza = isinstance(platforms_cfg, dict) and platform_key in platforms_cfg
+    plat_overrides = platforms_cfg.get(platform_key) if isinstance(platforms_cfg, dict) else None
+    if isinstance(plat_overrides, dict) and setting in plat_overrides:
         value = plat_overrides[setting]
         if _valid_display_value(setting, value):
             return _normalise(setting, value)
+        if setting == "memory_notifications":
+            # A present-but-malformed memory-notification override must resolve
+            # directly to that platform's built-in policy, rather than letting
+            # a generic setting re-enable it. WhatsApp's built-in policy is
+            # deliberately quiet; platforms without a specialised value retain
+            # the generic built-in ``on`` default.
+            return _builtin_display_default(platform_key, setting, fallback)
+    elif has_platform_stanza and setting == "memory_notifications":
+        # The platform stanza itself was present but malformed (rather than a
+        # mapping with a malformed value).  Treat it like a present invalid
+        # memory-notification override, so a generic setting cannot make
+        # WhatsApp's transient review chatter visible.
+        return _builtin_display_default(platform_key, setting, fallback)
     if setting == "tool_progress":  # legacy display.tool_progress_overrides.<platform>
         legacy = display_cfg.get("tool_progress_overrides")
         if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
@@ -104,10 +127,7 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
         value = display_cfg[setting]
         if _valid_display_value(setting, value):
             return _normalise(setting, value)
-    val = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
-    if val is None:
-        val = _GLOBAL_DEFAULTS.get(setting)
-    return fallback if val is None else val
+    return _builtin_display_default(platform_key, setting, fallback)
 
 
 # --- Normalisation of YAML quirks (bare ``off`` → False in YAML 1.1, etc.) ---
@@ -120,11 +140,12 @@ def _valid_display_value(setting: str, value: Any) -> bool:
     """Whether a config value can override the setting's built-in policy.
 
     ``memory_notifications`` is intentionally stricter than historical
-    tri-state settings: an unknown value should fall through to the platform
-    default. That keeps WhatsApp quiet if an operator's YAML value is malformed
-    while retaining the generic default on other platforms. This resolver does
-    not retain a last-known-good config value; that config-resilience work
-    belongs to the later typed-notice follow-up.
+    tri-state settings. A present-but-invalid platform override resolves to
+    that platform's built-in policy in ``resolve_display_setting``; this makes
+    WhatsApp fail closed to its quiet default. Invalid generic values retain
+    normal resolver fall-through. This resolver does not retain a
+    last-known-good config value; that config-resilience work belongs to the
+    later typed-notice follow-up.
     """
     if setting != "memory_notifications" or isinstance(value, bool):
         return True
