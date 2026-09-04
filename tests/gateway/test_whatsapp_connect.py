@@ -66,6 +66,10 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    # Connect-path tests are not lock integration tests: make their ownership
+    # explicit so a sandbox filesystem denial cannot accidentally exercise the
+    # fail-closed production path.
+    adapter._acquire_platform_lock = MagicMock(return_value=True)
     return adapter
 
 
@@ -231,6 +235,8 @@ class TestConnectCleanup:
     @pytest.mark.asyncio
     async def test_releases_lock_when_npm_install_fails(self):
         adapter = _make_adapter()
+        # This one is the lock integration path, so restore the real helper.
+        del adapter._acquire_platform_lock
 
         def _path_exists(path_obj):
             return not str(path_obj).endswith("node_modules")
