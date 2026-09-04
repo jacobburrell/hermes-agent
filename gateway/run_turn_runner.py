@@ -1110,21 +1110,28 @@ class TurnRunner:
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
-        agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
-        # Register the release hook on the adapter so base.py's finally block fires it after the
-        # main response is delivered.
-        if ctx._status_adapter and ctx.session_key:
-            if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
-                ctx._status_adapter.register_post_delivery_callback(ctx.session_key, bg_release, generation=ctx.run_generation)
-            else:
-                pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
-                if pdc is not None:
-                    pdc[ctx.session_key] = bg_release
-        # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
-        if isinstance(mem_notif, bool):
-            mem_notif = "on" if mem_notif else "off"
-        agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+        # Resolve through the shared display policy so WhatsApp (and every other platform) can
+        # opt out without disabling the established global default for the rest of the gateway.
+        platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+        agent.memory_notifications = ctx.resolve_display_setting(
+            ctx.user_config, platform_key, "memory_notifications"
+        )
+        # A silent review must not retain a callback or a post-delivery release hook on a reused
+        # agent.  The review may still run; it simply has no user-visible delivery rail.
+        agent.background_review_callback = None
+        if agent.memory_notifications != "off":
+            agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
+            # Register the release hook on the adapter so base.py's finally block fires it after
+            # the main response lands.
+            if ctx._status_adapter and ctx.session_key:
+                if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
+                    ctx._status_adapter.register_post_delivery_callback(
+                        ctx.session_key, bg_release, generation=ctx.run_generation,
+                    )
+                else:
+                    pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
+                    if pdc is not None:
+                        pdc[ctx.session_key] = bg_release
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
