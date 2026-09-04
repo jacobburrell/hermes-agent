@@ -1722,12 +1722,12 @@ display:
   memory_notifications: "on"
 
   # WhatsApp is final-answer-first for these transient notices by built-in
-  # platform default. Keep this explicit profile setting in a deployment as
-  # defense in depth; it does not change the global or other-platform policy:
-  #
-  # platforms:
-  #   whatsapp:
-  #     memory_notifications: "off"
+  # platform default. This explicit platform override is required when the
+  # global ``memory_notifications`` setting above is explicitly "on"; it
+  # keeps the global/other-platform policy unchanged while WhatsApp stays quiet.
+  platforms:
+    whatsapp:
+      memory_notifications: "off"
 
   # Per-platform defaults can be quieter than the global setting. Telegram
   # tunes for mobile: tool_progress and busy_ack_detail default off (no
