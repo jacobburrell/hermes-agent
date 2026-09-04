@@ -8,6 +8,7 @@ fails, so this is intentionally not a receipt spool or delivery guarantee.
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,7 +16,8 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
-from gateway.session import SessionStore
+from gateway.session import AsyncSessionStore, SessionStore
+from gateway.run_turn import GatewayTurnMixin
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
@@ -216,6 +218,126 @@ async def test_observed_whatsapp_row_is_api_only_context_not_conversation_histor
     assert api_message.endswith("what should we open?")
 
 
+@pytest.mark.asyncio
+async def test_default_group_sessions_keep_observed_rows_in_same_group_context_after_restart(hermes_home):
+    """Default per-sender operating lanes still read only their group's observed rows."""
+    from gateway.run import _build_gateway_agent_history
+
+    store = SessionStore(sessions_dir=hermes_home / "sessions", config=GatewayConfig())
+    adapter = _adapter(store=store)
+    assert await adapter._build_message_event(_group_payload("ambient fact: open A")) is None
+    store.close_all_db_handles()
+
+    restarted_store = SessionStore(sessions_dir=hermes_home / "sessions", config=GatewayConfig())
+    restarted_adapter = _adapter(store=restarted_store)
+    addressed = await restarted_adapter._build_message_event(_group_payload(
+        "what should we open?",
+        messageId="wa-addressed-after-restart",
+        mentionedIds=["15551230000@s.whatsapp.net"],
+    ))
+    assert addressed is not None
+    observed_source = addressed._whatsapp_observed_group_source
+    assert observed_source.user_id is None
+    assert addressed.source.user_id == "15550001111@s.whatsapp.net"
+    assert restarted_store._generate_session_key(observed_source) != restarted_store._generate_session_key(addressed.source)
+
+    class _Runner:
+        async_session_store = AsyncSessionStore(restarted_store)
+
+        @staticmethod
+        def _session_key_for_source(source):
+            return restarted_store._generate_session_key(source)
+
+    observed_rows = await GatewayTurnMixin._hmwa_load_whatsapp_observed_group_rows(
+        _Runner(), addressed, addressed.source,
+    )
+    # The actual TurnRunner path receives the ordinary operating transcript
+    # plus these un-repaired observed rows, then separates them API-only.
+    normal_history = [{"role": "user", "content": "addressed operating turn"}]
+    agent_history, observed_context = _build_gateway_agent_history(
+        [*normal_history, *observed_rows], channel_prompt=addressed.channel_prompt,
+    )
+    assert agent_history == normal_history
+    assert observed_context is not None and "ambient fact: open A" in observed_context
+
+
+def test_raw_observed_rows_survive_user_adjacency_until_api_only_extraction(hermes_home):
+    """Real state.db reads must not repair an observed row into normal history."""
+    from gateway.run import _build_gateway_agent_history
+
+    store = SessionStore(sessions_dir=hermes_home / "sessions", config=GatewayConfig())
+    adapter = _adapter(store=store)
+    source = adapter._observed_group_source(_group_payload())
+    entry = store.get_or_create_session(source)
+    store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "ordinary user turn", "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "[Alice|a]\nambient must stay separate",
+        "timestamp": datetime.now(timezone.utc).isoformat(), "observed": True,
+    })
+
+    raw_rows = store.load_transcript(entry.session_id, repair_alternation=False)
+    assert [row["content"] for row in raw_rows] == [
+        "ordinary user turn", "[Alice|a]\nambient must stay separate",
+    ]
+    history, observed_context = _build_gateway_agent_history(
+        raw_rows, channel_prompt="observed WhatsApp group context",
+    )
+    assert [row["content"] for row in history] == ["ordinary user turn"]
+    assert observed_context is not None and "ambient must stay separate" in observed_context
+    assert "ambient must stay separate" not in history[0]["content"]
+
+
+def test_real_db_observed_selection_keeps_twenty_boundaries_and_never_merges_into_history(hermes_home):
+    """The actual SQLite replay path preserves observed row boundaries until selection."""
+    from gateway.run import _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES, _build_gateway_agent_history
+
+    store = SessionStore(sessions_dir=hermes_home / "sessions", config=GatewayConfig())
+    adapter = _adapter(store=store)
+    source = adapter._observed_group_source(_group_payload(chatId="120363009876543210@g.us"))
+    entry = store.get_or_create_session(source)
+    store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "ordinary operating history must remain private", "timestamp": 1_725_000_000,
+    })
+    for index in range(25):
+        store.append_to_transcript(entry.session_id, {
+            "role": "user", "observed": True,
+            "content": f"[Alice|a]\nrow-{index}: ambient only", "timestamp": 1_725_000_001 + index,
+        })
+
+    raw_rows = store.load_transcript(entry.session_id, repair_alternation=False)
+    history, observed_context = _build_gateway_agent_history(
+        raw_rows, channel_prompt="observed WhatsApp group context",
+    )
+    assert [row["content"] for row in history] == ["ordinary operating history must remain private"]
+    assert observed_context is not None
+    retained = [
+        int(line.split(":", 1)[0].split("row-", 1)[1])
+        for line in observed_context.splitlines() if line.startswith("row-")
+    ]
+    assert retained == list(range(5, 25))  # newest twenty, retained oldest-first
+    assert "ambient only" not in history[0]["content"]
+    assert len(observed_context.encode("utf-8")) <= _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES
+
+    # A second, real SQLite row forces a UTF-8 byte cutoff.  The complete
+    # header+body remains bounded and decodable, not merely the row body.
+    large_source = adapter._observed_group_source(_group_payload(chatId="120363001111111111@g.us"))
+    large_entry = store.get_or_create_session(large_source)
+    store.append_to_transcript(large_entry.session_id, {
+        "role": "user", "observed": True,
+        "content": "[Alice|a]\nmultibyte " + ("😀" * 3_000), "timestamp": 1_725_001_000,
+    })
+    large_rows = store.load_transcript(large_entry.session_id, repair_alternation=False)
+    large_history, large_context = _build_gateway_agent_history(
+        large_rows, channel_prompt="observed WhatsApp group context",
+    )
+    assert large_history == []
+    assert large_context is not None
+    assert len(large_context.encode("utf-8")) <= _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES
+    assert large_context.encode("utf-8").decode("utf-8") == large_context
+
+
 def test_whatsapp_api_only_context_is_most_recent_bounded_and_chronological():
     from gateway.run import (
         _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES,
@@ -238,6 +360,60 @@ def test_whatsapp_api_only_context_is_most_recent_bounded_and_chronological():
     assert retained[-1] == 24
     assert len(retained) <= _WHATSAPP_OBSERVED_CONTEXT_MAX_ROWS
     assert 0 not in retained
+
+
+def test_whatsapp_api_only_context_caps_complete_utf8_header_and_body():
+    from gateway.run import _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES, _build_gateway_agent_history
+
+    rows = [
+        {"role": "user", "observed": True, "content": f"[Alice|a]\\nrow-{index}: " + ("😀" * 1400)}
+        for index in range(25)
+    ]
+    history, observed_context = _build_gateway_agent_history(
+        rows, channel_prompt="observed WhatsApp group context",
+    )
+    assert history == []
+    assert observed_context is not None
+    assert len(observed_context.encode("utf-8")) <= _WHATSAPP_OBSERVED_CONTEXT_MAX_BYTES
+    # A strict UTF-8 decode is implicit in Python str; this proves no dangling
+    # continuation bytes were admitted by the byte cap.
+    assert observed_context.encode("utf-8").decode("utf-8") == observed_context
+    assert "row-24" in observed_context
+
+
+@pytest.mark.asyncio
+async def test_bridge_timestamp_is_validated_once_for_observed_and_operational_events(hermes_home):
+    store = _store(hermes_home)
+    adapter = _adapter(store=store)
+    valid_epoch = 1_725_000_000
+    expected = datetime.fromtimestamp(valid_epoch, tz=timezone.utc)
+    assert await adapter._build_message_event(_group_payload(timestamp=valid_epoch)) is None
+    [observed_entry] = store._entries.values()
+    [observed_row] = store.load_transcript(observed_entry.session_id, repair_alternation=False)
+    # The state.db schema stores its canonical UTC epoch as a numeric REAL.
+    assert observed_row["timestamp"] == valid_epoch
+
+    direct = await adapter._build_message_event(_dm_payload(timestamp=valid_epoch))
+    assert direct is not None
+    assert direct.timestamp == expected
+
+
+@pytest.mark.parametrize("value", [None, True, "1725000000", float("nan"), float("inf"), -1, 253402300800])
+def test_invalid_bridge_timestamp_uses_the_single_captured_receive_time(value):
+    received = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    assert WhatsAppAdapter._validated_bridge_timestamp({"timestamp": value}, received) == received
+
+
+def test_bridge_timestamp_rejects_epoch_zero_and_clock_skew_but_accepts_current_epoch():
+    received = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    current_epoch = int(received.timestamp()) - 1
+    far_future = int((received + timedelta(minutes=6)).timestamp())
+
+    assert WhatsAppAdapter._validated_bridge_timestamp({"timestamp": 0}, received) == received
+    assert WhatsAppAdapter._validated_bridge_timestamp({"timestamp": far_future}, received) == received
+    assert WhatsAppAdapter._validated_bridge_timestamp({"timestamp": current_epoch}, received) == datetime.fromtimestamp(
+        current_epoch, tz=timezone.utc,
+    )
 
 
 def test_existing_telegram_observed_context_keeps_its_stable_api_prefix():
