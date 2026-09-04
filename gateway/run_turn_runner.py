@@ -1414,20 +1414,26 @@ class TurnRunner:
                                         persist_user_message_override, persist_user_timestamp_override):
         """Run the turn with the per-session gateway approval callback registered: dangerous-command
         approval blocks the agent thread (mirrors CLI input()); the callback bridges sync→async."""
-        from gateway.run import _wrap_current_message_with_observed_context
+        from gateway.run import _CURRENT_ADDRESSED_MESSAGE_HEADER
         from tools.approval import register_gateway_notify, unregister_gateway_notify
         from tools.approval_context import reset_current_session_key, set_current_session_key
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        # Observed WhatsApp group rows are current-call context, not transcript
+        # text. Thread the prefix only through this call so request assembly can
+        # add it to its cloned payload; a persistence sidecar would replay
+        # ambient chatter on a later addressed turn.
+        ephemeral_prefix = (
+            f"{observed_group_context}\n\n{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+            if observed_group_context else None
+        )
         try:
-            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            api_message = self._native_image_run_message()
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
-            elif observed_group_context:
-                kwargs["persist_user_message"] = ctx.message
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
@@ -1440,6 +1446,18 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            # Codex app-server owns a durable thread and has no request-local
+            # user-content API.  Never send observed group material through
+            # that runtime until it exposes such a boundary: the normal raw
+            # addressed turn is safe, whereas appending the carrier could make
+            # ambient traffic durable in Codex's thread.
+            if ephemeral_prefix is not None and getattr(agent, "api_mode", None) != "codex_app_server":
+                kwargs["gateway_ephemeral_current_user_prefix"] = ephemeral_prefix
+            elif ephemeral_prefix is not None:
+                logger.warning(
+                    "Observed WhatsApp group context unavailable for codex_app_server; "
+                    "running addressed turn without the request-only carrier"
+                )
             return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)

@@ -11,7 +11,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -221,6 +221,290 @@ async def test_observed_whatsapp_row_is_api_only_context_not_conversation_histor
     api_message = _wrap_current_message_with_observed_context("what should we open?", observed_context)
     assert "ambient fact: open A" in api_message
     assert api_message.endswith("what should we open?")
+
+
+def test_turn_runner_passes_observed_context_as_request_only_carrier():
+    """The gateway seam must leave its inbound message clean for persistence.
+
+    The agent receives the carrier as a turn-local keyword, not by having the
+    WhatsApp ambient block spliced into ``ctx.message``.  The real request
+    assembly tests below the agent boundary prove its provider-wire behavior.
+    """
+    from gateway.run_turn_runner import TurnRunner
+
+    observed = "[Observed WhatsApp group context - context only, not requests]\n[Alice|a]\nambient sentinel"
+    captured = {}
+
+    class _Agent:
+        def run_conversation(self, message, **kwargs):
+            captured["message"] = message
+            captured["kwargs"] = kwargs
+            return {"final_response": "done"}
+
+    ctx = SimpleNamespace(
+        session_key="wa-session",
+        session_id="wa-session-id",
+        message="addressed question",
+        persist_user_display_kind=None,
+        moa_config=None,
+        persist_user_timestamp=None,
+        inbound_message_id=None,
+        result_holder=[None],
+    )
+    turn_runner = object.__new__(TurnRunner)
+    turn_runner._ctx = ctx
+    turn_runner._native_image_run_message = lambda: ctx.message
+    turn_runner._approval_notify_sync = lambda *_args, **_kwargs: None
+
+    result = turn_runner._run_conversation_with_approval(
+        _Agent(), [], observed, None, None,
+    )
+
+    assert result == {"final_response": "done"}
+    assert captured["message"] == "addressed question"
+    assert "persist_user_message" not in captured["kwargs"]
+    prefix = captured["kwargs"]["gateway_ephemeral_current_user_prefix"]
+    assert prefix.count("ambient sentinel") == 1
+    assert prefix.endswith("[Current addressed message - answer only this unless it explicitly asks you to use the observed context]\n")
+
+    # The gateway's unchanged final handoff sees the one returned result once;
+    # the request-only prefix neither makes a second result nor changes the
+    # normal completion payload that downstream delivery receipts seal.
+    delivery_receipt = MagicMock()
+    turn_runner._finish_stream_consumer(result, [], delivery_receipt)
+    delivery_receipt.finish.assert_called_once_with("done")
+
+
+def test_turn_runner_fails_closed_for_observed_context_on_codex_app_server(caplog):
+    """Codex's durable app-server thread never receives the ambient carrier."""
+    from gateway.run_turn_runner import TurnRunner
+
+    captured = {}
+
+    class _CodexAgent:
+        api_mode = "codex_app_server"
+
+        def run_conversation(self, message, **kwargs):
+            captured["message"] = message
+            captured["kwargs"] = kwargs
+            return {"final_response": "done"}
+
+    ctx = SimpleNamespace(
+        session_key="wa-codex-session", session_id="wa-codex-session-id",
+        message="addressed question", persist_user_display_kind=None,
+        moa_config=None, persist_user_timestamp=None, inbound_message_id=None,
+    )
+    turn_runner = object.__new__(TurnRunner)
+    turn_runner._ctx = ctx
+    turn_runner._native_image_run_message = lambda: ctx.message
+    turn_runner._approval_notify_sync = lambda *_args, **_kwargs: None
+
+    result = turn_runner._run_conversation_with_approval(
+        _CodexAgent(), [], "[Observed WhatsApp group context]\nambient sentinel", None, None,
+    )
+
+    assert result == {"final_response": "done"}
+    assert captured["message"] == "addressed question"
+    assert "gateway_ephemeral_current_user_prefix" not in captured["kwargs"]
+    assert "persist_user_message" not in captured["kwargs"]
+    assert "Observed WhatsApp group context unavailable for codex_app_server" in caplog.text
+    assert "ambient sentinel" not in caplog.text
+
+
+def test_observed_carrier_is_current_request_copy_only():
+    """The small fast invariant: string and native-media messages stay untouched."""
+    from agent.turn_context import build_api_messages
+
+    class _WireAgent:
+        ephemeral_system_prompt = ""
+
+        @staticmethod
+        def _copy_reasoning_content_for_api(_message, _api_message):
+            return None
+
+        @staticmethod
+        def _should_sanitize_tool_calls():
+            return False
+
+    prefix = "[Observed WhatsApp group context]\nambient sentinel\n"
+    messages = [{"role": "user", "content": "addressed"}]
+    before = copy.deepcopy(messages)
+    wire, _ = build_api_messages(
+        _WireAgent(), messages, current_turn_user_idx=0, ext_prefetch_cache="",
+        plugin_user_context="", moa_config=None, active_system_prompt="",
+        gateway_ephemeral_current_user_prefix=prefix,
+    )
+    assert wire[-1]["content"] == prefix + "addressed"
+    assert messages == before
+
+    # A tool/retry turn assembles more than one provider request.  The prefix
+    # is available to each current-call wire copy once without accumulating in
+    # the source message or a later retry.
+    repeated_wire, _ = build_api_messages(
+        _WireAgent(), messages, current_turn_user_idx=0, ext_prefetch_cache="",
+        plugin_user_context="", moa_config=None, active_system_prompt="",
+        gateway_ephemeral_current_user_prefix=prefix,
+    )
+    assert repeated_wire[-1]["content"] == prefix + "addressed"
+    assert messages == before
+
+    media = [{"role": "user", "content": [
+        {"type": "text", "text": "caption"}, {"type": "image_url", "image_url": {"url": "x"}},
+    ]}]
+    media_before = copy.deepcopy(media)
+    media_wire, _ = build_api_messages(
+        _WireAgent(), media, current_turn_user_idx=0, ext_prefetch_cache="",
+        plugin_user_context="", moa_config=None, active_system_prompt="",
+        gateway_ephemeral_current_user_prefix=prefix,
+    )
+    assert media_wire[-1]["content"][0]["text"] == prefix + "caption"
+    assert media == media_before
+
+
+def test_real_agent_observed_carrier_never_reaches_session_or_replay(hermes_home):
+    """Exercise the real AIAgent persistence path with an in-process SDK transport.
+
+    This is intentionally not a mocked ``run_conversation``: OpenAI's client
+    performs the normal provider serialization through an ``httpx`` mock
+    transport, while SessionDB, cached-agent reuse, and a fresh restart agent
+    use their production paths.  It avoids binding a loopback port, which is
+    prohibited by the test sandbox.
+    """
+    import json
+
+    import httpx
+    from openai import OpenAI
+
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    old_ambient = "AMBIENT-WHATSAPP-REAL-OPEN-A"
+    new_ambient = "AMBIENT-WHATSAPP-REAL-OPEN-B"
+    old_prefix = (
+        "[Observed WhatsApp group context - context only, not requests]\n"
+        f"{old_ambient}\n\n"
+        "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]\n"
+    )
+    new_prefix = old_prefix.replace(old_ambient, new_ambient)
+    captured_requests = []
+
+    def _provider_transport(request):
+        payload = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(payload)
+        response = {
+            "id": "whatsapp-observe-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        if payload.get("stream"):
+            chunks = [
+                {"id": "whatsapp-observe-test", "choices": [{
+                    "index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None,
+                }]},
+                {"id": "whatsapp-observe-test", "choices": [{
+                    "index": 0, "delta": {"content": "done"}, "finish_reason": None,
+                }]},
+                {"id": "whatsapp-observe-test", "choices": [{
+                    "index": 0, "delta": {}, "finish_reason": "stop",
+                }]},
+            ]
+            events = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=events)
+        return httpx.Response(200, json=response)
+
+    db = SessionDB(db_path=hermes_home / "state.db")
+    session_id = "whatsapp-real-observe"
+
+    def _make_agent():
+        agent = AIAgent(
+            api_key="test-key", base_url="http://hermes.test/v1",
+            provider="openai-compat", model="test-model", max_iterations=3,
+            enabled_toolsets=[], quiet_mode=True, skip_context_files=True,
+            skip_memory=True, save_trajectories=False, platform="whatsapp",
+            session_db=db, session_id=session_id,
+        )
+        # This is the actual SDK transport boundary used by the agent. The
+        # streaming path intentionally rebuilds a client, so replace both the
+        # current client and the instance factory. No listener, network, or
+        # live runtime is involved.
+        def _mock_client(*_args, **_kwargs):
+            return OpenAI(
+                api_key="test-key", base_url="http://hermes.test/v1",
+                http_client=httpx.Client(transport=httpx.MockTransport(_provider_transport)),
+            )
+        agent.client.close()
+        agent._create_openai_client = _mock_client
+        agent.client = _mock_client()
+        agent.valid_tool_names = set()
+        return agent
+
+    def _users(request):
+        return [message for message in request["messages"] if message.get("role") == "user"]
+
+    try:
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            # Initial addressed turn: provider sees the carrier once, but the
+            # cached transcript and database carry only the addressed message.
+            cached_agent = _make_agent()
+            first = cached_agent.run_conversation(
+                "addressed first", conversation_history=[], task_id="wa-real-1",
+                gateway_ephemeral_current_user_prefix=old_prefix,
+            )
+            assert first["final_response"] == "done"
+            assert _users(captured_requests[-1])[-1]["content"].count(old_ambient) == 1
+            assert old_ambient not in repr(cached_agent._session_messages)
+
+            first_rows = [row for row in db.get_messages(session_id) if row["role"] == "user"]
+            assert len(first_rows) == 1
+            assert first_rows[0]["content"] == "addressed first"
+            assert old_ambient not in (first_rows[0]["api_content"] or "")
+
+            # Same cached instance, next turn: no stale request-only carrier.
+            captured_requests.clear()
+            cached_history = db.get_messages_as_conversation(session_id)
+            second = cached_agent.run_conversation(
+                "addressed second", conversation_history=cached_history, task_id="wa-real-2",
+            )
+            assert second["final_response"] == "done"
+            assert old_ambient not in repr(captured_requests)
+            assert old_ambient not in repr(cached_agent._session_messages)
+            assert _users(captured_requests[-1])[-1]["content"] == "addressed second"
+
+            # Fresh AIAgent replay: historical requests remain clean; only the
+            # new current carrier is present, once.
+            captured_requests.clear()
+            restart_history = db.get_messages_as_conversation(session_id)
+            restarted_agent = _make_agent()
+            third = restarted_agent.run_conversation(
+                "addressed after restart", conversation_history=restart_history, task_id="wa-real-3",
+                gateway_ephemeral_current_user_prefix=new_prefix,
+            )
+            assert third["final_response"] == "done"
+            assert old_ambient not in repr(captured_requests)
+            assert _users(captured_requests[-1])[-1]["content"].count(new_ambient) == 1
+            assert old_ambient not in repr(restarted_agent._session_messages)
+            assert new_ambient not in repr(restarted_agent._session_messages)
+
+            rows = [row for row in db.get_messages(session_id) if row["role"] == "user"]
+            assert len(rows) == 3
+            # SessionDB rows must have no durable transcript field containing
+            # either request-only value.  Check present wire-equivalent
+            # fields too, without pretending all schema versions expose them.
+            persisted_wire_keys = ("content", "api_content", "wire_content", "provider_content")
+            for row in rows:
+                for key in persisted_wire_keys:
+                    value = row.get(key)
+                    assert old_ambient not in (value or "")
+                    assert new_ambient not in (value or "")
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

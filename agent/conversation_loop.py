@@ -1264,6 +1264,7 @@ class _LoopState:
     _should_review_memory: Any
     _plugin_user_context: Any
     _ext_prefetch_cache: Any
+    _gateway_ephemeral_current_user_prefix: Any
     # Turn-scoped state (rebound by the phases).
     messages: Any
     active_system_prompt: Any
@@ -1324,7 +1325,8 @@ class _LoopState:
 # _LoopState fields seeded from TurnContext (same name minus the leading underscore).
 _CTX_FIELDS = frozenset({
     "user_message", "original_user_message", "conversation_history", "effective_task_id", "turn_id",
-    "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache", "messages",
+    "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache",
+    "_gateway_ephemeral_current_user_prefix", "messages",
     "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
 })
 # Keyword names each phase helper takes (minus ``agent``), cached per function object.
@@ -1400,6 +1402,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    gateway_ephemeral_current_user_prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1433,6 +1436,7 @@ def run_conversation(
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
+            gateway_ephemeral_current_user_prefix=gateway_ephemeral_current_user_prefix,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
