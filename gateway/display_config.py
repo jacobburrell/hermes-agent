@@ -24,6 +24,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "long_running_notifications": True,
     "busy_ack_detail": True,
     "busy_steer_ack_enabled": True,  # busy_input_mode=steer echo; the text still lands in the run
+    # Background self-improvement notices: "off" keeps the review silent; "on" is the
+    # established generic notification default; "verbose" allows the review's detailed summary.
+    "memory_notifications": "on",
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
@@ -155,6 +158,7 @@ _NORMALISERS: dict[str, Any] = {
     "long_running_notifications": _norm_long_running,
     "busy_ack_detail": _norm_bool,
     "busy_steer_ack_enabled": _norm_bool,
+    "memory_notifications": _norm_tristate("on", "off", {"off", "on", "verbose"}),
     "thinking_progress": _norm_bool,
     "cleanup_progress": _norm_cleanup_progress,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
