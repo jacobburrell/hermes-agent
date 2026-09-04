@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -45,8 +46,18 @@ def _group_message(body="hello", **overrides):
         "mentionedIds": [],
         "botIds": ["15551230000@s.whatsapp.net", "15551230000@lid"],
         "quotedParticipant": "",
+        "quotedMessageId": None,
+        "quotedRemoteJid": "",
+        "hasQuotedMessage": False,
     }
     data.update(overrides)
+    if data["quotedParticipant"]:
+        if "hasQuotedMessage" not in overrides:
+            data["hasQuotedMessage"] = True
+        if "quotedMessageId" not in overrides:
+            data["quotedMessageId"] = "legacy-quoted-id"
+        if "quotedRemoteJid" not in overrides:
+            data["quotedRemoteJid"] = data["chatId"]
     return data
 
 
@@ -178,6 +189,88 @@ def test_group_gate_blocks_foreign_reply_and_mention_after_normalization():
     assert adapter._message_mentions_bot(mention) is False
     assert adapter._should_process_message(reply) is False
     assert adapter._should_process_message(mention) is False
+
+
+def test_group_reply_uses_chat_bound_outbound_id_proof_before_participant_alias():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    proved = _group_message(
+        "replying without participant metadata",
+        hasQuotedMessage=True,
+        quotedMessageId="jack-outbound-1",
+        quotedRemoteJid="120363001234567890@g.us",
+        quotedParticipant="",
+        quotedOutboundByJack=True,
+    )
+    assert adapter._message_is_reply_to_bot(proved) is True
+    assert adapter._should_process_message(proved) is True
+    event = asyncio.run(adapter._build_message_event({
+        **proved,
+        "messageId": "incoming-proved-reply",
+        "senderId": "15550001111@s.whatsapp.net",
+        "senderName": "Alice",
+        "chatName": "Test AI",
+        "hasMedia": False,
+        "mediaUrls": [],
+    }))
+    assert event is not None
+    assert event.reply_to_message_id == "jack-outbound-1"
+    assert event.reply_to_is_own_message is True
+
+    known_foreign = _group_message(
+        "participant claims Jack but ID is known foreign",
+        quotedParticipant="15551230000:8@s.whatsapp.net",
+        botIds=["15551230000@s.whatsapp.net"],
+        quotedOutboundByJack=False,
+    )
+    assert adapter._message_is_reply_to_bot(known_foreign) is False
+    assert adapter._should_process_message(known_foreign) is False
+
+
+def test_group_reply_fallback_is_narrow_and_chat_bound_after_restart():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+    fallback = _group_message(
+        "old native reply",
+        quotedParticipant="15551230000@s.whatsapp.net",
+        quotedOutboundByJack=None,
+    )
+    assert adapter._message_is_reply_to_bot(fallback) is True
+
+    absent_field = dict(fallback)
+    absent_field.pop("quotedOutboundByJack")
+    assert adapter._message_is_reply_to_bot(absent_field) is True
+
+    for blocked in (
+        {**fallback, "quotedRemoteJid": "120363009999999999@g.us"},
+        {
+            **fallback,
+            "quotedOutboundByJack": True,
+            "quotedRemoteJid": "120363009999999999@g.us",
+        },
+        {**fallback, "quotedMessageId": None},
+        {**fallback, "hasQuotedMessage": False},
+        {**fallback, "chatId": ""},
+        {**fallback, "fromMe": True},
+        {**fallback, "quotedOutboundByJack": "true"},
+        {
+            **_group_message("quoted text mentions Jack"),
+            "quotedText": "Jack Assistant said this",
+        },
+    ):
+        assert adapter._message_is_reply_to_bot(blocked) is False
+
+
+def test_group_reply_explicit_ownership_accepts_canonical_phone_and_lid_forms():
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+    for bot_id in ("123456789@lid", "15551234567@s.whatsapp.net"):
+        message = _group_message(
+            "proved reply",
+            botIds=[bot_id],
+            quotedParticipant=bot_id,
+            quotedOutboundByJack=True,
+        )
+        assert adapter._message_is_reply_to_bot(message) is True
+        assert adapter._should_process_message(message) is True
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():
@@ -323,4 +416,3 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-

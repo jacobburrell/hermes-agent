@@ -40,13 +40,14 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  drainMessageQueueForResponse,
   extractBridgeEvent,
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
   normalizeWhatsAppId,
-  pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  sendAndRememberBridgeOutbound,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -188,20 +189,14 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
   return chunks;
 }
 
-function rememberSentMessage(sent, payload) {
-  if (!sent?.key?.id) return;
-  if (sent.message) {
-    messageStore.remember(sent);
-    return;
-  }
-  const syntheticMessage = pollCreationMessageFromPayload(payload);
-  if (syntheticMessage) {
-    messageStore.remember({ ...sent, message: syntheticMessage });
-  }
-}
-
-function trackSentMessageId(sent) {
-  rememberSentId(sent?.key?.id);
+function sendHermesMessage(chatId, payload, options = {}) {
+  return sendAndRememberBridgeOutbound({
+    send: () => sendWithTimeout(chatId, payload, options),
+    messageStore,
+    chatId,
+    payload,
+    afterRemember: sent => rememberSentId(sent?.key?.id),
+  });
 }
 
 function redactWhatsAppId(value) {
@@ -722,6 +717,7 @@ async function startSocket() {
         senderNumber,
         botIds,
         isGroup,
+        messageStore,
         downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
@@ -816,7 +812,7 @@ app.use((req, res, next) => {
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
+  const msgs = drainMessageQueueForResponse(messageQueue);
   res.json(msgs);
 });
 
@@ -840,9 +836,7 @@ app.post('/send', async (req, res) => {
         replyTo: i === 0 ? replyTo : undefined,
         messageStore,
       });
-      const sent = await sendWithTimeout(chatId, payload, options);
-      trackSentMessageId(sent);
-      messageStore.remember(sent);
+      const sent = await sendHermesMessage(chatId, payload, options);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
@@ -875,11 +869,10 @@ app.post('/edit', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
 
-    await sendWithTimeout(chatId, { text: chunks[0], edit: key });
+    await sendHermesMessage(chatId, { text: chunks[0], edit: key });
     if (chunks.length > 1) {
       for (let i = 1; i < chunks.length; i += 1) {
-        const sent = await sendWithTimeout(chatId, { text: chunks[i] });
-        trackSentMessageId(sent);
+        const sent = await sendHermesMessage(chatId, { text: chunks[i] });
         if (sent?.key?.id) messageIds.push(sent.key.id);
         if (i < chunks.length - 1) {
           await sleep(CHUNK_DELAY_MS);
@@ -983,9 +976,7 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sendWithTimeout(chatId, msgPayload);
-    trackSentMessageId(sent);
-    messageStore.remember(sent);
+    const sent = await sendHermesMessage(chatId, msgPayload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1007,9 +998,7 @@ app.post('/send-poll', async (req, res) => {
 
   try {
     const payload = buildPollPayload({ question, options, selectableCount });
-    const sent = await sendWithTimeout(chatId, payload);
-    trackSentMessageId(sent);
-    rememberSentMessage(sent, payload);
+    const sent = await sendHermesMessage(chatId, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1029,9 +1018,7 @@ app.post('/send-location', async (req, res) => {
 
   try {
     const payload = buildLocationPayload({ latitude, longitude, name, address });
-    const sent = await sendWithTimeout(chatId, payload);
-    trackSentMessageId(sent);
-    messageStore.remember(sent);
+    const sent = await sendHermesMessage(chatId, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });

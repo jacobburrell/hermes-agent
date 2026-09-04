@@ -50,11 +50,11 @@ export function getContextInfo(messageContent) {
 export function createBoundedMessageStore(limit = 512) {
   const byId = new Map();
 
-  function remember(msg) {
+  function remember(msg, { outboundByJack = false } = {}) {
     const id = msg?.key?.id;
     if (!id) return;
     byId.delete(id);
-    byId.set(id, msg);
+    byId.set(id, { msg, outboundByJack: outboundByJack === true });
     while (byId.size > limit) {
       const oldest = byId.keys().next().value;
       byId.delete(oldest);
@@ -63,13 +63,59 @@ export function createBoundedMessageStore(limit = 512) {
 
   function get(id) {
     if (!id || !byId.has(id)) return null;
-    const msg = byId.get(id);
+    const entry = byId.get(id);
     byId.delete(id);
-    byId.set(id, msg);
-    return msg;
+    byId.set(id, entry);
+    return entry.msg;
   }
 
-  return { remember, get };
+  function quotedOutboundByJack(id, chatId) {
+    if (!id || !byId.has(id)) return null;
+    const entry = byId.get(id);
+    if (!entry.outboundByJack) return false;
+    const outboundChat = normalizeWhatsAppId(entry.msg?.key?.remoteJid || '');
+    const inboundChat = normalizeWhatsAppId(chatId || '');
+    return Boolean(outboundChat && inboundChat && outboundChat === inboundChat);
+  }
+
+  return { remember, get, quotedOutboundByJack };
+}
+
+export function drainMessageQueueForResponse(messageQueue) {
+  return messageQueue.splice(0, messageQueue.length);
+}
+
+export function rememberBridgeOutboundMessage(messageStore, sent, { chatId, payload } = {}) {
+  if (!messageStore || !sent?.key?.id) return false;
+  const remoteJid = normalizeWhatsAppId(sent.key.remoteJid || chatId || '');
+  if (!remoteJid) return false;
+  const syntheticMessage = sent.message ? null : pollCreationMessageFromPayload(payload);
+  messageStore.remember(
+    {
+      ...sent,
+      key: { ...sent.key, remoteJid },
+      ...(syntheticMessage ? { message: syntheticMessage } : {}),
+    },
+    { outboundByJack: true },
+  );
+  return true;
+}
+
+export async function sendAndRememberBridgeOutbound({
+  send,
+  messageStore,
+  chatId,
+  payload,
+  afterRemember,
+} = {}) {
+  if (typeof send !== 'function') throw new TypeError('send is required');
+  // Await first: a rejected/failed transport must never manufacture an
+  // ownership record that could admit a later quoted message.
+  const sent = await send();
+  if (rememberBridgeOutboundMessage(messageStore, sent, { chatId, payload })) {
+    if (typeof afterRemember === 'function') afterRemember(sent);
+  }
+  return sent;
 }
 
 export function pollCreationMessageSecret(pollCreation) {
@@ -310,6 +356,7 @@ export async function extractBridgeEvent({
   senderNumber,
   botIds = [],
   isGroup = false,
+  messageStore,
   downloadMedia,
   writeMediaFile,
   cacheDirs = {},
@@ -322,6 +369,16 @@ export async function extractBridgeEvent({
   const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
   const hasQuotedMessage = !!contextInfo?.quotedMessage;
   const quotedText = textFromQuotedMessage(contextInfo?.quotedMessage);
+  let quotedOutboundByJack = null;
+  if (quotedMessageId) {
+    const inboundChat = normalizeWhatsAppId(chatId || '');
+    const quotedChat = quotedRemoteJid || inboundChat;
+    if (msg?.key?.fromMe || !inboundChat || quotedChat !== inboundChat) {
+      quotedOutboundByJack = false;
+    } else if (typeof messageStore?.quotedOutboundByJack === 'function') {
+      quotedOutboundByJack = messageStore.quotedOutboundByJack(quotedMessageId, inboundChat);
+    }
+  }
 
   let body = '';
   let hasMedia = false;
@@ -489,6 +546,7 @@ export async function extractBridgeEvent({
     quotedRemoteJid,
     quotedText,
     hasQuotedMessage,
+    quotedOutboundByJack,
     botIds,
     readReceiptKey: {
       remoteJid: msg.key.remoteJid || chatId,

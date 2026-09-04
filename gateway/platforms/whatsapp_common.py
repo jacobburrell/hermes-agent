@@ -234,6 +234,34 @@ class WhatsAppBehaviorMixin:
         return {nid for c in (data.get("botIds") or []) if (nid := self._normalize_whatsapp_id(c))}
 
     def _message_is_reply_to_bot(self, data: Dict[str, Any]) -> bool:
+        if (
+            data.get("fromMe")
+            or not data.get("hasQuotedMessage")
+            or not str(data.get("quotedMessageId") or "").strip()
+        ):
+            return False
+
+        current_chat = self._normalize_whatsapp_id(data.get("chatId"))
+        if not current_chat:
+            return False
+        quoted_chat = self._normalize_whatsapp_id(data.get("quotedRemoteJid"))
+        if quoted_chat and quoted_chat != current_chat:
+            return False
+
+        # A bridge-side, chat-bound outbound-ID record is authoritative.  A
+        # known foreign ID must never be rescued by participant aliases.
+        ownership = data.get("quotedOutboundByJack")
+        if ownership is True:
+            return True
+        if ownership is False:
+            return False
+        if "quotedOutboundByJack" in data and ownership is not None:
+            return False
+
+        # Compatibility/restart fallback: older bridges and an in-memory
+        # messageStore after restart cannot prove old outbound IDs.  Retain
+        # only the prior participant-alias check, with real quote metadata and
+        # the chat-binding guard above.  Quoted text is never evidence.
         quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))
         return bool(quoted_participant) and quoted_participant in self._bot_ids_from_message(data)
 

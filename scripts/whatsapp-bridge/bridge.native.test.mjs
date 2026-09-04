@@ -16,6 +16,7 @@ import {
   buildPollPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  drainMessageQueueForResponse,
   appendMediaFailureNote,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -23,6 +24,8 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  rememberBridgeOutboundMessage,
+  sendAndRememberBridgeOutbound,
 } from './bridge_helpers.js';
 
 // -- inbound read receipts ------------------------------------------------
@@ -117,8 +120,130 @@ import {
   console.log('  ✓ unresolved replyTo falls back to plain text');
 }
 
+// -- chat-bound outbound ownership ----------------------------------------
+{
+  const store = createBoundedMessageStore(2);
+  const jackSent = {
+    key: {
+      id: 'jack-outbound-1',
+      remoteJid: '15551234567:47@s.whatsapp.net',
+      fromMe: true,
+    },
+    message: { conversation: 'Jack answer' },
+  };
+  assert.equal(
+    rememberBridgeOutboundMessage(store, jackSent, {
+      chatId: '15551234567@s.whatsapp.net',
+      payload: { text: 'Jack answer' },
+    }),
+    true,
+  );
+  assert.equal(
+    store.quotedOutboundByJack('jack-outbound-1', '15551234567@s.whatsapp.net'),
+    true,
+  );
+  assert.equal(
+    store.quotedOutboundByJack('jack-outbound-1', '15550009999@s.whatsapp.net'),
+    false,
+  );
+  assert.equal(store.get('jack-outbound-1').message.conversation, 'Jack answer');
+
+  store.remember({
+    key: {
+      id: 'owner-typed-1',
+      remoteJid: '15551234567@s.whatsapp.net',
+      fromMe: true,
+    },
+    message: { conversation: 'Owner typed this' },
+  });
+  assert.equal(
+    store.quotedOutboundByJack('owner-typed-1', '15551234567@s.whatsapp.net'),
+    false,
+  );
+
+  // A later inbound record with a colliding Baileys ID overwrites the
+  // provenance instead of inheriting the successful-send proof.
+  store.remember({
+    key: {
+      id: 'jack-outbound-1',
+      remoteJid: '15551234567@s.whatsapp.net',
+      fromMe: false,
+    },
+    message: { conversation: 'Inbound collision' },
+  });
+  assert.equal(
+    store.quotedOutboundByJack('jack-outbound-1', '15551234567@s.whatsapp.net'),
+    false,
+  );
+  assert.equal(store.quotedOutboundByJack('missing-after-restart', '15551234567@s.whatsapp.net'), null);
+
+  // The same bound applies to a send result whose Baileys response omitted
+  // message content; poll payloads retain a synthetic quoteable message.
+  const pollPayload = buildPollPayload({
+    question: 'Proceed?', options: ['Yes', 'No'], selectableCount: 1,
+  });
+  assert.equal(
+    rememberBridgeOutboundMessage(store, {
+      key: { id: 'jack-poll-1', remoteJid: '123456789:8@lid', fromMe: true },
+    }, { chatId: '123456789@lid', payload: pollPayload }),
+    true,
+  );
+  assert.equal(store.quotedOutboundByJack('jack-poll-1', '123456789@lid'), true);
+  assert.ok(store.get('jack-poll-1').message.pollCreationMessageV3);
+
+  // Capacity eviction is the intentional restart/old-message fallback state.
+  assert.equal(store.quotedOutboundByJack('owner-typed-1', '15551234567@s.whatsapp.net'), null);
+  assert.equal(rememberBridgeOutboundMessage(store, null, { chatId: 'x' }), false);
+  console.log('  ✓ messageStore proves only chat-bound bridge outbound IDs');
+}
+
+{
+  const store = createBoundedMessageStore(4);
+  const sent = {
+    key: { id: 'successful-send', remoteJid: '120363001234567890@g.us', fromMe: true },
+    message: { imageMessage: { caption: 'photo reply' } },
+  };
+  const tracked = [];
+  assert.equal(
+    await sendAndRememberBridgeOutbound({
+      send: async () => sent,
+      messageStore: store,
+      chatId: '120363001234567890@g.us',
+      payload: { image: Buffer.from('image'), caption: 'photo reply' },
+      afterRemember: result => tracked.push(result.key.id),
+    }),
+    sent,
+  );
+  assert.deepEqual(tracked, ['successful-send']);
+  assert.equal(store.quotedOutboundByJack('successful-send', '120363001234567890@g.us'), true);
+  assert.equal(store.get('successful-send').message.imageMessage.caption, 'photo reply');
+
+  await assert.rejects(
+    sendAndRememberBridgeOutbound({
+      send: async () => { throw new Error('send failed'); },
+      messageStore: store,
+      chatId: '120363001234567890@g.us',
+      payload: { text: 'never sent' },
+      afterRemember: () => tracked.push('should-not-run'),
+    }),
+    /send failed/,
+  );
+  assert.equal(store.quotedOutboundByJack('failed-send', '120363001234567890@g.us'), null);
+  assert.deepEqual(tracked, ['successful-send']);
+  console.log('  ✓ only successful text/media send results create ownership records');
+}
+
 // -- inbound quote/media/native metadata --------------------------------
 {
+  const ownershipStore = createBoundedMessageStore(4);
+  rememberBridgeOutboundMessage(ownershipStore, {
+    key: {
+      id: 'outbound-1',
+      remoteJid: '15551234567:47@s.whatsapp.net',
+      fromMe: true,
+    },
+    message: { conversation: 'approve deploy?' },
+  }, { chatId: '15551234567@s.whatsapp.net' });
   const event = await extractBridgeEvent({
     msg: {
       key: {
@@ -145,6 +270,7 @@ import {
     senderId: '15550001111@s.whatsapp.net',
     senderNumber: '15550001111',
     botIds: ['15559998888@s.whatsapp.net'],
+    messageStore: ownershipStore,
     downloadMedia: async () => Buffer.from(''),
   });
 
@@ -159,8 +285,133 @@ import {
     fromMe: false,
   });
   assert.equal(event.hasQuotedMessage, true);
+  assert.equal(event.quotedOutboundByJack, true);
   assert.equal(event.body, 'approved');
-  console.log('  ✓ inbound quoted metadata includes quoted text');
+  console.log('  ✓ inbound quoted metadata carries same-chat outbound ownership proof');
+}
+
+{
+  const ownershipStore = createBoundedMessageStore(4);
+  rememberBridgeOutboundMessage(ownershipStore, {
+    key: {
+      id: 'outbound-before-photo',
+      remoteJid: '120363001234567890@g.us',
+      fromMe: true,
+    },
+    message: { conversation: 'send the photo' },
+  }, { chatId: '120363001234567890@g.us' });
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-photo-reply',
+        remoteJid: '120363001234567890@g.us',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      messageTimestamp: 124,
+      message: {
+        imageMessage: {
+          caption: 'here it is',
+          mimetype: 'image/jpeg',
+          contextInfo: {
+            stanzaId: 'outbound-before-photo',
+            participant: '15559998888:7@s.whatsapp.net',
+            remoteJid: '120363001234567890@g.us',
+            quotedMessage: { conversation: 'send the photo' },
+          },
+        },
+      },
+    },
+    chatId: '120363001234567890@g.us',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: ['15559998888@s.whatsapp.net'],
+    messageStore: ownershipStore,
+    downloadMedia: async () => Buffer.from('jpeg'),
+    writeMediaFile: async () => '/tmp/reply.jpg',
+  });
+
+  assert.equal(event.hasMedia, true);
+  assert.equal(event.mediaType, 'image');
+  assert.equal(event.quotedOutboundByJack, true);
+  assert.deepEqual(event.mediaUrls, ['/tmp/reply.jpg']);
+  console.log('  ✓ native media replies retain same-chat outbound ownership proof');
+}
+
+{
+  const ownershipStore = createBoundedMessageStore(4);
+  rememberBridgeOutboundMessage(ownershipStore, {
+    key: { id: 'known-jack-id', remoteJid: '15551110000@s.whatsapp.net', fromMe: true },
+    message: { conversation: 'Jack in another chat' },
+  }, { chatId: '15551110000@s.whatsapp.net' });
+  ownershipStore.remember({
+    key: { id: 'known-foreign-id', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+    message: { conversation: 'Not Jack' },
+  });
+  ownershipStore.remember({
+    key: { id: 'known-foreign-poll', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+    message: { pollCreationMessage: { name: 'Not Jack poll' } },
+  });
+  rememberBridgeOutboundMessage(ownershipStore, {
+    key: { id: 'known-jack-here', remoteJid: '15551234567@s.whatsapp.net', fromMe: true },
+    message: { conversation: 'Jack in this chat' },
+  }, { chatId: '15551234567@s.whatsapp.net' });
+
+  async function quotedEvent({ stanzaId, remoteJid = '15551234567@s.whatsapp.net', fromMe = false }) {
+    return extractBridgeEvent({
+      msg: {
+        key: {
+          id: `incoming-${stanzaId}`,
+          remoteJid: '15551234567@s.whatsapp.net',
+          participant: '15550001111@s.whatsapp.net',
+          fromMe,
+        },
+        pushName: 'Tester',
+        messageTimestamp: 123,
+        message: {
+          extendedTextMessage: {
+            text: 'reply body',
+            contextInfo: {
+              stanzaId,
+              participant: '15559998888:9@s.whatsapp.net',
+              remoteJid,
+              quotedMessage: { conversation: 'untrusted quoted text' },
+            },
+          },
+        },
+      },
+      chatId: '15551234567@s.whatsapp.net',
+      senderId: '15550001111@s.whatsapp.net',
+      senderNumber: '15550001111',
+      botIds: ['15559998888@s.whatsapp.net'],
+      messageStore: ownershipStore,
+    });
+  }
+
+  const proved = await quotedEvent({ stanzaId: 'known-jack-here' });
+  const crossChat = await quotedEvent({ stanzaId: 'known-jack-id' });
+  const foreign = await quotedEvent({ stanzaId: 'known-foreign-id' });
+  const foreignPoll = await quotedEvent({ stanzaId: 'known-foreign-poll' });
+  const missing = await quotedEvent({ stanzaId: 'missing-after-restart' });
+  assert.equal(proved.quotedOutboundByJack, true);
+  assert.equal(crossChat.quotedOutboundByJack, false);
+  assert.equal(foreign.quotedOutboundByJack, false);
+  assert.equal(foreignPoll.quotedOutboundByJack, false);
+  assert.equal(missing.quotedOutboundByJack, null);
+  assert.equal((await quotedEvent({
+    stanzaId: 'missing-after-restart', remoteJid: '15551110000@s.whatsapp.net',
+  })).quotedOutboundByJack, false);
+  assert.equal((await quotedEvent({ stanzaId: 'known-jack-id', fromMe: true })).quotedOutboundByJack, false);
+  const responseQueue = [proved, foreign, missing];
+  const serializedMessagesResponse = JSON.parse(JSON.stringify(
+    drainMessageQueueForResponse(responseQueue),
+  ));
+  assert.deepEqual(
+    serializedMessagesResponse.map(event => event.quotedOutboundByJack),
+    [true, false, null],
+  );
+  assert.equal(responseQueue.length, 0);
+  console.log('  ✓ foreign, cross-chat, restart-missing, and self-echo quote verdicts fail closed');
 }
 
 {
@@ -188,6 +439,7 @@ import {
   assert.equal(event.mime, 'application/pdf');
   assert.equal(event.fileName, 'report.pdf');
   assert.equal(event.nativeType, 'documentMessage');
+  assert.equal(event.quotedOutboundByJack, null);
   assert.deepEqual(event.mediaUrls, ['/tmp/report.pdf']);
   console.log('  ✓ inbound document metadata preserves MIME and filename');
 }
