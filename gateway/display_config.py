@@ -24,6 +24,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "long_running_notifications": True,
     "busy_ack_detail": True,
     "busy_steer_ack_enabled": True,  # busy_input_mode=steer echo; the text still lands in the run
+    # Background self-improvement notices: preserve the established default on platforms that
+    # have not selected a quieter policy. WhatsApp overrides this below to final-answer-first.
+    "memory_notifications": "on",
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
@@ -58,7 +61,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "feishu": _TIER_MEDIUM,
     "buzz": _TIER_MEDIUM,  # Nostr: edits in place but channels are shared community spaces
     "signal": _TIER_LOW,
-    "whatsapp": _TIER_MEDIUM,  # Baileys bridge supports /edit
+    "whatsapp": {**_TIER_MEDIUM, "memory_notifications": "off"},  # Baileys bridge supports /edit
     "whatsapp_cloud": _TIER_LOW,  # adapter lacks edit_message; promote once it lands
     "photon": _TIER_LOW,  # permanent-message iMessage inboxes (no edit)
     "bluebubbles": _TIER_LOW,
@@ -78,32 +81,69 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
+def _builtin_display_default(platform_key: str, setting: str, fallback: Any) -> Any:
+    """Return the platform policy, falling back to the generic built-in default."""
+    value = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
+    if value is None:
+        value = _GLOBAL_DEFAULTS.get(setting)
+    return fallback if value is None else value
+
+
 def resolve_display_setting(user_config: dict, platform_key: str, setting: str, fallback: Any = None) -> Any:
     """Resolve a display setting with per-platform override support (see module docstring for order).
 
     ``platform_key`` is the platform config key (``"telegram"``; see ``_platform_config_key`` in
     gateway/run.py). Returns *fallback* when nothing is configured.
     """
-    display_cfg = user_config.get("display") or {}
-    plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
-    if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
-        return _normalise(setting, plat_overrides[setting])
+    display_value = user_config.get("display") if isinstance(user_config, dict) else None
+    display_cfg = display_value if isinstance(display_value, dict) else {}
+    platforms_value = display_cfg.get("platforms")
+    platforms_cfg = platforms_value if isinstance(platforms_value, dict) else {}
+    has_platform_stanza = platform_key in platforms_cfg
+    plat_overrides = platforms_cfg.get(platform_key)
+    if isinstance(plat_overrides, dict) and setting in plat_overrides:
+        value = plat_overrides[setting]
+        if _valid_display_value(setting, value):
+            return _normalise(setting, value)
+        if setting == "memory_notifications":
+            # A present invalid override is an explicit but unusable platform policy. Do not let a
+            # global setting re-enable WhatsApp's transient review chatter.
+            return _builtin_display_default(platform_key, setting, fallback)
+    elif has_platform_stanza and not isinstance(plat_overrides, dict) and setting == "memory_notifications":
+        # A non-mapping platform stanza is likewise an invalid platform policy. A valid mapping
+        # that merely omits this key continues through to the valid global setting below.
+        return _builtin_display_default(platform_key, setting, fallback)
     if setting == "tool_progress":  # legacy display.tool_progress_overrides.<platform>
         legacy = display_cfg.get("tool_progress_overrides")
         if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
             return _normalise(setting, legacy[platform_key])
     if setting != "streaming" and display_cfg.get(setting) is not None:  # display.streaming is CLI-only
-        return _normalise(setting, display_cfg[setting])
-    val = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
-    if val is None:
-        val = _GLOBAL_DEFAULTS.get(setting)
-    return fallback if val is None else val
+        value = display_cfg[setting]
+        if _valid_display_value(setting, value):
+            return _normalise(setting, value)
+    return _builtin_display_default(platform_key, setting, fallback)
 
 
 # --- Normalisation of YAML quirks (bare ``off`` → False in YAML 1.1, etc.) ---
 
 _TRUTHY = {"true", "1", "yes", "on"}
 _FALSY = {"false", "0", "no"}
+
+
+def _valid_display_value(setting: str, value: Any) -> bool:
+    """Whether *value* may override the built-in policy for *setting*.
+
+    Memory notifications are strict because permissive tri-state normalization turns unknown input
+    into ``on``. Invalid generic input falls through to the built-in platform policy; an invalid
+    platform override is handled above so WhatsApp fails quiet.
+    """
+    if setting != "memory_notifications":
+        return True
+    if isinstance(value, bool):
+        return True
+    return isinstance(value, str) and value.strip().lower() in (
+        _TRUTHY | _FALSY | {"off", "verbose"}
+    )
 
 
 def _norm_tristate(on: str, off: str, choices: set, extra_truthy: set = frozenset()):
@@ -155,6 +195,7 @@ _NORMALISERS: dict[str, Any] = {
     "long_running_notifications": _norm_long_running,
     "busy_ack_detail": _norm_bool,
     "busy_steer_ack_enabled": _norm_bool,
+    "memory_notifications": _norm_tristate("on", "off", {"off", "on", "verbose"}),
     "thinking_progress": _norm_bool,
     "cleanup_progress": _norm_cleanup_progress,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),

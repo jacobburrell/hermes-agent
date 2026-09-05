@@ -1,5 +1,7 @@
 """Tests for gateway.display_config — per-platform display/verbosity resolver."""
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Resolver: resolution order
@@ -50,6 +52,80 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_memory_notifications_valid_platform_override_wins_and_is_scoped(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+        assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
+
+    def test_memory_notifications_valid_platform_mapping_missing_key_inherits_global(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "verbose",
+                "platforms": {"whatsapp": {"tool_progress": "off"}},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "verbose"
+
+    def test_memory_notifications_whatsapp_default_is_quiet_but_other_platforms_remain_on(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "whatsapp", "memory_notifications") == "off"
+        assert resolve_display_setting({}, "discord", "memory_notifications") == "on"
+
+    @pytest.mark.parametrize("invalid_override", ["banana", None, ["off"]])
+    def test_invalid_whatsapp_memory_override_fails_quiet_before_global_setting(
+        self, invalid_override,
+    ):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": invalid_override}},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+
+    @pytest.mark.parametrize("invalid_stanza", ["invalid", [], None])
+    def test_nonmapping_whatsapp_platform_stanza_fails_quiet(self, invalid_stanza):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": invalid_stanza},
+            }
+        }
+
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+
+    @pytest.mark.parametrize("invalid_display", ["invalid", ["on"]])
+    def test_nonmapping_display_uses_platform_builtin(self, invalid_display):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting(
+            {"display": invalid_display}, "whatsapp", "memory_notifications"
+        ) == "off"
+
+    def test_invalid_generic_memory_value_uses_platform_builtin(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"memory_notifications": ["off"]}}
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == "off"
+        assert resolve_display_setting(config, "discord", "memory_notifications") == "on"
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
@@ -88,6 +164,20 @@ class TestYAMLNormalisation:
 
         config = {"display": {"tool_progress": False}}
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(False, "off"), (True, "on"), ("verbose", "verbose"), ("NO", "off")],
+    )
+    def test_memory_notifications_normalisation(self, configured, expected):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {"whatsapp": {"memory_notifications": configured}},
+            }
+        }
+        assert resolve_display_setting(config, "whatsapp", "memory_notifications") == expected
 
 
     def test_only_long_running_visibility_accepts_generic_mode(self):
@@ -325,5 +415,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 

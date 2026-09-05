@@ -288,24 +288,30 @@ After a turn, the background self-improvement review may quietly save a memory
 or update a skill. This is Hermes' consent-aware learning loop: repeated
 corrections and durable workflow lessons become compact memory entries or
 procedural skills, while `write_approval` can stage those writes for review
-before they affect future sessions. By default it surfaces a short
-`💾 Memory updated` line in chat so you know it happened. Control how chatty
-that is:
+before they affect future sessions. By default, gateway platforms other than
+WhatsApp surface a short `💾 Memory updated` line so you know it happened.
+WhatsApp is final-answer-first: its built-in default runs the review silently.
+Control how chatty that is:
 
 ```yaml
 display:
-  memory_notifications: on    # off | on (default) | verbose
+  memory_notifications: "on"  # Global default for platforms without an override.
+  platforms:
+    whatsapp:
+      memory_notifications: "off"
 ```
 
 | Value | Behaviour |
 |-------|-----------|
 | `off` | No chat notification. The review still runs and still writes — you just don't see a line for it. |
-| `on` (default) | Generic line, e.g. `💾 Memory updated`, `💾 Skill 'foo' patched`. |
+| `on` (default except WhatsApp) | Generic line, e.g. `💾 Memory updated`, `💾 Skill 'foo' patched`. |
 | `verbose` | Includes a compact preview of what changed, e.g. `💾 Memory ➕ User prefers terse replies` or a `"old" → "new"` skill diff snippet. |
 
 > This only governs the **gateway** chat notification. The review itself, and
 > writes to your memory/skill stores, are unaffected by this setting. Set it
-> per-platform via `display.platforms.<platform>.memory_notifications`.
+> per-platform via `display.platforms.<platform>.memory_notifications`. An
+> explicit global value applies to WhatsApp too, so keep the quoted WhatsApp
+> `"off"` override shown above when the global setting is `"on"`.
 
 ## Running the review on a cheaper model (`auxiliary.background_review`)
 

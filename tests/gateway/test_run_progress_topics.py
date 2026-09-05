@@ -5,6 +5,8 @@ import importlib
 import sys
 import time
 import types
+from collections import OrderedDict
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -956,13 +958,25 @@ class QueuedFailedEmptyAgent:
 
 
 class BackgroundReviewAgent:
+    callbacks = []
+    notification_modes = []
+
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
+        self.memory_notifications = kwargs.get("memory_notifications", "on")
         self.tools = []
 
+    def _safe_print(self, *args, **kwargs):
+        return None
+
     def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
-        if self.background_review_callback:
-            self.background_review_callback("💾 Skill 'prospect-scanner' created.")
+        type(self).callbacks.append(self.background_review_callback)
+        type(self).notification_modes.append(self.memory_notifications)
+        # Exercise the real background-review publisher rather than invoking the gateway callback
+        # directly. It emits only when the current turn has a visible callback rail.
+        from agent.background_review import _publish_review_summary
+
+        _publish_review_summary(self, ["Skill 'prospect-scanner' created."])
         return {
             "final_response": "done",
             "messages": [],
@@ -999,6 +1013,7 @@ async def _run_with_agent(
     session_id,
     pending_text=None,
     config_data=None,
+    raw_config=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
     chat_type="group",
@@ -1007,7 +1022,9 @@ async def _run_with_agent(
     user_id=None,
     scope_id=None,
 ):
-    if config_data:
+    if raw_config is not None:
+        (tmp_path / "config.yaml").write_text(raw_config, encoding="utf-8")
+    elif config_data:
         import yaml
 
         (tmp_path / "config.yaml").write_text(yaml.dump(config_data), encoding="utf-8")
@@ -1383,6 +1400,8 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
 
 @pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1392,7 +1411,399 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
     )
 
     assert result["final_response"] == "done"
+    assert callable(BackgroundReviewAgent.callbacks[0])
+    assert BackgroundReviewAgent.notification_modes == ["on"]
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_memory_notifications_off_preserves_final_and_has_no_status_rail(
+    monkeypatch, tmp_path,
+):
+    """The real review publisher stays silent while the final answer remains unchanged."""
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    session_key = "agent:main:whatsapp:group:-1001:17585"
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-whatsapp-review-off",
+        config_data={
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        },
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert BackgroundReviewAgent.callbacks == [None]
+    assert BackgroundReviewAgent.notification_modes == ["off"]
+    assert session_key not in adapter._post_delivery_callbacks
+    assert adapter.sent == []
+
+    await adapter.send("-1001", result["final_response"])
+    assert [call["content"] for call in adapter.sent] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_yaml_keeps_whatsapp_review_status_quiet(monkeypatch, tmp_path):
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-whatsapp-review-malformed",
+        raw_config="display:\n  memory_notifications: [unterminated\n",
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert BackgroundReviewAgent.callbacks == [None]
+    assert BackgroundReviewAgent.notification_modes == ["off"]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_whatsapp_display_stanza_cannot_reenable_review_status(
+    monkeypatch, tmp_path,
+):
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-whatsapp-review-invalid-stanza",
+        config_data={
+            "display": {
+                "memory_notifications": "on",
+                "platforms": {"whatsapp": "invalid"},
+            }
+        },
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert BackgroundReviewAgent.callbacks == [None]
+    assert BackgroundReviewAgent.notification_modes == ["off"]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_memory_notifications_resolve_from_each_source_profile(
+    monkeypatch, tmp_path,
+):
+    """Opposing multiplex profiles are loaded at each source-scoped turn boundary."""
+    import yaml
+
+    quiet_home = tmp_path / "profiles" / "quiet"
+    visible_home = tmp_path / "profiles" / "visible"
+    quiet_home.mkdir(parents=True)
+    visible_home.mkdir(parents=True)
+    (quiet_home / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    (visible_home / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "on"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = BackgroundReviewAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+
+    adapter = ProgressCaptureAdapter(platform=Platform.WHATSAPP)
+    runner = _make_runner(adapter)
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {
+        "quiet": {Platform.WHATSAPP: adapter},
+        "visible": {Platform.WHATSAPP: adapter},
+    }
+    homes = {"quiet": quiet_home, "visible": visible_home}
+    monkeypatch.setattr(runner, "_resolve_profile_home_for_source", lambda source: homes[source.profile])
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    quiet_source = SessionSource(
+        platform=Platform.WHATSAPP, chat_id="quiet-chat", profile="quiet",
+    )
+    visible_source = SessionSource(
+        platform=Platform.WHATSAPP, chat_id="visible-chat", profile="visible",
+    )
+    quiet_result = await runner._run_agent(
+        message="quiet", context_prompt="", history=[], source=quiet_source,
+        session_id="sess-quiet-profile", session_key="agent:quiet:whatsapp:dm:quiet-chat",
+    )
+    visible_result = await runner._run_agent(
+        message="visible", context_prompt="", history=[], source=visible_source,
+        session_id="sess-visible-profile", session_key="agent:visible:whatsapp:dm:visible-chat",
+    )
+
+    assert quiet_result["final_response"] == visible_result["final_response"] == "done"
+    assert BackgroundReviewAgent.callbacks[0] is None
+    assert callable(BackgroundReviewAgent.callbacks[1])
+    assert BackgroundReviewAgent.notification_modes == ["off", "on"]
+    assert "agent:quiet:whatsapp:dm:quiet-chat" not in adapter._post_delivery_callbacks
+    assert callable(adapter.pop_post_delivery_callback("agent:visible:whatsapp:dm:visible-chat"))
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_multiplex_review_delivery_reloads_exact_source_profile_managed_overlay(
+    monkeypatch, tmp_path,
+):
+    """Managed WhatsApp off wins when the queued status rechecks its source profile."""
+    import yaml
+    from hermes_cli import managed_scope
+
+    source_home = tmp_path / "profiles" / "visible"
+    source_home.mkdir(parents=True)
+    (source_home / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "on"}}}}),
+        encoding="utf-8",
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    managed_scope.invalidate_managed_cache()
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = BackgroundReviewAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+
+    adapter = ProgressCaptureAdapter(platform=Platform.WHATSAPP)
+    runner = _make_runner(adapter)
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {"visible": {Platform.WHATSAPP: adapter}}
+    monkeypatch.setattr(runner, "_resolve_profile_home_for_source", lambda source: source_home)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    original_load = gateway_run._load_gateway_config
+    loaded_paths = []
+
+    def _recording_load(config_path=None):
+        loaded_paths.append(config_path)
+        return original_load(config_path)
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", _recording_load)
+    source = SessionSource(
+        platform=Platform.WHATSAPP, chat_id="visible-chat", profile="visible",
+    )
+    session_key = "agent:visible:whatsapp:dm:visible-chat"
+    result = await runner._run_agent(
+        message="visible", context_prompt="", history=[], source=source,
+        session_id="sess-visible-managed", session_key=session_key,
+    )
+    release = adapter.pop_post_delivery_callback(session_key)
+    assert callable(release)
+    assert BackgroundReviewAgent.notification_modes == ["on"]
+
+    # The queued callback was authorized by the source profile's user config. Before final delivery,
+    # an administrator pins that same leaf off; the managed layer must win at the live recheck.
+    (managed_dir / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    await adapter.send("visible-chat", result["final_response"])
+    release()
+    await asyncio.sleep(0.05)
+
+    assert source_home / "config.yaml" in loaded_paths
+    assert [call["content"] for call in adapter.sent] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_memory_notifications_on_sends_review_once_after_final(
+    monkeypatch, tmp_path,
+):
+    """The exact publisher→callback→status-adapter rail remains available by explicit opt-in."""
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    session_key = "agent:main:whatsapp:group:-1001:17585"
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-whatsapp-review-on",
+        config_data={
+            "display": {
+                "platforms": {"whatsapp": {"memory_notifications": "on"}},
+            }
+        },
+        platform=Platform.WHATSAPP,
+    )
+
+    assert result["final_response"] == "done"
+    assert callable(BackgroundReviewAgent.callbacks[0])
+    assert BackgroundReviewAgent.notification_modes == ["on"]
+    assert adapter.sent == []  # review is held until the final response is delivered
+
+    await adapter.send("-1001", result["final_response"])
+    release = adapter.pop_post_delivery_callback(session_key)
+    assert callable(release)
+    release()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if len(adapter.sent) == 2:
+            break
+    assert [call["content"] for call in adapter.sent] == [
+        "done",
+        "💾 Self-improvement review: Skill 'prospect-scanner' created.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_memory_notifications_on_to_off_clears_status_rail(
+    monkeypatch, tmp_path,
+):
+    """A profile config edit applies to the next turn even when the agent is reused."""
+    import yaml
+
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"memory_notifications": "on"}}), encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = BackgroundReviewAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.WHATSAPP)
+    runner = _make_runner(adapter)
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.WHATSAPP, chat_id="-1001", chat_type="group", thread_id="17585",
+    )
+    session_key = "agent:main:whatsapp:group:-1001:17585"
+
+    first = await runner._run_agent(
+        message="first", context_prompt="", history=[], source=source,
+        session_id="sess-cached-review", session_key=session_key,
+    )
+    cached_agent = runner._agent_cache[session_key][0]
+    assert first["final_response"] == "done"
+    assert callable(cached_agent.background_review_callback)
+    assert callable(adapter.pop_post_delivery_callback(session_key))
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    second = await runner._run_agent(
+        message="second", context_prompt="", history=[], source=source,
+        session_id="sess-cached-review", session_key=session_key,
+    )
+
+    assert second["final_response"] == "done"
+    assert runner._agent_cache[session_key][0] is cached_agent
+    assert BackgroundReviewAgent.notification_modes == ["on", "off"]
+    assert callable(BackgroundReviewAgent.callbacks[0])
+    assert BackgroundReviewAgent.callbacks[1] is None
+    assert cached_agent.background_review_callback is None
+    assert session_key not in adapter._post_delivery_callbacks
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_queued_review_rechecks_live_whatsapp_policy_before_status_send(
+    monkeypatch, tmp_path,
+):
+    """An on→off edit before release suppresses the old closure without touching other hooks."""
+    import yaml
+
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    session_key = "agent:main:whatsapp:group:-1001:17585"
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-whatsapp-review-recheck",
+        config_data={
+            "display": {
+                "platforms": {"whatsapp": {"memory_notifications": "on"}},
+            }
+        },
+        platform=Platform.WHATSAPP,
+    )
+    release = adapter.pop_post_delivery_callback(session_key)
+    assert callable(release)
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"whatsapp": {"memory_notifications": "off"}}}}),
+        encoding="utf-8",
+    )
+    await adapter.send("-1001", result["final_response"])
+    release()
+    await asyncio.sleep(0.05)
+
+    assert [call["content"] for call in adapter.sent] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_non_whatsapp_memory_notifications_global_compatibility(monkeypatch, tmp_path):
+    BackgroundReviewAgent.callbacks = []
+    BackgroundReviewAgent.notification_modes = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-discord-review-verbose",
+        config_data={
+            "display": {
+                "memory_notifications": "verbose",
+                "platforms": {"whatsapp": {"memory_notifications": "off"}},
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-channel",
+        thread_id="discord-thread",
+    )
+
+    assert result["final_response"] == "done"
+    assert callable(BackgroundReviewAgent.callbacks[0])
+    assert BackgroundReviewAgent.notification_modes == ["verbose"]
+    assert adapter.sent == []
+
+    await adapter.send("discord-channel", result["final_response"])
+    release = adapter.pop_post_delivery_callback(
+        "agent:main:discord:group:discord-channel:discord-thread"
+    )
+    assert callable(release)
+    release()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if len(adapter.sent) == 2:
+            break
+    assert [call["content"] for call in adapter.sent] == [
+        "done",
+        "💾 Self-improvement review: Skill 'prospect-scanner' created.",
+    ]
 
 
 @pytest.mark.asyncio

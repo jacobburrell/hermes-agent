@@ -1713,6 +1713,16 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
+  # Post-turn self-improvement review notifications sent by messaging gateways.
+  # Other platforms keep the established built-in default of "on". WhatsApp is
+  # final-answer-first and defaults to "off" unless a global or per-platform
+  # setting explicitly enables it. Quote these values for YAML 1.1 compatibility.
+  # If setting a global "on", retain the WhatsApp override below to keep it quiet.
+  memory_notifications: "on"       # "off" | "on" | "verbose"
+  platforms:
+    whatsapp:
+      memory_notifications: "off"
+
   # Per-platform defaults can be quieter than the global setting. Telegram
   # tunes for mobile: tool_progress and busy_ack_detail default off (no
   # per-tool breadcrumb stream, no "iteration 21/60" debug detail in busy
