@@ -18,7 +18,7 @@ from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
 )
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
-from hermes_constants import (find_node_executable, get_hermes_dir, with_hermes_node_path)
+from hermes_constants import (find_node_executable, get_hermes_dir, get_hermes_home, with_hermes_node_path)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -286,6 +286,26 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
+        self._inbound_archive = None
+        self._inbound_archive_home = Path(get_hermes_home())
+
+    def _inbound_archive_instance(self):
+        if self._inbound_archive is None:
+            from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive
+            home = Path(getattr(self, "_inbound_archive_home", get_hermes_home()))
+            self._inbound_archive = WhatsAppInboundArchive(
+                home / "whatsapp" / "inbound-archive-v1", home, _cache_dirs(),
+            )
+        return self._inbound_archive
+
+    def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
+        """Keep authorized inbound evidence locally without changing admission."""
+        chat_id = str(data.get("chatId") or "")
+        if self._is_broadcast_chat(chat_id):
+            return False
+        if data.get("isGroup", False):
+            return self._is_group_allowed(chat_id)
+        return self._is_dm_allowed(str(data.get("senderId") or data.get("from") or ""))
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``; NaN/Inf/negative/unparseable → ``default`` (fed to asyncio.sleep)."""
@@ -713,8 +733,34 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 async with self._bridge_req("get", "messages", 30) as resp:
                     if resp.status == 200:
                         for msg_data in await resp.json():
-                            event = await self._build_message_event(msg_data)
+                            # Archive before dispatch, but never let retention alter the
+                            # established DM/group/mention admission decision.
+                            admitted = self._should_process_message(msg_data)
+                            if self._is_archive_authorized(msg_data):
+                                try:
+                                    archive_id, accepted = await asyncio.to_thread(
+                                        self._inbound_archive_instance().record,
+                                        msg_data,
+                                        "operate" if admitted else "observe",
+                                    )
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp inbound archive failed; suppressing dispatch", self.name)
+                                    continue
+                                if not accepted:
+                                    # A message-id collision with different contents is not
+                                    # safe to execute as another inbound turn.
+                                    continue
+                            else:
+                                archive_id = None
+                            if not admitted:
+                                continue
+                            event = await self._build_message_event(msg_data, already_admitted=True)
                             if event:
+                                if archive_id is not None:
+                                    await asyncio.to_thread(
+                                        self._inbound_archive_instance().materialize,
+                                        archive_id, msg_data, list(event.media_urls),
+                                    )
                                 # Fire-and-forget: a slow bridge /read must not delay dispatch.
                                 asyncio.create_task(self._send_read_receipt(msg_data))
                                 if event.message_type == MessageType.TEXT:
@@ -818,10 +864,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] Attached quoted-reply media: {path}", flush=True)
         return accepted
 
-    async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
+    async def _build_message_event(
+        self, data: Dict[str, Any], *, already_admitted: bool = False,
+    ) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            if not already_admitted and not self._should_process_message(data):
                 return None
             msg_type = self._classify_bridge_message(data)
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",
