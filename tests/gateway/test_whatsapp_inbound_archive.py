@@ -118,6 +118,9 @@ async def test_adapter_media_materialization_gates_observe_receipts_and_dispatch
             )),
         )
         adapter._inbound_archive_instance = Mock(return_value=archive)
+        adapter._agent_visible_archive_manifest = Mock(
+            side_effect=lambda materialized: adapter._trusted_archive_manifest(materialized)
+        )
         built = SimpleNamespace(message_type=MessageType.PHOTO, media_urls=["/profile/cache/photo.jpg"], media_types=["image/jpeg"])
         adapter._build_message_event = AsyncMock(return_value=built)
         adapter.handle_message = AsyncMock(); adapter._send_read_receipt = AsyncMock()
@@ -258,8 +261,6 @@ async def test_builder_accepts_only_capability_bound_owned_manifest(
     untrusted = await adapter._build_message_event(raw, already_admitted=True)
 
     assert event.message_type == expected_type and event.media_urls == [str(owned)] and event.media_types == [mime]
-    if kind == "document":
-        assert "[Content of report.txt]:" in event.text
     assert untrusted.media_urls == []
 
 

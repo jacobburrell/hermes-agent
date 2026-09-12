@@ -311,6 +311,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return self._inbound_archive
 
     def _trusted_archive_manifest(self, materialized) -> _ArchiveOwnedManifest:
+        if not hasattr(self, "_archive_manifest_capability"):
+            self._archive_manifest_capability = object()
         paths = tuple(materialized.owned_paths)
         descriptors = tuple(materialized.owned_descriptors)
         if not paths or len(paths) != len(descriptors):
@@ -806,11 +808,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     continue
                             else:
                                 archive_id = None
-                            if not admitted:
-                                continue
                             event_data = dict(msg_data)
                             manifest = None
-                            if msg_data.get("hasMedia"):
+                            materialized = None
+                            if archive_id is not None and msg_data.get("hasMedia"):
                                 try:
                                     media_paths, attachment_count = await self._archive_media_slots(msg_data)
                                     materialized = await asyncio.to_thread(
@@ -820,12 +821,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     )
                                     if not materialized.complete:
                                         continue
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
+                                    continue
+                            # Observed traffic is archived but never enters a model turn.
+                            if not admitted:
+                                continue
+                            if materialized is not None:
+                                try:
                                     manifest = await asyncio.to_thread(
                                         self._agent_visible_archive_manifest, materialized,
                                     )
                                     event_data["mediaUrls"] = list(manifest.paths)
                                 except Exception:
-                                    logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
+                                    logger.warning("[%s] WhatsApp owned-media exposure failed; suppressing dispatch", self.name)
                                     continue
                             event = await self._build_message_event(
                                 event_data, already_admitted=True, archive_manifest=manifest,
