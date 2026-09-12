@@ -192,9 +192,17 @@ async def test_observe_http_media_never_caches_or_builds(media_type, helper_name
 
 @pytest.mark.asyncio
 async def test_operate_builder_receives_only_archive_owned_media_after_materialize(monkeypatch, tmp_path):
-    source = tmp_path / "bridge-cache.jpg"; source.write_bytes(b"before")
-    owned = tmp_path / "archive" / "media" / "digest"; owned.parent.mkdir(parents=True); owned.write_bytes(b"owned")
-    raw = _raw(hasMedia=True, mediaType="image", mediaUrls=[str(source)])
+    image = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\x0dIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05"
+        b"\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = home / "cache" / "bridge-cache.png"; source.write_bytes(image)
+    owned = home / "whatsapp" / "inbound-archive-v1" / "media" / "digest"; owned.parent.mkdir(parents=True); owned.write_bytes(image)
+    raw = _raw(hasMedia=True, mediaType="image", mime="image/png", fileName="photo.png", mediaUrls=[str(source)])
     adapter = object.__new__(WhatsAppAdapter)
     adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
     adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
@@ -204,7 +212,7 @@ async def test_operate_builder_receives_only_archive_owned_media_after_materiali
 
     def materialize(*_args, **_kwargs):
         source.write_bytes(b"replaced")
-        return MaterializationResult(True, 1, 1, ("owned",), (str(owned),), ({"kind": "image", "mime": "image/jpeg", "file_name": "photo.jpg"},))
+        return MaterializationResult(True, 1, 1, ("owned",), (str(owned),), ({"kind": "image", "mime": "image/png", "file_name": "photo.png"},))
 
     archive = SimpleNamespace(record=Mock(return_value=(1, True)), materialize=Mock(side_effect=materialize))
     adapter._inbound_archive_instance = Mock(return_value=archive)
@@ -217,10 +225,12 @@ async def test_operate_builder_receives_only_archive_owned_media_after_materiali
 
     await adapter._poll_messages()
 
-    assert source.read_bytes() == b"replaced" and built[0]["mediaUrls"] == [str(owned)]
+    exposed = Path(built[0]["mediaUrls"][0])
+    assert source.read_bytes() == b"replaced" and exposed.read_bytes() == image
+    assert exposed.parent == home / "cache" / "images"
     assert raw["mediaUrls"] == [str(source)]
     cache_image.assert_not_awaited()
-    assert adapter.handle_message.await_args.args[0].media_urls == [str(owned)]
+    assert adapter.handle_message.await_args.args[0].media_urls == [str(exposed)]
 
 
 @pytest.mark.asyncio

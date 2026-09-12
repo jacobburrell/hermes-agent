@@ -68,9 +68,11 @@ async def test_owned_whatsapp_image_becomes_native_model_attachment_not_bridge_p
     event_data = dict(raw); event_data["mediaUrls"] = list(manifest.paths)
     event = await adapter._build_message_event(event_data, already_admitted=True, archive_manifest=manifest)
 
+    exposed = Path(event.media_urls[0])
     assert result.complete and event.text == "caption kept"
-    assert event.message_type == MessageType.PHOTO and event.media_urls == list(result.owned_paths)
-    assert str(bridge_path) not in event.media_urls
+    assert event.message_type == MessageType.PHOTO and exposed.read_bytes() == _PNG
+    assert exposed.parent == home / "cache" / "images"
+    assert str(bridge_path) not in event.media_urls and str(result.owned_paths[0]) not in event.media_urls
     runner = _runner(); source = _source()
     await runner._prepare_inbound_message_text(event=event, source=source, history=[])
     parts, skipped = build_native_content_parts(
