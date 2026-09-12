@@ -34,6 +34,12 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  createInboundSpool,
+  opaqueInboundProfileNamespace,
+  registerInboundSpoolRoutes,
+  stageInboundEventSafely,
+} from './inbound_spool.js';
+import {
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -225,6 +231,38 @@ function emitDebugEvent(payload) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
+// Inbound records are durably staged only after extractBridgeEvent has
+// downloaded current media into this profile's bridge cache.  The namespaces
+// make a copied session or rotated device identity unable to consume another
+// profile/account's record.
+const INBOUND_PROFILE_NAMESPACE = opaqueInboundProfileNamespace(SESSION_DIR);
+const inboundSpool = createInboundSpool(path.join(SESSION_DIR, 'inbound-spool-v1'));
+const inboundStageFailures = { accountNotReady: 0, persistence: 0 };
+
+function inboundAccountNamespace() {
+  return inboundSpool.resolveAccountNamespace(
+    [sock?.user?.id, sock?.user?.lid]
+      .map(value => normalizeWhatsAppId(value))
+      .filter(Boolean),
+  );
+}
+
+function recordInboundStageFailure(reason) {
+  const key = reason === 'account_not_ready' ? 'accountNotReady' : 'persistence';
+  inboundStageFailures[key] += 1;
+  console.warn(JSON.stringify({ event: 'inbound_spool_stage_failure', reason, count: inboundStageFailures[key] }));
+}
+
+function stageInboundEvent(event) {
+  return stageInboundEventSafely({
+    spool: inboundSpool,
+    profileNamespace: INBOUND_PROFILE_NAMESPACE,
+    accountNamespace: inboundAccountNamespace(),
+    event,
+    onFailure: recordInboundStageFailure,
+  });
+}
+
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
   const map = {};
@@ -242,10 +280,6 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
-
-// Message queue for polling
-const messageQueue = [];
-const MAX_QUEUE_SIZE = 100;
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -355,10 +389,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
-  if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
-  }
+  stageInboundEvent(event);
 }
 
 function rememberSentId(id) {
@@ -751,20 +782,19 @@ async function startSocket() {
         mediaType: event.mediaType,
         mediaUrls: event.mediaUrls,
       });
-      messageQueue.push(event);
+      const staged = stageInboundEvent(event);
+      if (!staged) continue;
       emitDebugEvent({
-        stage: 'queued',
+        stage: 'staged',
         chatId: redactWhatsAppId(chatId),
         senderId: redactWhatsAppId(senderId),
         fromOwner: !!fromOwner,
         bodyLength: event.body.length,
         hasMedia: event.hasMedia,
         mediaType: event.mediaType,
-        queueLength: messageQueue.length,
+        stagedStatus: staged.status,
+        pendingCount: inboundSpool.stats().pending,
       });
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
-      }
     }
   });
 }
@@ -804,11 +834,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Poll for new messages (long-poll style)
-app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
-  res.json(msgs);
-});
+// Polling returns a fenced lease rather than destructively draining inbound.
+// Python ACK integration follows in the next isolated slice.
+registerInboundSpoolRoutes(app, inboundSpool);
 
 // Send a message
 app.post('/send', async (req, res) => {
@@ -1098,7 +1126,9 @@ app.get('/chat/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
-    queueLength: messageQueue.length,
+    queueLength: inboundSpool.stats().pending,
+    inboundSpool: inboundSpool.stats(),
+    inboundStageFailures: { ...inboundStageFailures },
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,

@@ -20,6 +20,7 @@ import {
   inboundEventDigest,
   opaqueInboundAccountNamespace,
   opaqueInboundProfileNamespace,
+  registerInboundSpoolRoutes,
   stageInboundEventSafely,
 } from './inbound_spool.js';
 
@@ -63,6 +64,25 @@ function withSpool(run) {
   }
 }
 
+function fakeRouteApp() {
+  const routes = { get: new Map(), post: new Map() };
+  return {
+    routes,
+    get(route, handler) { routes.get.set(route, handler); },
+    post(route, handler) { routes.post.set(route, handler); },
+  };
+}
+
+function callRoute(handler, { query = {}, body = {} } = {}) {
+  const result = { status: 200, body: undefined };
+  const res = {
+    status(code) { result.status = code; return this; },
+    json(value) { result.body = value; return this; },
+  };
+  handler({ query, body }, res);
+  return result;
+}
+
 test('profile and account namespaces are opaque and account readiness fails closed', () => {
   assert.equal(opaqueInboundProfileNamespace(''), null);
   assert.match(opaqueInboundProfileNamespace('/private/profile/session'), /^[a-f0-9]{64}$/);
@@ -70,6 +90,59 @@ test('profile and account namespaces are opaque and account readiness fails clos
   assert.equal(opaqueInboundAccountNamespace(['', null, undefined]), null);
   assert.match(opaqueInboundAccountNamespace(['15551234567@s.whatsapp.net']), /^[a-f0-9]{64}$/);
 });
+
+test('leased bridge routes preserve staged media through restart and require fenced ACK', () => withSpool(({ root, spool, restart }) => {
+  const eventWithMedia = event({
+    hasMedia: true,
+    mediaType: 'image',
+    mime: 'image/jpeg',
+    fileName: 'photo.jpg',
+    mediaUrls: ['/profile/cache/images/photo.jpg'],
+    mediaMetadata: [{ mediaType: 'image', mime: 'image/jpeg', fileName: 'photo.jpg', size: 4 }],
+  });
+  const noAccount = stageInboundEventSafely({
+    spool,
+    profileNamespace: PROFILE,
+    accountNamespace: null,
+    event: eventWithMedia,
+  });
+  assert.equal(noAccount, null);
+  const staged = stageInboundEventSafely({
+    spool,
+    profileNamespace: PROFILE,
+    accountNamespace: ACCOUNT,
+    event: eventWithMedia,
+  });
+  assert.equal(staged.status, 'appended');
+
+  const app = fakeRouteApp();
+  registerInboundSpoolRoutes(app, spool);
+  const first = callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-a' } });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.length, 1);
+  assert.deepEqual(first.body[0].mediaUrls, eventWithMedia.mediaUrls);
+  assert.equal(first.body[0]._inboundLease.deliveryId, staged.deliveryId);
+
+  const restarted = restart();
+  const afterRestart = fakeRouteApp();
+  registerInboundSpoolRoutes(afterRestart, restarted);
+  // A competing consumer cannot take a live lease after bridge restart.
+  assert.deepEqual(
+    callRoute(afterRestart.routes.get.get('/messages'), { query: { consumerId: 'python-b' } }).body,
+    [],
+  );
+  const ack = callRoute(afterRestart.routes.post.get('/messages/ack'), {
+    body: first.body[0]._inboundLease,
+  });
+  assert.equal(ack.status, 200);
+  assert.equal(ack.body.status, 'acknowledged');
+  assert.deepEqual(
+    callRoute(afterRestart.routes.get.get('/messages'), { query: { consumerId: 'python-a' } }).body,
+    [],
+  );
+  assert.equal(restarted.stats().tombstones, 1);
+  assert.equal(readdirSync(path.join(root, 'records')).length, 0);
+}));
 
 test('canonical identity isolates profile, account, participant, and fromMe', () => withSpool(({ spool }) => {
   const variants = [

@@ -726,3 +726,38 @@ export class InboundSpool {
 export function createInboundSpool(rootDir, options) {
   return new InboundSpool(rootDir, options);
 }
+
+function sendInboundSpoolResult(res, result) {
+  const status = result?.status;
+  if (status === 'not_found') return res.status(404).json(result);
+  if (status === 'stale_lease') return res.status(409).json(result);
+  return res.json(result);
+}
+
+/**
+ * Register the narrow HTTP ownership boundary used by the Python adapter.
+ *
+ * The bridge intentionally leases flat event objects, rather than deleting
+ * them on poll.  Only a matching fenced ACK can settle a record.  Keeping the
+ * handlers here makes the protocol testable without starting Baileys.
+ */
+export function registerInboundSpoolRoutes(app, spool) {
+  app.get('/messages', (req, res) => {
+    try {
+      return res.json(spool.lease({
+        consumerId: req.query?.consumerId,
+        limit: req.query?.limit,
+      }));
+    } catch {
+      return res.status(400).json({ error: 'Invalid inbound lease request' });
+    }
+  });
+  app.post('/messages/renew', (req, res) => {
+    try { return sendInboundSpoolResult(res, spool.renew(req.body || {})); }
+    catch { return res.status(400).json({ error: 'Invalid inbound lease renewal' }); }
+  });
+  app.post('/messages/ack', (req, res) => {
+    try { return sendInboundSpoolResult(res, spool.acknowledge(req.body || {})); }
+    catch { return res.status(400).json({ error: 'Invalid inbound acknowledgement' }); }
+  });
+}
