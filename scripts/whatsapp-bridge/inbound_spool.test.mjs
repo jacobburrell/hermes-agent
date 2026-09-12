@@ -115,8 +115,9 @@ test('leased bridge routes preserve staged media through restart and require fen
   });
   assert.equal(staged.status, 'appended');
 
+  let scope = { profileNamespace: PROFILE, accountNamespace: ACCOUNT };
   const app = fakeRouteApp();
-  registerInboundSpoolRoutes(app, spool);
+  registerInboundSpoolRoutes(app, spool, { resolveScope: () => scope });
   const first = callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-a' } });
   assert.equal(first.status, 200);
   assert.equal(first.body.length, 1);
@@ -125,7 +126,7 @@ test('leased bridge routes preserve staged media through restart and require fen
 
   const restarted = restart();
   const afterRestart = fakeRouteApp();
-  registerInboundSpoolRoutes(afterRestart, restarted);
+  registerInboundSpoolRoutes(afterRestart, restarted, { resolveScope: () => scope });
   // A competing consumer cannot take a live lease after bridge restart.
   assert.deepEqual(
     callRoute(afterRestart.routes.get.get('/messages'), { query: { consumerId: 'python-b' } }).body,
@@ -142,6 +143,48 @@ test('leased bridge routes preserve staged media through restart and require fen
   );
   assert.equal(restarted.stats().tombstones, 1);
   assert.equal(readdirSync(path.join(root, 'records')).length, 0);
+}));
+
+test('bridge routes fence copied profiles and rotated accounts without settling old leases', () => withSpool(({ spool }) => {
+  const staged = spool.append({ profileNamespace: PROFILE, accountNamespace: ACCOUNT, event: event() });
+  let scope = { profileNamespace: PROFILE, accountNamespace: ACCOUNT };
+  const app = fakeRouteApp();
+  registerInboundSpoolRoutes(app, spool, { resolveScope: () => scope });
+  const initial = callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-a' } });
+  assert.equal(initial.body.length, 1);
+  const receipt = initial.body[0]._inboundLease;
+
+  scope = { profileNamespace: 'c'.repeat(64), accountNamespace: ACCOUNT };
+  assert.deepEqual(
+    callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-b' } }).body,
+    [],
+  );
+  assert.equal(
+    callRoute(app.routes.post.get('/messages/ack'), { body: receipt }).status,
+    409,
+  );
+
+  scope = { profileNamespace: PROFILE, accountNamespace: 'd'.repeat(64) };
+  assert.deepEqual(
+    callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-b' } }).body,
+    [],
+  );
+  assert.equal(
+    callRoute(app.routes.post.get('/messages/renew'), { body: receipt }).status,
+    409,
+  );
+  assert.equal(spool.stats().pending, 1);
+
+  scope = null;
+  assert.equal(
+    callRoute(app.routes.get.get('/messages'), { query: { consumerId: 'python-a' } }).status,
+    503,
+  );
+  assert.equal(
+    callRoute(app.routes.post.get('/messages/ack'), { body: receipt }).status,
+    503,
+  );
+  assert.equal(staged.deliveryId, receipt.deliveryId);
 }));
 
 test('canonical identity isolates profile, account, participant, and fromMe', () => withSpool(({ spool }) => {

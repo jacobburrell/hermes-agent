@@ -247,6 +247,13 @@ function inboundAccountNamespace() {
   );
 }
 
+function inboundLeaseScope() {
+  const accountNamespace = inboundAccountNamespace();
+  return accountNamespace
+    ? { profileNamespace: INBOUND_PROFILE_NAMESPACE, accountNamespace }
+    : null;
+}
+
 function recordInboundStageFailure(reason) {
   const key = reason === 'account_not_ready' ? 'accountNotReady' : 'persistence';
   inboundStageFailures[key] += 1;
@@ -836,7 +843,7 @@ app.use((req, res, next) => {
 
 // Polling returns a fenced lease rather than destructively draining inbound.
 // Python ACK integration follows in the next isolated slice.
-registerInboundSpoolRoutes(app, inboundSpool);
+registerInboundSpoolRoutes(app, inboundSpool, { resolveScope: inboundLeaseScope });
 
 // Send a message
 app.post('/send', async (req, res) => {

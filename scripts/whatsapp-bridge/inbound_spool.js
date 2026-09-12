@@ -571,8 +571,11 @@ export class InboundSpool {
     return { status: 'appended', deliveryId, eventDigest, sequence: record.sequence };
   }
 
-  lease({ consumerId, limit = DEFAULT_LIMIT, leaseMs = this.leaseMs } = {}) {
+  lease({ consumerId, profileNamespace, accountNamespace, limit = DEFAULT_LIMIT, leaseMs = this.leaseMs } = {}) {
     const consumer = requireConsumerId(consumerId);
+    const scoped = profileNamespace !== undefined || accountNamespace !== undefined;
+    const profile = scoped ? requireOpaqueNamespace('profileNamespace', profileNamespace) : null;
+    const account = scoped ? requireOpaqueNamespace('accountNamespace', accountNamespace) : null;
     const boundedLimit = Math.max(1, Math.min(Number(limit) || DEFAULT_LIMIT, DEFAULT_LIMIT));
     const duration = boundedLeaseMs(leaseMs, this.leaseMs);
     const now = this.now();
@@ -595,6 +598,10 @@ export class InboundSpool {
     const leased = [];
     for (const record of scanOrder) {
       if (leased.length >= boundedLimit) break;
+      if (scoped && (
+        record.identity?.profile !== profile
+        || record.identity?.account !== account
+      )) continue;
       const live = record.state === 'leased' && Number(record.lease?.expiresAt) > now;
       if (live && record.lease.consumerId !== consumer) continue;
       if (live) {
@@ -619,13 +626,18 @@ export class InboundSpool {
     return leased;
   }
 
-  renew({ consumerId, deliveryId, epoch, token, leaseMs = this.leaseMs } = {}) {
+  renew({ consumerId, deliveryId, epoch, token, profileNamespace, accountNamespace, leaseMs = this.leaseMs } = {}) {
     const id = normalizeDeliveryId(deliveryId);
     if (!id) return { status: 'not_found' };
     const recordPath = this.#recordPath(id);
     if (!existsSync(recordPath)) return { status: 'not_found' };
     const record = readJson(recordPath);
+    const scoped = profileNamespace !== undefined || accountNamespace !== undefined;
+    const profile = scoped ? requireOpaqueNamespace('profileNamespace', profileNamespace) : null;
+    const account = scoped ? requireOpaqueNamespace('accountNamespace', accountNamespace) : null;
     if (
+      (scoped && (record.identity?.profile !== profile || record.identity?.account !== account))
+      ||
       record.state !== 'leased'
       || record.lease.consumerId !== String(consumerId || '')
       || record.lease.epoch !== Number(epoch)
@@ -642,7 +654,7 @@ export class InboundSpool {
     return { status: 'renewed', delivery: publicLeaseMetadata(record) };
   }
 
-  acknowledge({ consumerId, deliveryId, epoch, token } = {}) {
+  acknowledge({ consumerId, deliveryId, epoch, token, profileNamespace, accountNamespace } = {}) {
     const id = normalizeDeliveryId(deliveryId);
     if (!id) return { status: 'not_found' };
     const ackFingerprint = sha256(canonicalJson({
@@ -652,11 +664,17 @@ export class InboundSpool {
       token: String(token || ''),
     }));
     const recordPath = this.#recordPath(id);
+    const scoped = profileNamespace !== undefined || accountNamespace !== undefined;
+    const profile = scoped ? requireOpaqueNamespace('profileNamespace', profileNamespace) : null;
+    const account = scoped ? requireOpaqueNamespace('accountNamespace', accountNamespace) : null;
     if (!existsSync(recordPath)) {
       const tombstonePath = this.#tombstonePath(id);
       if (!existsSync(tombstonePath)) return { status: 'not_found' };
       try {
         const tombstone = readJson(tombstonePath);
+        if (scoped && (tombstone.identity?.profile !== profile || tombstone.identity?.account !== account)) {
+          return { status: 'stale_lease', deliveryId: id };
+        }
         return safeTokenEqual(tombstone.ackFingerprint, ackFingerprint)
           ? { status: 'already_acknowledged', deliveryId: id }
           : { status: 'stale_lease', deliveryId: id };
@@ -668,6 +686,8 @@ export class InboundSpool {
     }
     const record = readJson(recordPath);
     if (
+      (scoped && (record.identity?.profile !== profile || record.identity?.account !== account))
+      ||
       record.state !== 'leased'
       || record.lease.consumerId !== String(consumerId || '')
       || record.lease.epoch !== Number(epoch)
@@ -680,6 +700,10 @@ export class InboundSpool {
       schemaVersion: SCHEMA_VERSION,
       deliveryId: id,
       eventDigest: record.eventDigest,
+      identity: {
+        profile: record.identity?.profile || '',
+        account: record.identity?.account || '',
+      },
       terminalState: 'acknowledged',
       ackFingerprint,
       settledAt: this.now(),
@@ -741,23 +765,36 @@ function sendInboundSpoolResult(res, result) {
  * them on poll.  Only a matching fenced ACK can settle a record.  Keeping the
  * handlers here makes the protocol testable without starting Baileys.
  */
-export function registerInboundSpoolRoutes(app, spool) {
+export function registerInboundSpoolRoutes(app, spool, { resolveScope } = {}) {
+  const scopedRequest = () => {
+    const scope = resolveScope?.();
+    if (!scope?.profileNamespace || !scope?.accountNamespace) return null;
+    return scope;
+  };
+  const unavailable = res => res.status(503).json({ error: 'Inbound account identity unavailable' });
   app.get('/messages', (req, res) => {
+    const scope = scopedRequest();
+    if (!scope) return unavailable(res);
     try {
       return res.json(spool.lease({
         consumerId: req.query?.consumerId,
         limit: req.query?.limit,
+        ...scope,
       }));
     } catch {
       return res.status(400).json({ error: 'Invalid inbound lease request' });
     }
   });
   app.post('/messages/renew', (req, res) => {
-    try { return sendInboundSpoolResult(res, spool.renew(req.body || {})); }
+    const scope = scopedRequest();
+    if (!scope) return unavailable(res);
+    try { return sendInboundSpoolResult(res, spool.renew({ ...(req.body || {}), ...scope })); }
     catch { return res.status(400).json({ error: 'Invalid inbound lease renewal' }); }
   });
   app.post('/messages/ack', (req, res) => {
-    try { return sendInboundSpoolResult(res, spool.acknowledge(req.body || {})); }
+    const scope = scopedRequest();
+    if (!scope) return unavailable(res);
+    try { return sendInboundSpoolResult(res, spool.acknowledge({ ...(req.body || {}), ...scope })); }
     catch { return res.status(400).json({ error: 'Invalid inbound acknowledgement' }); }
   });
 }
