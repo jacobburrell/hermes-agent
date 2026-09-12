@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 from contextlib import suppress
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -31,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 # Owner-typed inbound text is prefixed at MessageEvent construction so transcripts stay disambiguated before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
+
+
+@dataclass(frozen=True)
+class _ArchiveOwnedManifest:
+    """Adapter-private proof that an inbound attachment has an owned copy."""
+    capability: object
+    paths: tuple[str, ...]
+    descriptors: tuple[dict[str, str], ...]
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
@@ -288,6 +297,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
         self._inbound_archive = None
         self._inbound_archive_home = Path(get_hermes_home())
+        self._archive_manifest_capability = object()
 
     def _inbound_archive_instance(self):
         if self._inbound_archive is None:
@@ -298,6 +308,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
         return self._inbound_archive
 
+    def _trusted_archive_manifest(self, materialized) -> _ArchiveOwnedManifest:
+        paths = tuple(materialized.owned_paths)
+        descriptors = tuple(materialized.owned_descriptors)
+        if not paths or len(paths) != len(descriptors):
+            raise ValueError("incomplete archive-owned manifest")
+        return _ArchiveOwnedManifest(self._archive_manifest_capability, paths, descriptors)
+
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
         """Keep authorized inbound evidence locally without changing admission."""
         chat_id = str(data.get("chatId") or "")
@@ -306,6 +323,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if data.get("isGroup", False):
             return self._is_group_allowed(chat_id)
         return self._is_dm_allowed(str(data.get("senderId") or data.get("from") or ""))
+
+    async def _archive_media_slots(self, data: Dict[str, Any]) -> tuple[list[Optional[str]], int]:
+        """Collect only bridge-cache files for private archival before event construction."""
+        raw_urls = data.get("mediaUrls")
+        if not isinstance(raw_urls, list):
+            raw_urls = []
+        if not raw_urls:
+            return [], 1 if data.get("hasMedia") else 0
+        slots: list[Optional[str]] = []
+        for raw_url in raw_urls:
+            slots.append(raw_url if isinstance(raw_url, str) and os.path.isabs(raw_url) and _is_allowed_bridge_path(raw_url) else None)
+        return slots, len(raw_urls)
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``; NaN/Inf/negative/unparseable → ``default`` (fed to asyncio.sleep)."""
@@ -754,13 +783,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 archive_id = None
                             if not admitted:
                                 continue
-                            event = await self._build_message_event(msg_data, already_admitted=True)
-                            if event:
-                                if archive_id is not None:
-                                    await asyncio.to_thread(
+                            event_data = dict(msg_data)
+                            manifest = None
+                            if msg_data.get("hasMedia"):
+                                try:
+                                    media_paths, attachment_count = await self._archive_media_slots(msg_data)
+                                    materialized = await asyncio.to_thread(
                                         self._inbound_archive_instance().materialize,
-                                        archive_id, msg_data, list(event.media_urls),
+                                        archive_id, msg_data, media_paths,
+                                        expected_attachment_count=attachment_count,
                                     )
+                                    if not materialized.complete:
+                                        continue
+                                    manifest = self._trusted_archive_manifest(materialized)
+                                    event_data["mediaUrls"] = list(manifest.paths)
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
+                                    continue
+                            event = await self._build_message_event(
+                                event_data, already_admitted=True, archive_manifest=manifest,
+                            )
+                            if event:
                                 # Fire-and-forget: a slow bridge /read must not delay dispatch.
                                 asyncio.create_task(self._send_read_receipt(msg_data))
                                 if event.message_type == MessageType.TEXT:
@@ -798,11 +841,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return MessageType.TEXT
         return next((kind for needle, kind in _MEDIA_NEEDLES if needle in media_type), MessageType.DOCUMENT)
 
-    async def _collect_bridge_media(self, data: Dict[str, Any], msg_type: MessageType) -> tuple[list, list]:
+    async def _collect_bridge_media(
+        self, data: Dict[str, Any], msg_type: MessageType,
+        trusted_manifest: Optional[_ArchiveOwnedManifest] = None,
+    ) -> tuple[list, list]:
         """``mediaUrls`` → ``(cached_urls, media_types)``: remote image/audio cached locally; absolute paths only inside a cache dir."""
         accepted: list[tuple] = []  # (url_or_path, mime)
         label, default_mime = _MEDIA_INFO.get(msg_type, (None, ""))
         bridge_mime = str(data.get("mime") or "").strip()
+        trusted_media = (
+            dict(zip(trusted_manifest.paths, trusted_manifest.descriptors))
+            if trusted_manifest is not None and trusted_manifest.capability is self._archive_manifest_capability
+            else {}
+        )
         for url in data.get("mediaUrls", []):
             mime = bridge_mime or (SUPPORTED_DOCUMENT_TYPES.get(Path(url).suffix.lower(), "application/octet-stream") if msg_type == MessageType.DOCUMENT else default_mime)
             if url.startswith(("http://", "https://")) and msg_type in {MessageType.PHOTO, MessageType.VOICE, MessageType.AUDIO}:
@@ -813,8 +864,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 except Exception as e:
                     print(f"[{self.name}] Failed to cache {label}: {e}", flush=True)
                 accepted.append((url, mime))
-            elif label is not None and os.path.isabs(url):
-                if _is_allowed_bridge_path(url):
+            elif label is not None and isinstance(url, str) and os.path.isabs(url):
+                descriptor = trusted_media.get(url)
+                if descriptor is not None or _is_allowed_bridge_path(url):
                     accepted.append((url, mime))
                     print(f"[{self.name}] Using bridge-cached {label}: {url}", flush=True)
                 else:
@@ -866,6 +918,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _build_message_event(
         self, data: Dict[str, Any], *, already_admitted: bool = False,
+        archive_manifest: Optional[_ArchiveOwnedManifest] = None,
     ) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
@@ -875,7 +928,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",
                                        user_id=data.get("senderId"), user_name=data.get("senderName"),
                                        message_id=data.get("messageId"))
-            cached_urls, media_types = await self._collect_bridge_media(data, msg_type)
+            cached_urls, media_types = await self._collect_bridge_media(data, msg_type, archive_manifest)
             body = data.get("body", "")
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
