@@ -99,15 +99,12 @@ async def test_adapter_observe_operate_failure_collision_and_retry(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_adapter_media_materialization_gates_observe_receipts_and_dispatch(monkeypatch):
-    monkeypatch.setattr(
-        "plugins.platforms.whatsapp.adapter._is_allowed_bridge_path",
-        lambda path: str(path).startswith("/profile/cache/"),
-    )
     async def run(*, admitted, complete, raw_urls=None):
         raw = _raw(hasMedia=True, isGroup=True, mediaType="image", mediaUrls=raw_urls or ["/profile/cache/photo.jpg"])
         adapter = object.__new__(WhatsAppAdapter)
         adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
         adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+        adapter._is_allowed_profile_bridge_path = lambda path: str(path).startswith("/profile/cache/")
         adapter._is_archive_authorized = Mock(return_value=True)
         adapter._should_process_message = Mock(return_value=admitted)
         archive = SimpleNamespace(
@@ -153,14 +150,11 @@ async def test_adapter_media_materialization_gates_observe_receipts_and_dispatch
 @pytest.mark.asyncio
 async def test_observe_document_uses_raw_slots_without_building_event(monkeypatch):
     allowed = "/profile/cache/kept.pdf"; rejected = "/outside/rejected.pdf"
-    monkeypatch.setattr(
-        "plugins.platforms.whatsapp.adapter._is_allowed_bridge_path",
-        lambda path: path == allowed,
-    )
     raw = _raw(hasMedia=True, isGroup=True, mediaType="document", mediaUrls=[allowed, rejected])
     adapter = object.__new__(WhatsAppAdapter)
     adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
     adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_allowed_profile_bridge_path = lambda path: path == allowed
     adapter._is_archive_authorized = Mock(return_value=True); adapter._should_process_message = Mock(return_value=False)
     archive = SimpleNamespace(record=Mock(return_value=(1, True)), materialize=Mock(return_value=SimpleNamespace(complete=False)))
     adapter._inbound_archive_instance = Mock(return_value=archive)
@@ -210,7 +204,7 @@ async def test_operate_builder_receives_only_archive_owned_media_after_materiali
     adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
     adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
     adapter._is_archive_authorized = Mock(return_value=True); adapter._should_process_message = Mock(return_value=True)
-    monkeypatch.setattr("plugins.platforms.whatsapp.adapter._is_allowed_bridge_path", lambda path: path == str(source))
+    adapter._is_allowed_profile_bridge_path = lambda path: path == str(source)
     cache_image = AsyncMock(); monkeypatch.setattr("plugins.platforms.whatsapp.adapter.cache_image_from_url", cache_image)
 
     def materialize(*_args, **_kwargs):
@@ -234,6 +228,61 @@ async def test_operate_builder_receives_only_archive_owned_media_after_materiali
     assert raw["mediaUrls"] == [str(source)]
     cache_image.assert_not_awaited()
     assert adapter.handle_message.await_args.args[0].media_urls == [str(exposed)]
+
+
+@pytest.mark.asyncio
+async def test_multiplexed_ambient_archive_and_agent_copy_stay_with_adapter_profile(tmp_path, monkeypatch):
+    """A receiving adapter never follows a different active profile's cache root."""
+    image = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\x0dIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05"
+        b"\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    profile_a, profile_b = tmp_path / "profiles" / "a", tmp_path / "profiles" / "b"
+    source = profile_a / "cache" / "images" / "bridge.png"
+    source.parent.mkdir(parents=True); source.write_bytes(image)
+    (profile_b / "cache").mkdir(parents=True)
+    profile_b_cache_files_before = {
+        path.relative_to(profile_b / "cache")
+        for path in (profile_b / "cache").rglob("*") if path.is_file()
+    }
+    # Simulate an ambient callback running with B active while A owns the
+    # WhatsApp transport and its bridge cache.
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    raw = _raw("profile-bound", hasMedia=True, isGroup=True, mediaType="image", mime="image/png", fileName="bridge.png", mediaUrls=[str(source)])
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._inbound_archive = None; adapter._inbound_archive_home = profile_a.resolve(); adapter._archive_manifest_capability = object()
+    adapter._is_archive_authorized = Mock(return_value=True); adapter._should_process_message = Mock(return_value=False)
+    adapter._build_message_event = AsyncMock(); adapter.handle_message = AsyncMock(); adapter._send_read_receipt = AsyncMock()
+
+    await adapter._poll_messages()
+
+    archive = adapter._inbound_archive_instance()
+    with archive._connect() as db:
+        owned = Path(db.execute("SELECT owned_path FROM archive_attachment").fetchone()[0])
+    assert owned.parent == archive.media_root and owned.read_bytes() == image
+    assert profile_a in owned.parents
+    assert {
+        path.relative_to(profile_b / "cache")
+        for path in (profile_b / "cache").rglob("*") if path.is_file()
+    } == profile_b_cache_files_before
+    adapter._build_message_event.assert_not_awaited(); adapter.handle_message.assert_not_awaited()
+
+    materialized = type("Materialized", (), {
+        "owned_paths": (str(owned),),
+        "owned_descriptors": ({"kind": "image", "mime": "image/png", "file_name": "bridge.png"},),
+    })()
+    visible = adapter._agent_visible_archive_manifest(materialized).paths[0]
+    assert Path(visible).read_bytes() == image
+    assert Path(visible).is_relative_to(profile_a / "cache" / "images")
+    assert os.environ["HERMES_HOME"] == str(profile_b)  # owner binding never rewrites global state
+    assert {
+        path.relative_to(profile_b / "cache")
+        for path in (profile_b / "cache").rglob("*") if path.is_file()
+    } == profile_b_cache_files_before
 
 
 @pytest.mark.asyncio

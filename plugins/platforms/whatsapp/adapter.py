@@ -9,6 +9,7 @@ import platform
 import re
 import signal
 import subprocess
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
@@ -186,8 +187,7 @@ from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, SUPPORTED_DOCUMENT_TYPES,
-    cache_audio_from_bytes, cache_audio_from_url, cache_document_from_bytes,
-    cache_image_from_bytes, cache_image_from_url, cache_video_from_bytes,
+    cache_audio_from_url, cache_image_from_url, validate_inbound_media_size,
 )
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
@@ -298,15 +298,57 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
         self._inbound_archive = None
-        self._inbound_archive_home = Path(get_hermes_home())
+        # Capture the creating adapter's home.  Later multiplex callbacks can
+        # run under another profile's context, so never resolve this again via
+        # the process-wide/context-local getter.
+        self._inbound_archive_home = Path(get_hermes_home()).resolve()
         self._archive_manifest_capability = object()
+
+    def _profile_cache_dirs(self) -> tuple[Path, Path, Path, Path]:
+        """Profile-owned image, audio, video and document cache roots.
+
+        This intentionally does not use the active runtime profile: an inbound
+        event belongs to the receiving adapter even if an ambient observer or
+        multiplex callback currently runs inside another profile's context.
+        """
+        # Do not put ``get_hermes_home()`` in getattr's default: Python
+        # evaluates that default eagerly, which would still resolve (and may
+        # initialize) an unrelated active profile on every incoming event.
+        home = Path(getattr(self, "_inbound_archive_home", None) or get_hermes_home()).resolve()
+        roots = (
+            get_hermes_dir("cache/images", "image_cache", home=home),
+            get_hermes_dir("cache/audio", "audio_cache", home=home),
+            get_hermes_dir("cache/videos", "video_cache", home=home),
+            get_hermes_dir("cache/documents", "document_cache", home=home),
+        )
+        for root in roots:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return roots
+
+    def _is_allowed_profile_bridge_path(self, value: str) -> bool:
+        # Production adapters bind their owner during __init__.  Keep the
+        # long-standing cache validation available to deliberately bare test
+        # adapters (and old embedder fixtures) rather than making quote-media
+        # handoff disappear solely because that construction bypassed __init__.
+        # A real adapter never takes this compatibility branch.
+        if not hasattr(self, "_inbound_archive_home"):
+            return _is_allowed_bridge_path(value)
+        try:
+            resolved = Path(value).resolve()
+        except (OSError, ValueError):
+            return False
+        for root in self._profile_cache_dirs():
+            with suppress(OSError, ValueError):
+                if resolved.is_relative_to(root.resolve()):
+                    return True
+        return False
 
     def _inbound_archive_instance(self):
         if self._inbound_archive is None:
             from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive
-            home = Path(getattr(self, "_inbound_archive_home", get_hermes_home()))
+            home = Path(getattr(self, "_inbound_archive_home", None) or get_hermes_home())
             self._inbound_archive = WhatsAppInboundArchive(
-                home / "whatsapp" / "inbound-archive-v1", home, _cache_dirs(),
+                home / "whatsapp" / "inbound-archive-v1", home, self._profile_cache_dirs(),
             )
         return self._inbound_archive
 
@@ -326,20 +368,32 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         turn receives a fresh cache copy, never an observe-only event.
         """
         manifest = self._trusted_archive_manifest(materialized)
+        image_dir, audio_dir, video_dir, document_dir = self._profile_cache_dirs()
         visible_paths: list[str] = []
         for owned_path, descriptor in zip(manifest.paths, manifest.descriptors):
             kind = str(descriptor.get("kind") or "").lower()
             data = Path(owned_path).read_bytes()
             filename = str(descriptor.get("file_name") or "")
             suffix = Path(filename).suffix.lower()
+            validate_inbound_media_size(len(data), media_type=kind or "media")
             if kind == "image":
-                visible_paths.append(cache_image_from_bytes(data, ext=suffix or ".jpg"))
+                from gateway.platforms.base import _looks_like_image
+                if not _looks_like_image(data):
+                    raise ValueError("refusing non-image inbound bytes")
+                target = image_dir / f"img_{uuid.uuid4().hex[:12]}{suffix or '.jpg'}"
             elif kind in {"audio", "ptt", "voice"}:
-                visible_paths.append(cache_audio_from_bytes(data, ext=suffix or ".ogg"))
+                target = audio_dir / f"audio_{uuid.uuid4().hex[:12]}{suffix or '.ogg'}"
             elif kind == "video":
-                visible_paths.append(cache_video_from_bytes(data, ext=suffix or ".mp4"))
+                target = video_dir / f"video_{uuid.uuid4().hex[:12]}{suffix or '.mp4'}"
             else:
-                visible_paths.append(cache_document_from_bytes(data, filename or "document"))
+                safe_name = (Path(filename).name if filename else "document").replace("\x00", "").strip() or "document"
+                target = document_dir / f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+            if not target.resolve().is_relative_to(target.parent.resolve()):
+                raise ValueError("attachment cache path escaped profile root")
+            target.write_bytes(data)
+            with suppress(OSError):
+                target.chmod(0o600)
+            visible_paths.append(str(target))
         return _ArchiveOwnedManifest(manifest.capability, tuple(visible_paths), manifest.descriptors)
 
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
@@ -360,7 +414,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return [], 1 if data.get("hasMedia") else 0
         slots: list[Optional[str]] = []
         for raw_url in raw_urls:
-            slots.append(raw_url if isinstance(raw_url, str) and os.path.isabs(raw_url) and _is_allowed_bridge_path(raw_url) else None)
+            slots.append(raw_url if isinstance(raw_url, str) and os.path.isabs(raw_url) and self._is_allowed_profile_bridge_path(raw_url) else None)
         return slots, len(raw_urls)
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
@@ -474,7 +528,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         else:
             bridge_env.pop("WHATSAPP_ALLOWED_USERS", None)
         # Without these the bridge hardcodes ~/.hermes/{image,audio,document}_cache (wrong under HERMES_HOME/profiles/cache layout).
-        img_dir, audio_dir, _video_dir, doc_dir = _cache_dirs()
+        img_dir, audio_dir, _video_dir, doc_dir = self._profile_cache_dirs()
         bridge_env.update(HERMES_IMAGE_CACHE_DIR=str(img_dir), HERMES_AUDIO_CACHE_DIR=str(audio_dir), HERMES_DOCUMENT_CACHE_DIR=str(doc_dir))
         return bridge_env
 
@@ -902,7 +956,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 accepted.append((url, mime))
             elif label is not None and isinstance(url, str) and os.path.isabs(url):
                 descriptor = trusted_media.get(url)
-                if descriptor is not None or _is_allowed_bridge_path(url):
+                if descriptor is not None or self._is_allowed_profile_bridge_path(url):
                     accepted.append((url, mime))
                     print(f"[{self.name}] Using bridge-cached {label}: {url}", flush=True)
                 else:
@@ -941,7 +995,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         quoted_type = str(data.get("quotedMediaType") or "").strip()
         accepted: list[tuple[str, str]] = []
         for path in data.get("quotedMediaUrls") or []:
-            if not (isinstance(path, str) and os.path.isabs(path) and _is_allowed_bridge_path(path)):
+            if not (isinstance(path, str) and os.path.isabs(path) and self._is_allowed_profile_bridge_path(path)):
                 print(f"[{self.name}] Rejected quoted-media path outside cache dir: {path}", flush=True)
                 continue
             accepted.append((path, _QUOTED_MIME_BY_BRIDGE_KIND.get(quoted_type, "application/octet-stream")))
