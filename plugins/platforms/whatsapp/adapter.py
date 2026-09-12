@@ -185,7 +185,9 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
-    BasePlatformAdapter, SendResult, SUPPORTED_DOCUMENT_TYPES, cache_image_from_url, cache_audio_from_url,
+    BasePlatformAdapter, SendResult, SUPPORTED_DOCUMENT_TYPES,
+    cache_audio_from_bytes, cache_audio_from_url, cache_document_from_bytes,
+    cache_image_from_bytes, cache_image_from_url, cache_video_from_bytes,
 )
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
@@ -314,6 +316,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not paths or len(paths) != len(descriptors):
             raise ValueError("incomplete archive-owned manifest")
         return _ArchiveOwnedManifest(self._archive_manifest_capability, paths, descriptors)
+
+    def _agent_visible_archive_manifest(self, materialized) -> _ArchiveOwnedManifest:
+        """Copy complete owned bytes into existing agent-visible cache mounts.
+
+        Archive objects stay private to the profile.  Only an admitted operating
+        turn receives a fresh cache copy, never an observe-only event.
+        """
+        manifest = self._trusted_archive_manifest(materialized)
+        visible_paths: list[str] = []
+        for owned_path, descriptor in zip(manifest.paths, manifest.descriptors):
+            kind = str(descriptor.get("kind") or "").lower()
+            data = Path(owned_path).read_bytes()
+            filename = str(descriptor.get("file_name") or "")
+            suffix = Path(filename).suffix.lower()
+            if kind == "image":
+                visible_paths.append(cache_image_from_bytes(data, ext=suffix or ".jpg"))
+            elif kind in {"audio", "ptt", "voice"}:
+                visible_paths.append(cache_audio_from_bytes(data, ext=suffix or ".ogg"))
+            elif kind == "video":
+                visible_paths.append(cache_video_from_bytes(data, ext=suffix or ".mp4"))
+            else:
+                visible_paths.append(cache_document_from_bytes(data, filename or "document"))
+        return _ArchiveOwnedManifest(manifest.capability, tuple(visible_paths), manifest.descriptors)
 
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
         """Keep authorized inbound evidence locally without changing admission."""
@@ -795,7 +820,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     )
                                     if not materialized.complete:
                                         continue
-                                    manifest = self._trusted_archive_manifest(materialized)
+                                    manifest = await asyncio.to_thread(
+                                        self._agent_visible_archive_manifest, materialized,
+                                    )
                                     event_data["mediaUrls"] = list(manifest.paths)
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
