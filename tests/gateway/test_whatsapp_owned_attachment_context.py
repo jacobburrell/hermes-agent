@@ -82,6 +82,37 @@ async def test_owned_whatsapp_image_becomes_native_model_attachment_not_bridge_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "mime", "filename", "content", "cache_subdir"),
+    [
+        ("audio", "audio/mpeg", "call.mp3", b"ID3\x04owned audio", "audio"),
+        ("video", "video/mp4", "walk.mp4", b"\x00\x00\x00\x18ftypmp42owned video", "videos"),
+    ],
+)
+async def test_owned_whatsapp_media_uses_agent_visible_copy_not_bridge_or_archive(
+    tmp_path, monkeypatch, kind, mime, filename, content, cache_subdir,
+):
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    bridge_path = cache / f"bridge-{filename}"; bridge_path.write_bytes(content)
+    raw = _raw("media", mediaType=kind, mime=mime, fileName=filename)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    event_id, _ = archive.record(raw, "operate")
+    result = archive.materialize(event_id, raw, [str(bridge_path)])
+    adapter = _adapter(); manifest = adapter._agent_visible_archive_manifest(result)
+    event_data = dict(raw); event_data["mediaUrls"] = list(manifest.paths)
+    event = await adapter._build_message_event(event_data, already_admitted=True, archive_manifest=manifest)
+
+    exposed = Path(event.media_urls[0])
+    assert result.complete and exposed.read_bytes() == content
+    assert exposed.parent == home / "cache" / cache_subdir
+    assert str(bridge_path) not in event.media_urls and str(result.owned_paths[0]) not in event.media_urls
+    runner = _runner(); source = _source()
+    prompt = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+    assert str(exposed) in prompt and str(bridge_path) not in prompt and str(result.owned_paths[0]) not in prompt
+
+
+@pytest.mark.asyncio
 async def test_owned_whatsapp_document_uses_agent_cache_copy_not_bridge_path(tmp_path, monkeypatch):
     home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
