@@ -285,6 +285,38 @@ async def test_multiplexed_ambient_archive_and_agent_copy_stay_with_adapter_prof
     } == profile_b_cache_files_before
 
 
+def test_profile_cache_symlink_is_rejected_before_inbound_or_agent_visible_write(tmp_path):
+    """A profile-relative cache symlink must never route owned bytes to another profile."""
+    profile_a, profile_b = tmp_path / "profiles" / "a", tmp_path / "profiles" / "b"
+    profile_a.mkdir(parents=True); profile_b.mkdir(parents=True)
+    (profile_a / "cache").symlink_to(profile_b, target_is_directory=True)
+    owned = tmp_path / "owned.png"
+    owned.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\x0dIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05"
+        b"\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_archive = None
+    adapter._inbound_archive_home = profile_a.resolve()
+    adapter._archive_manifest_capability = object()
+
+    # The incoming bridge path is not trusted once the owner's cache root is
+    # redirected.  Neither archive materialization nor an admitted handoff
+    # may create any file in profile B.
+    assert not adapter._is_allowed_profile_bridge_path(str(profile_b / "incoming.png"))
+    with pytest.raises(ValueError, match="symlink"):
+        adapter._inbound_archive_instance()
+    materialized = type("Materialized", (), {
+        "owned_paths": (str(owned),),
+        "owned_descriptors": ({"kind": "image", "mime": "image/png", "file_name": "owned.png"},),
+    })()
+    with pytest.raises(ValueError, match="symlink"):
+        adapter._agent_visible_archive_manifest(materialized)
+    assert not any(path.is_file() for path in profile_b.rglob("*"))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind,mime,file_name,expected_type,content", [
     ("image", "image/jpeg", "photo.jpg", MessageType.PHOTO, b"image"),

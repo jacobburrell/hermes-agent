@@ -322,7 +322,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("cache/documents", "document_cache", home=home),
         )
         for root in roots:
+            try:
+                relative = root.relative_to(home)
+            except ValueError as exc:
+                raise ValueError("attachment cache root escaped owner profile") from exc
+            # Creating a profile-relative spelling is not enough: a preexisting
+            # cache or legacy-cache ancestor may be a symlink into another
+            # profile.  Reject before mkdir/write rather than following it.
+            ancestor = home
+            for part in relative.parts:
+                ancestor /= part
+                if ancestor.is_symlink():
+                    raise ValueError("attachment cache root contains a symlink")
             root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                if not root.resolve().is_relative_to(home):
+                    raise ValueError("attachment cache root resolved outside owner profile")
+            except OSError as exc:
+                raise ValueError("attachment cache root could not be resolved") from exc
         return roots
 
     def _is_allowed_profile_bridge_path(self, value: str) -> bool:
@@ -337,7 +354,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             resolved = Path(value).resolve()
         except (OSError, ValueError):
             return False
-        for root in self._profile_cache_dirs():
+        try:
+            roots = self._profile_cache_dirs()
+        except ValueError:
+            return False
+        for root in roots:
             with suppress(OSError, ValueError):
                 if resolved.is_relative_to(root.resolve()):
                     return True
