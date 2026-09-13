@@ -425,21 +425,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _agent_visible_quoted_media_paths(self, data: Dict[str, Any]) -> tuple[str, ...] | None:
         """Replace bridge quote-cache paths with copies of prior owned media.
 
-        ``None`` means the bridge did not supply quoted media and preserves
-        the outbound-media fallback in :meth:`_quoted_media`.  An empty tuple
-        means it did supply a path but the exact quoted inbound record is not
-        durably available, so it must not reach Jack as a transient reference.
+        Inbound quote recovery is exact-chat only.  A ``quotedRemoteJid`` may
+        be absent for a native same-chat reply, but when it is present it must
+        canonically match the authenticated enclosing ``chatId``. ``None``
+        preserves the outbound-media fallback in :meth:`_quoted_media`; an
+        empty tuple rejects bridge-supplied media that lacks a matching owned
+        inbound record.
         """
         raw_paths = data.get("quotedMediaUrls")
-        if not isinstance(raw_paths, list) or not raw_paths:
-            return None
-        quote_id = data.get("quotedMessageId")
-        quote_chat = data.get("quotedRemoteJid") or data.get("chatId")
+        has_bridge_paths = isinstance(raw_paths, list) and bool(raw_paths)
+        quote_id = str(data.get("quotedMessageId") or "").strip()
+        enclosing_chat = self._normalize_whatsapp_id(data.get("chatId"))
+        quoted_chat = self._normalize_whatsapp_id(data.get("quotedRemoteJid"))
+        if not quote_id or not enclosing_chat:
+            return () if has_bridge_paths else None
+        if quoted_chat and quoted_chat != enclosing_chat:
+            # Never use a quote's remote JID to cross the enclosing message's
+            # chat boundary. Keep the ordinary outbound fallback only when
+            # the bridge did not supply a transient inbound-cache path.
+            return () if has_bridge_paths else None
         materialized = self._inbound_archive_instance().materialized_message_attachments(
-            quote_chat, quote_id,
+            enclosing_chat, quote_id,
         )
         if materialized is None:
-            return ()
+            return () if has_bridge_paths else None
         return self._agent_visible_archive_manifest(materialized).paths
 
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
@@ -1124,7 +1133,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 except Exception:
                                     logger.warning("[%s] WhatsApp owned-media exposure failed; suppressing dispatch", self.name)
                                     continue
-                            if event_data.get("quotedMediaUrls"):
+                            if event_data.get("hasQuotedMessage") and event_data.get("quotedMessageId"):
                                 try:
                                     quoted_paths = await asyncio.to_thread(
                                         self._agent_visible_quoted_media_paths, event_data,

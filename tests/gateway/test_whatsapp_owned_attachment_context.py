@@ -285,7 +285,10 @@ async def test_native_bridge_document_is_archived_then_exposed_to_model_with_cap
 
 
 @pytest.mark.asyncio
-async def test_native_reply_uses_prior_owned_attachment_not_bridge_quote_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("quote_cache_state", ["present", "gone"])
+async def test_native_reply_uses_prior_owned_attachment_not_bridge_quote_path(
+    tmp_path, monkeypatch, quote_cache_state,
+):
     """A reply/forward quote reuses the durable original bytes, not a cache URL."""
     home = tmp_path / "profile"
     image_cache = home / "cache" / "images"
@@ -310,7 +313,8 @@ async def test_native_reply_uses_prior_owned_attachment_not_bridge_quote_path(tm
         hasQuotedMessage=True, quotedMessageId="quoted-original",
         quotedRemoteJid="chat@g.us", quotedParticipant="1555000@s.whatsapp.net",
         quotedText="Original photo caption", quotedForwarded=True,
-        quotedMediaUrls=[str(bridge_original)], quotedMediaType="image",
+        quotedMediaUrls=([str(bridge_original)] if quote_cache_state == "present" else []),
+        quotedMediaType="image",
     )
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = SimpleNamespace(value="whatsapp")
@@ -385,6 +389,67 @@ def test_unarchived_quoted_attachment_is_not_exposed_from_bridge_cache(tmp_path,
         "quotedMessageId": "missing-original",
         "quotedMediaUrls": [str(bridge_path)],
     }) == ()
+
+
+@pytest.mark.asyncio
+async def test_cross_chat_quoted_media_cannot_escape_its_archived_chat(tmp_path, monkeypatch):
+    """An admitted reply cannot use its quote metadata to disclose another chat's file."""
+    home = tmp_path / "profile"
+    image_cache = home / "cache" / "images"
+    image_cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    bridge_path = image_cache / "other-chat-bridge.png"
+    bridge_path.write_bytes(_PNG)
+    archive = WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, image_cache,
+    )
+    other_chat_original = _raw(
+        "cross-chat-original", chatId="other-chat@g.us", mediaType="image",
+        mime="image/png", fileName="other-chat.png",
+    )
+    original_id, _ = archive.record(other_chat_original, "observe")
+    assert archive.materialize(original_id, other_chat_original, [str(bridge_path)]).complete
+
+    reply = _raw(
+        "cross-chat-reply", hasMedia=False, mediaType="", mime="", fileName="",
+        body="Please inspect the quoted image.", hasQuotedMessage=True,
+        quotedMessageId="cross-chat-original", quotedRemoteJid="other-chat@g.us",
+        quotedText="Other chat caption", quotedMediaUrls=[str(bridge_path)],
+        quotedMediaType="image",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._running = True
+    adapter._bridge_port = 1
+    adapter._http_session = _OneMessageSession(adapter, reply)
+    adapter._bridge_req = lambda _method, _path, _timeout, **_kwargs: adapter._http_session.get()
+    adapter._inbound_archive = archive
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = lambda _data: True
+    adapter._should_process_message = lambda _data: True
+    adapter._message_is_reply_to_bot = lambda _data: True
+    adapter._send_read_receipt = AsyncMock()
+    adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+    received = []
+    adapter.handle_message = AsyncMock()
+    adapter._enqueue_text_event = received.append
+
+    await asyncio.wait_for(adapter._poll_messages(), timeout=2)
+
+    assert len(received) == 1
+    event = received[0]
+    assert event.media_urls == []
+    assert event.raw_message["quotedMediaUrls"] == []
+    assert str(bridge_path) not in event.text
+    runner = _runner(); source = _source()
+    await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+    parts, skipped = build_native_content_parts(
+        event.text, runner._consume_pending_native_image_paths(build_session_key(source)),
+    )
+    assert not skipped
+    assert not any(part.get("type") == "image_url" for part in parts)
 
 
 @pytest.mark.asyncio
