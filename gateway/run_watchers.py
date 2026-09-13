@@ -179,6 +179,12 @@ class GatewaySessionWatchersMixin:
             return False
         from gateway.warning_notifications import present_notification
         from gateway.run import _async_profile_runtime_scope
+        # A stall report is gateway diagnostics.  A muted WhatsApp source still
+        # needs the one-episode latch so the watchdog does not retry/log-spam.
+        if not self._transient_notice_enabled_for_source(source):
+            logger.info("Session stall notify suppressed by source notice policy: session=%s", session_key)
+            notified_map[session_key] = True
+            return False
         try:
             metadata = self._thread_metadata_for_source(source)
             notice = format_session_stall_notification(idle_seconds)

@@ -891,6 +891,11 @@ class TurnRunner:
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
+        # Callers often check these policies before preparing status text, but
+        # configuration and turn ownership can change before this final send
+        # boundary.  Keep WhatsApp's final-answer-first policy authoritative.
+        if not self._status_live() or not self._runner._transient_notice_enabled_for_source(ctx.source):
+            return
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:

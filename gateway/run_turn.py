@@ -3399,6 +3399,11 @@ class GatewayTurnMixin:
         _warn_adapter = self._adapter_for_source(source)
         if not _warn_adapter:
             return
+        # This is progress diagnostics, not the final timeout result.  It must
+        # follow the same source-scoped final-answer-first policy as other
+        # transient notice rails.
+        if not self._transient_notice_enabled_for_source(source):
+            return
         try:
             await _warn_adapter.emit_warning(
                 source.chat_id, f"⚠️ I seem to be stuck (no activity for {int(worker.agent_warning // 60) or 1} min). "

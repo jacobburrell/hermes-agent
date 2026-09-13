@@ -445,6 +445,10 @@ class GatewayBusySessionMixin:
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
         else:
             message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+        # Queue/decline state is durable even when WhatsApp is final-answer-first.
+        # Do not make a restart or drain manufacture a visible transient notice.
+        if not self._busy_ack_enabled_for_source(event.source):
+            return
         await self._send_busy_reply(event, adapter, message)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.

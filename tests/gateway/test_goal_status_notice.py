@@ -52,6 +52,7 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
     adapter = FakeAdapter()
     runner.adapters = {Platform.DISCORD: adapter}
     runner.config = SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False)
+    runner._transient_notice_enabled_for_source = lambda _source: True
 
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -79,4 +80,18 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
         }
     ]
 
+
+@pytest.mark.asyncio
+async def test_goal_status_notice_is_silent_for_muted_whatsapp_but_goal_delivery_can_continue():
+    """Goal state is independent from the user-visible runtime-status rail."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.config = SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False)
+    runner._transient_notice_enabled_for_source = lambda _source: False
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="chat-a", user_id="owner")
+
+    await runner._send_goal_status_notice(source, "Goal blocked: internal detail")
+
+    assert adapter.calls == []
 

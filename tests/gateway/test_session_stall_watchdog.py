@@ -161,6 +161,7 @@ def _runner_for_stall(adapter: _FakeAdapter) -> GatewayRunner:
     r._thread_metadata_for_source = lambda source, *a, **k: {
         "thread_id": getattr(source, "thread_id", None)
     }
+    r._transient_notice_enabled_for_source = lambda _source: True
     return r
 
 
@@ -190,6 +191,21 @@ async def test_check_session_stalls_notifies_once(monkeypatch):
     sent2 = await runner._check_session_stalls(60)
     assert sent2 == 0
     assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_latches_muted_whatsapp_without_sending():
+    """A silent runtime policy must not turn a stuck turn into repeated chat diagnostics."""
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._transient_notice_enabled_for_source = lambda _source: False
+    session_key = "agent:main:whatsapp:group:quiet"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 0
+    assert adapter.sent == []
+    assert runner._session_stall_notified[session_key] is True
 
 
 @pytest.mark.asyncio

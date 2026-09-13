@@ -212,6 +212,10 @@ class GatewayGoalsMixin:
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
+        # Goal progress/blocked status is internal runtime state.  The actual
+        # continuation/final answer remains independently deliverable.
+        if not self._transient_notice_enabled_for_source(source):
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return

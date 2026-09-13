@@ -146,6 +146,81 @@ def test_busy_policy_only_changes_ack_visibility_not_event_admission() -> None:
     assert runner._busy_ack_enabled_for_source(event.source) is False
 
 
+@pytest.mark.asyncio
+async def test_busy_drain_mutates_queue_but_keeps_whatsapp_quiet() -> None:
+    """A restart/drain must retain the pending turn without manufacturing an ack."""
+    runner = _runner({})
+    event = MessageEvent(text="follow-up", message_type=MessageType.TEXT, source=_source(), message_id="m-drain")
+    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
+    queued: list[tuple[str, MessageEvent]] = []
+    runner._adapter_for_source = lambda _source: adapter
+    runner._queue_during_drain_enabled = lambda _mode: True
+    runner._queue_or_replace_pending_event = lambda key, pending: queued.append((key, pending))
+    runner._status_action_gerund = lambda: "restarting"
+
+    await runner._send_busy_drain_notice(event, "session-a", "queue")
+
+    assert queued == [("session-a", event)]
+    adapter._send_with_retry.assert_not_awaited()
+
+
+def test_status_transport_rechecks_live_source_policy() -> None:
+    """Pre-gated memory/interim callbacks cannot send after a live WhatsApp mute."""
+    source = _source()
+    runner = _runner({})
+    runner._transient_notice_enabled_for_source = lambda _source: False
+    scheduled: list[object] = []
+    ctx = SimpleNamespace(
+        source=source,
+        _status_adapter=SimpleNamespace(send=AsyncMock()),
+        _run_still_current=lambda: True,
+        _status_chat_id="chat-a",
+    )
+    turn = TurnRunner(runner, ctx)
+    turn._schedule = lambda coro, *_args: scheduled.append(coro)
+
+    turn._send_status_text("💾 Memory updated", None, "status send")
+
+    assert scheduled == []
+    ctx._status_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_transport_keeps_other_platforms_compatible() -> None:
+    source = _source(Platform.TELEGRAM)
+    runner = _runner({})
+    runner._transient_notice_enabled_for_source = lambda _source: True
+    scheduled: list[object] = []
+    adapter = SimpleNamespace(send=AsyncMock())
+    ctx = SimpleNamespace(
+        source=source,
+        _status_adapter=adapter,
+        _run_still_current=lambda: True,
+        _status_chat_id="chat-a",
+    )
+    turn = TurnRunner(runner, ctx)
+    turn._schedule = lambda coro, *_args: scheduled.append(coro)
+
+    turn._send_status_text("Working", None, "status send")
+    assert len(scheduled) == 1
+    await scheduled.pop()
+    adapter.send.assert_awaited_once_with("chat-a", "Working", metadata=None)
+
+
+@pytest.mark.asyncio
+async def test_inactivity_warning_respects_whatsapp_transient_policy() -> None:
+    source = _source()
+    runner = _runner({})
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner._adapter_for_source = lambda _source: adapter
+    runner._transient_notice_enabled_for_source = lambda _source: False
+    worker = SimpleNamespace(agent_warning=60, agent_timeout=120)
+
+    await runner._run_agent_inactivity_warning(worker, source, None)
+
+    adapter.send.assert_not_awaited()
+
+
 def _progress_turn(policy):
     """Build the actual editable-progress path with a minimal native adapter."""
     source = _source()
