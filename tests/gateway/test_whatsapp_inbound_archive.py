@@ -321,6 +321,21 @@ def _actual_node_spool_digest(event):
     return result.stdout.strip()
 
 
+@pytest.mark.parametrize(
+    "native_metadata",
+    (
+        {"latitude": 0.000001},
+        {"latitude": 0.0000001},
+        {"latitude": -0.0},
+        {"location": {"latitude": 0.000001, "longitude": 0.0000001, "altitude": -0.0}},
+    ),
+    ids=("fixed-boundary", "exponent-boundary", "negative-zero", "nested-metadata"),
+)
+def test_bridge_digest_matches_node_number_serialization_boundaries(native_metadata):
+    event = _raw(mid="numeric", nativeMetadata=native_metadata)
+    assert bridge_event_digest(event) == _actual_node_spool_digest(event)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ("body", "quote", "media-descriptor"))
 async def test_actual_node_digest_contract_rejects_mutated_leased_event(mutation):

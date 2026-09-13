@@ -66,9 +66,35 @@ def _node_digest_json(value: Any) -> str:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ArchiveRejected("non-finite bridge number")
+        # JSON.stringify(-0) is "0", unlike Python's json module.
+        if value == 0:
+            return "0"
         if value.is_integer():
             return _node_digest_json(int(value))
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        # ECMAScript switches to fixed notation for [1e-6, 1e21), while
+        # Python's shortest representation switches much earlier and pads
+        # exponents (1e-07 vs 1e-7).  Start with Python's shortest round-trip
+        # digits, then render them using JavaScript's boundary rules.
+        rendered = repr(value).lower()
+        if "e" not in rendered:
+            return rendered
+        mantissa, exponent_text = rendered.split("e", 1)
+        exponent = int(exponent_text)
+        absolute = abs(value)
+        if absolute < 1e-6 or absolute >= 1e21:
+            sign = "+" if exponent >= 0 else "-"
+            return f"{mantissa}e{sign}{abs(exponent)}"
+        negative = mantissa.startswith("-")
+        digits = mantissa.removeprefix("-").replace(".", "")
+        before_decimal = len(mantissa.removeprefix("-").split(".", 1)[0])
+        position = before_decimal + exponent
+        if position <= 0:
+            fixed = "0." + "0" * (-position) + digits
+        elif position >= len(digits):
+            fixed = digits + "0" * (position - len(digits))
+        else:
+            fixed = digits[:position] + "." + digits[position:]
+        return ("-" if negative else "") + fixed
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     if isinstance(value, (list, tuple)):
