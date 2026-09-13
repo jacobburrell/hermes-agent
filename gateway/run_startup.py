@@ -307,7 +307,8 @@ class GatewayStartupMixin:
         solely so the send and receipt settlement share one durable identity.
         """
         from gateway.delivery_ledger import (
-            bridge_recovery_obligation, compute_obligation_id,
+            bridge_recovery_obligation, claim_bridge_recovery_obligation,
+            compute_obligation_id,
             hold_bridge_recovery_obligation,
         )
 
@@ -340,6 +341,12 @@ class GatewayStartupMixin:
                     reason="recovery obligation identity mismatch",
                 )
                 return
+            # A substantive final already ledgered before the crash is the
+            # durable answer owed to the user.  Preserve its exact text and
+            # id; never overwrite it with the generic interruption wording.
+            content = existing["content"]
+            session_key = existing["session_key"]
+            obligation_id = existing["obligation_id"]
             if existing["state"] == "delivered":
                 await self._settle_bridge_recovery(archive, recovery, existing["obligation_id"])
                 return
@@ -372,6 +379,22 @@ class GatewayStartupMixin:
             if recovery.state != "delivery_registered" or recovery.obligation_id != obligation_id:
                 logger.error("WhatsApp bridge recovery has no compatible delivery registration")
                 return
+
+        # This is the one atomic authorization to send.  A competing startup
+        # worker sees the row as attempting and returns without creating a
+        # second bubble.  ``send_final_ledgered`` below reuses the exact row
+        # (its recovery insert is a no-op) and supplies the normal post-send
+        # finalization/settlement behavior.
+        claimed = await asyncio.to_thread(
+            claim_bridge_recovery_obligation,
+            delivery_id=recovery.delivery_id, generation=recovery.generation,
+            obligation_id=obligation_id, session_key=session_key,
+            platform=Platform.WHATSAPP.value, chat_id=recovery.chat_id,
+            thread_id=None, content=content,
+            adapter_profile=getattr(adapter, "_owner_profile", None),
+        )
+        if not claimed:
+            return
 
         event = MessageEvent(
             text="", message_type=MessageType.TEXT, source=source,

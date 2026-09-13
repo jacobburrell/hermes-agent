@@ -6,6 +6,7 @@ prove it never calls the model-facing inbound handler again.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -90,14 +91,22 @@ def _runner(archive):
     return runner, adapter
 
 
-def _recovery_and_obligation(runner, archive, delivery_id="a" * 64):
+def _orphan_obligation(obligation_id):
+    with dl._connect() as db:
+        db.execute(
+            "UPDATE delivery_obligations SET owner_pid=?,owner_started_at=? WHERE obligation_id=?",
+            (999999999, 1, obligation_id),
+        )
+
+
+def _recovery_and_obligation(runner, archive, delivery_id="a" * 64, content=_CLARIFICATION):
     recovery = archive.reserve_bridge_recovery(delivery_id)
     assert recovery is not None and not recovery.is_group
     source = runner._bridge_recovery_source(runner.adapters[Platform.WHATSAPP], recovery)
     from gateway.session import build_session_key
 
     key = build_session_key(source, profile=source.profile)
-    obligation_id = dl.compute_obligation_id(key, recovery.delivery_id, _CLARIFICATION)
+    obligation_id = dl.compute_obligation_id(key, recovery.delivery_id, content)
     assert archive.register_bridge_recovery_delivery(recovery, obligation_id)
     return recovery, obligation_id, key
 
@@ -173,11 +182,34 @@ async def test_pending_ledger_row_sends_its_exact_existing_clarification_once(tm
         adapter_profile="jackwhatsapp", bridge_recovery_delivery_id=recovery.delivery_id,
         bridge_recovery_generation=recovery.generation,
     )
+    _orphan_obligation(obligation_id)
 
     await runner._recover_pending_whatsapp_bridge_handoffs()
     await runner._recover_pending_whatsapp_bridge_handoffs()
 
     assert [item[1] for item in adapter.sent] == [_CLARIFICATION]
+    assert archive.pending_bridge_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_pending_substantive_final_is_delivered_verbatim_not_replaced(tmp_path):
+    archive = _acked_archive(tmp_path)
+    runner, adapter = _runner(archive)
+    substantive = "The verified filing is ready for your review."
+    recovery, obligation_id, key = _recovery_and_obligation(
+        runner, archive, content=substantive,
+    )
+    dl.record_obligation(
+        obligation_id=obligation_id, session_key=key, platform="whatsapp",
+        chat_id=recovery.chat_id, thread_id=None, content=substantive,
+        adapter_profile="jackwhatsapp", bridge_recovery_delivery_id=recovery.delivery_id,
+        bridge_recovery_generation=recovery.generation,
+    )
+    _orphan_obligation(obligation_id)
+
+    await runner._recover_pending_whatsapp_bridge_handoffs()
+
+    assert [item[1] for item in adapter.sent] == [substantive]
     assert archive.pending_bridge_recoveries() == []
 
 
@@ -213,6 +245,41 @@ async def test_two_startup_workers_do_not_duplicate_direct_recovery(tmp_path):
     second.adapters = {Platform.WHATSAPP: adapter}
     second._profile_adapters = {"jackwhatsapp": {Platform.WHATSAPP: adapter}}
 
+    await asyncio.gather(
+        first._recover_pending_whatsapp_bridge_handoffs(),
+        second._recover_pending_whatsapp_bridge_handoffs(),
+    )
+
+    assert [item[1] for item in adapter.sent] == [_CLARIFICATION]
+    assert archive.pending_bridge_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_two_workers_racing_after_registered_before_ledger_get_one_send(tmp_path, monkeypatch):
+    """Crash window: archive registration committed, ledger insertion did not."""
+    archive = _acked_archive(tmp_path)
+    first, adapter = _runner(archive)
+    second, _ = _runner(archive)
+    second.adapters = {Platform.WHATSAPP: adapter}
+    second._profile_adapters = {"jackwhatsapp": {Platform.WHATSAPP: adapter}}
+    recovery = archive.reserve_bridge_recovery("a" * 64)
+    source = first._bridge_recovery_source(adapter, recovery)
+    from gateway.session import build_session_key
+
+    oid = dl.compute_obligation_id(
+        build_session_key(source, profile=source.profile), recovery.delivery_id, _CLARIFICATION,
+    )
+    assert archive.register_bridge_recovery_delivery(recovery, oid)
+
+    original_lookup = dl.bridge_recovery_obligation
+    rendezvous = threading.Barrier(2)
+
+    def synchronized_lookup(*args, **kwargs):
+        result = original_lookup(*args, **kwargs)
+        rendezvous.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(dl, "bridge_recovery_obligation", synchronized_lookup)
     await asyncio.gather(
         first._recover_pending_whatsapp_bridge_handoffs(),
         second._recover_pending_whatsapp_bridge_handoffs(),

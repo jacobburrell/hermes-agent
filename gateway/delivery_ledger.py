@@ -326,7 +326,8 @@ def bridge_recovery_obligation(delivery_id: str, generation: int) -> Optional[Di
     normalized_id, normalized_generation = _bridge_recovery_correlation(delivery_id, generation)
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT obligation_id, state, attempts, platform, chat_id, adapter_profile
+            """SELECT obligation_id, state, attempts, platform, chat_id, adapter_profile,
+                      session_key, content
                FROM delivery_obligations
                WHERE bridge_recovery_delivery_id=? AND bridge_recovery_generation=?""",
             (normalized_id, normalized_generation),
@@ -336,9 +337,59 @@ def bridge_recovery_obligation(delivery_id: str, generation: int) -> Optional[Di
     return {
         "obligation_id": row[0], "state": row[1], "attempts": row[2],
         "platform": row[3], "chat_id": row[4], "profile": row[5] or "default",
+        "session_key": row[6], "content": row[7],
         "bridge_recovery_delivery_id": normalized_id,
         "bridge_recovery_generation": normalized_generation,
     }
+
+
+def claim_bridge_recovery_obligation(*, delivery_id: str, generation: int,
+                                     obligation_id: str, session_key: str, platform: str,
+                                     chat_id: str, thread_id: Optional[str], content: str,
+                                     adapter_profile: Optional[str]) -> bool:
+    """Atomically create or claim the one safe-to-send recovery final.
+
+    A recovery archive row can survive a crash after its registration but
+    before the ledger insertion.  Two startup workers must not both turn that
+    gap into an outbound clarification.  This transaction is the sole send
+    claim: it creates an ``attempting`` row once, or adopts an exact pending
+    row left by a dead owner.  Ambiguous rows stay out of this path.
+    """
+    normalized_id, normalized_generation = _bridge_recovery_correlation(delivery_id, generation)
+    now, (pid, started) = time.time(), _owner_stamp()
+    profile = str(adapter_profile).strip() if adapter_profile else "default"
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT obligation_id,state,owner_pid,owner_started_at
+               FROM delivery_obligations
+               WHERE bridge_recovery_delivery_id=? AND bridge_recovery_generation=?""",
+            (normalized_id, normalized_generation),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id,session_key,platform,chat_id,thread_id,content,state,attempts,
+                    created_at,updated_at,owner_pid,owner_started_at,adapter_profile,
+                    bridge_recovery_delivery_id,bridge_recovery_generation)
+                   VALUES(?,?,?,?,?,?, 'attempting',1,?,?,?,?,?,?,?)""",
+                (obligation_id, session_key, platform, str(chat_id),
+                 str(thread_id) if thread_id else None, content, now, now, pid, started,
+                 profile, normalized_id, normalized_generation),
+            )
+            return True
+        if str(row[0]) != str(obligation_id) or str(row[1]) != "pending":
+            return False
+        if _owner_alive(row[2], row[3]):
+            return False
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting',attempts=attempts+1,updated_at=?,owner_pid=?,owner_started_at=?,last_error=NULL
+               WHERE bridge_recovery_delivery_id=? AND bridge_recovery_generation=?
+                 AND obligation_id=? AND state='pending' AND owner_pid IS ? AND owner_started_at IS ?""",
+            (now, pid, started, normalized_id, normalized_generation, obligation_id, row[2], row[3]),
+        )
+        return cursor.rowcount == 1
 
 
 def hold_bridge_recovery_obligation(delivery_id: str, generation: int, *, reason: str) -> bool:
