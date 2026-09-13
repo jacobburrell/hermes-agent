@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
+import { createOutboundOwnershipLedger, isVerifiedOutboundQuote } from './outbound_ownership.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   createInboundSpool,
@@ -76,11 +77,9 @@ const WHATSAPP_DEBUG =
 // "owner just typed in this customer chat" — needed for handover / sliding
 // TTL flows. Default OFF: existing deployments see no behavior change.
 //
-// Heuristic limitation: we distinguish bot-API-sent from owner-typed by
-// looking up `key.id` in `recentlySentIds` (populated when /send returns).
-// On bridge restart that set is empty, so a few in-flight bot replies may
-// briefly look like owner-typed until they age out. Acceptable; we don't
-// persist the set.
+// `recentlySentIds` is only an echo suppressor. Native quote admission uses
+// the separately scoped outbound-ownership ledger; a stanza id alone cannot
+// establish ownership across chats or linked-account rotations.
 const FORWARD_OWNER_MESSAGES =
   typeof process !== 'undefined' &&
   process.env &&
@@ -208,8 +207,22 @@ function rememberSentMessage(sent, payload) {
   }
 }
 
-function trackSentMessageId(sent) {
+function trackSentMessageId(sent, chatId) {
   rememberSentId(sent?.key?.id);
+<<<<<<< HEAD
+=======
+  try {
+    outboundOwnership.remember({
+      messageId: sent?.key?.id,
+      chatId,
+      accountNamespace: inboundAccountNamespace(),
+    });
+  } catch (err) {
+    // The current process retains only a narrowly scoped in-memory proof;
+    // after a failed directory fsync a restart will conservatively deny.
+    console.warn('[bridge] failed to persist outbound ownership:', err?.message || err);
+  }
+>>>>>>> c0b585f3de (fix(whatsapp): scope native reply admission)
 }
 
 function redactWhatsAppId(value) {
@@ -237,6 +250,9 @@ mkdirSync(SESSION_DIR, { recursive: true });
 // profile/account's record.
 const INBOUND_PROFILE_NAMESPACE = opaqueInboundProfileNamespace(SESSION_DIR);
 const inboundSpool = createInboundSpool(path.join(SESSION_DIR, 'inbound-spool-v1'));
+const outboundOwnership = createOutboundOwnershipLedger({
+  filePath: path.join(SESSION_DIR, 'outbound-owned-v1.json'),
+});
 const inboundStageFailures = { accountNotReady: 0, persistence: 0 };
 
 function inboundAccountNamespace() {
@@ -753,6 +769,14 @@ async function startSocket() {
         lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
+      event.quotedOutboundByJack = isVerifiedOutboundQuote({
+        messageId: event.quotedMessageId,
+        chatId,
+        quotedRemoteJid: event.quotedRemoteJid,
+        quotedRemoteJidPresent: event.quotedRemoteJidPresent,
+        accountNamespace: inboundAccountNamespace(),
+        ownershipLedger: outboundOwnership,
+      });
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -866,7 +890,7 @@ app.post('/send', async (req, res) => {
         messageStore,
       });
       const sent = await sendWithTimeout(chatId, payload, options);
-      trackSentMessageId(sent);
+      trackSentMessageId(sent, chatId);
       messageStore.remember(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
@@ -904,7 +928,7 @@ app.post('/edit', async (req, res) => {
     if (chunks.length > 1) {
       for (let i = 1; i < chunks.length; i += 1) {
         const sent = await sendWithTimeout(chatId, { text: chunks[i] });
-        trackSentMessageId(sent);
+        trackSentMessageId(sent, chatId);
         if (sent?.key?.id) messageIds.push(sent.key.id);
         if (i < chunks.length - 1) {
           await sleep(CHUNK_DELAY_MS);
@@ -1009,7 +1033,7 @@ app.post('/send-media', async (req, res) => {
     }
 
     const sent = await sendWithTimeout(chatId, msgPayload);
-    trackSentMessageId(sent);
+    trackSentMessageId(sent, chatId);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
@@ -1033,7 +1057,7 @@ app.post('/send-poll', async (req, res) => {
   try {
     const payload = buildPollPayload({ question, options, selectableCount });
     const sent = await sendWithTimeout(chatId, payload);
-    trackSentMessageId(sent);
+    trackSentMessageId(sent, chatId);
     rememberSentMessage(sent, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
@@ -1055,7 +1079,7 @@ app.post('/send-location', async (req, res) => {
   try {
     const payload = buildLocationPayload({ latitude, longitude, name, address });
     const sent = await sendWithTimeout(chatId, payload);
-    trackSentMessageId(sent);
+    trackSentMessageId(sent, chatId);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {

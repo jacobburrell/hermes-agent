@@ -20,9 +20,25 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- WhatsApp identity canonicalization ----------------------------------
+{
+  // A device suffix is valid JID syntax.  The old ':' -> '@' substitution
+  // produced an invalid double-@ form before Python could normalize it.
+  assert.equal(
+    normalizeWhatsAppId('15551234567:7@s.whatsapp.net'),
+    '15551234567:7@s.whatsapp.net',
+  );
+  assert.equal(normalizeWhatsAppId('15551234567@c.us'), '15551234567@c.us');
+  assert.equal(normalizeWhatsAppId('15551234567@lid'), '15551234567@lid');
+  assert.equal(normalizeWhatsAppId('15551234567@@s.whatsapp.net'), '');
+  assert.equal(normalizeWhatsAppId('15551234567:7@s.whatsapp.net@evil'), '');
+  console.log('  ✓ JID normalization preserves devices and rejects malformed identities');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {
@@ -127,6 +143,90 @@ import {
   assert.equal(event.hasQuotedMessage, true);
   assert.equal(event.body, 'approved');
   console.log('  ✓ inbound quoted metadata includes quoted text');
+}
+
+// -- native quote ownership metadata -------------------------------------
+{
+  // Baileys can omit remoteJid for a native reply in the enclosing chat.  It
+  // must remain distinguishable from an explicitly malformed/conflicting JID
+  // so the scoped outbound ownership ledger can fail closed.
+  const base = {
+    key: {
+      id: 'incoming-native-reply',
+      remoteJid: '15551234567:7@s.whatsapp.net',
+      participant: '15550001111@s.whatsapp.net',
+      fromMe: false,
+    },
+    messageTimestamp: 123,
+    message: {
+      extendedTextMessage: {
+        text: 'continue',
+        contextInfo: {
+          stanzaId: 'jack-outbound-device',
+          participant: '15559998888:3@s.whatsapp.net',
+          quotedMessage: { conversation: 'previous Jack reply' },
+        },
+      },
+    },
+  };
+  const absent = await extractBridgeEvent({
+    msg: base,
+    chatId: '15551234567:7@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: ['15559998888:3@s.whatsapp.net'],
+    downloadMedia: async () => Buffer.from(''),
+  });
+  assert.equal(absent.quotedRemoteJidPresent, false);
+  assert.equal(absent.quotedRemoteJid, null);
+  assert.equal(absent.quotedParticipant, '15559998888:3@s.whatsapp.net');
+
+  const conflictMessage = structuredClone(base);
+  conflictMessage.message.extendedTextMessage.contextInfo.remoteJid = '15550000000@s.whatsapp.net';
+  const conflict = await extractBridgeEvent({
+    msg: conflictMessage,
+    chatId: '15551234567:7@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: ['15559998888:3@s.whatsapp.net'],
+    downloadMedia: async () => Buffer.from(''),
+  });
+  assert.equal(conflict.quotedRemoteJidPresent, true);
+  assert.equal(conflict.quotedRemoteJid, '15550000000@s.whatsapp.net');
+  console.log('  ✓ native reply metadata preserves absent remote and explicit conflict');
+}
+
+// -- forwarded provenance belongs to the quoted message -----------------
+{
+  const makeEvent = async ({ outerForwarded, quotedForwarded }) => extractBridgeEvent({
+    msg: {
+      key: { id: 'forwarded-shape', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: 'reply',
+          contextInfo: {
+            stanzaId: 'quoted-1',
+            ...(outerForwarded ? { isForwarded: true } : {}),
+            quotedMessage: {
+              extendedTextMessage: {
+                text: 'quoted text',
+                contextInfo: quotedForwarded ? { isForwarded: true } : {},
+              },
+            },
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    downloadMedia: async () => Buffer.from(''),
+  });
+
+  assert.equal((await makeEvent({ outerForwarded: true, quotedForwarded: false })).quotedForwarded, false);
+  assert.equal((await makeEvent({ outerForwarded: false, quotedForwarded: true })).quotedForwarded, true);
+  console.log('  ✓ forwarded provenance is read from the quoted payload only');
 }
 
 // -- reply to uncaptioned quoted media resolves the cached original file --
