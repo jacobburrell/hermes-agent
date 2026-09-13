@@ -37,6 +37,9 @@ class BridgeReceipt:
     ready: bool
     acknowledged: bool
     recovery_pending: bool
+    # Album members share one recovery fence.  This is an opaque, profile
+    # private digest; it is never exposed through metadata or diagnostics.
+    album_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +216,7 @@ class WhatsAppInboundArchive:
                 token TEXT NOT NULL,
                 ready INTEGER NOT NULL DEFAULT 0,
                 recovery_pending INTEGER NOT NULL DEFAULT 0,
+                album_key TEXT,
                 acknowledged INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -240,6 +244,15 @@ class WhatsAppInboundArchive:
                     "ALTER TABLE archive_bridge_receipt "
                     "ADD COLUMN recovery_pending INTEGER NOT NULL DEFAULT 0"
                 )
+            if "album_key" not in columns:
+                db.execute("ALTER TABLE archive_bridge_receipt ADD COLUMN album_key TEXT")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS archive_bridge_receipt_album_recovery "
+                "ON archive_bridge_receipt(profile_scope,album_key,recovery_pending,acknowledged)"
+            )
+            event_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_event)")}
+            if "source_timestamp_ms" not in event_columns:
+                db.execute("ALTER TABLE archive_event ADD COLUMN source_timestamp_ms INTEGER")
         self._secure()
 
     def _validate_paths(self):
@@ -338,6 +351,7 @@ class WhatsAppInboundArchive:
             delivery_id=str(row["delivery_id"]), event_digest=str(row["bridge_event_digest"]),
             request=request, ready=bool(row["ready"]), acknowledged=bool(row["acknowledged"]),
             recovery_pending=bool(row["recovery_pending"]),
+            album_key=(str(row["album_key"]) if row["album_key"] else None),
         )
 
     def bind_bridge_receipt(self, event_id: int, lease: Mapping[str, Any], *, ready: bool = False) -> BridgeReceipt:
@@ -415,7 +429,7 @@ class WhatsAppInboundArchive:
             ).fetchone()
             return self._receipt_from_row(row)
 
-    def prepare_bridge_handoff(self, receipt: BridgeReceipt) -> BridgeReceipt:
+    def prepare_bridge_handoff(self, receipt: BridgeReceipt, *, album_key: str | None = None) -> BridgeReceipt:
         """Durably record the post-ACK recovery obligation before bridge ACK.
 
         A bridge ACK removes the spool record.  This row is consequently the
@@ -423,13 +437,18 @@ class WhatsAppInboundArchive:
         may send one ordinary recovery clarification, but must never replay
         the archived message as a new model turn.
         """
+        if album_key is not None:
+            album_key = str(album_key).lower()
+            if len(album_key) != 64 or any(char not in "0123456789abcdef" for char in album_key):
+                raise ArchiveRejected("invalid inbound album recovery key")
         with self._connect() as db:
             cursor = db.execute(
-                """UPDATE archive_bridge_receipt SET recovery_pending=1,updated_at=?
+                """UPDATE archive_bridge_receipt SET recovery_pending=1,
+                       album_key=COALESCE(?,album_key),updated_at=?
                    WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
                      AND consumer_id=? AND epoch=? AND token=?
                      AND ready=1 AND acknowledged=0""",
-                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                (album_key, time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
                  receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
             )
             if cursor.rowcount != 1:
@@ -492,10 +511,30 @@ class WhatsAppInboundArchive:
         does not run a model or emit a recovery message during startup.
         """
         with self._connect() as db:
+            # An ACK can outlive this process.  Album membership is written
+            # before that ACK, so a restart gets one representative recovery
+            # obligation rather than one clarification per photo.  Prefer an
+            # operational member when a group has mixed observe/operate
+            # admission; an all-observe album remains a single silent item.
             rows = db.execute(
-                """SELECT * FROM archive_bridge_receipt
-                   WHERE profile_scope=? AND recovery_pending=1 AND acknowledged=1
-                   ORDER BY updated_at,delivery_id""", (self.scope,)
+                """SELECT receipt.* FROM archive_bridge_receipt AS receipt
+                   JOIN archive_event AS event ON event.id=receipt.event_id
+                   WHERE receipt.profile_scope=?
+                     AND receipt.recovery_pending=1 AND receipt.acknowledged=1
+                     AND (
+                       receipt.album_key IS NULL OR receipt.delivery_id=(
+                         SELECT candidate.delivery_id
+                         FROM archive_bridge_receipt AS candidate
+                         JOIN archive_event AS candidate_event ON candidate_event.id=candidate.event_id
+                         WHERE candidate.profile_scope=receipt.profile_scope
+                           AND candidate.album_key=receipt.album_key
+                           AND candidate.recovery_pending=1 AND candidate.acknowledged=1
+                         ORDER BY CASE candidate_event.admission WHEN 'operate' THEN 0 ELSE 1 END,
+                                  candidate.updated_at,candidate.delivery_id
+                         LIMIT 1
+                       )
+                     )
+                   ORDER BY receipt.updated_at,receipt.delivery_id""", (self.scope,)
             ).fetchall()
             return [self._receipt_from_row(row) for row in rows]
 
@@ -579,7 +618,7 @@ class WhatsAppInboundArchive:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             receipt = db.execute(
-                """SELECT 1 FROM archive_bridge_receipt
+                """SELECT album_key FROM archive_bridge_receipt
                    WHERE profile_scope=? AND delivery_id=?
                      AND recovery_pending=1 AND acknowledged=1""",
                 (self.scope, delivery_id),
@@ -599,11 +638,19 @@ class WhatsAppInboundArchive:
             )
             if disposition.rowcount != 1:
                 return False
-            cursor = db.execute(
-                """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
-                   WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1""",
-                (now, self.scope, delivery_id),
-            )
+            album_key = str(receipt["album_key"] or "")
+            if album_key:
+                cursor = db.execute(
+                    """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
+                       WHERE profile_scope=? AND album_key=? AND recovery_pending=1""",
+                    (now, self.scope, album_key),
+                )
+            else:
+                cursor = db.execute(
+                    """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
+                       WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1""",
+                    (now, self.scope, delivery_id),
+                )
             return cursor.rowcount == 1
 
     @staticmethod
@@ -684,10 +731,19 @@ class WhatsAppInboundArchive:
                         "INSERT INTO archive_bridge_recovery(profile_scope,delivery_id,generation,state,created_at,updated_at) VALUES(?,?,1,'held_group',?,?)",
                         (self.scope, delivery_id, now, now),
                     )
-                    db.execute(
-                        "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? WHERE profile_scope=? AND delivery_id=?",
-                        (now, self.scope, delivery_id),
-                    )
+                    album_key = str(row["album_key"] or "")
+                    if album_key:
+                        db.execute(
+                            "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? "
+                            "WHERE profile_scope=? AND album_key=? AND recovery_pending=1",
+                            (now, self.scope, album_key),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? "
+                            "WHERE profile_scope=? AND delivery_id=?",
+                            (now, self.scope, delivery_id),
+                        )
                     return None
                 db.execute(
                     "INSERT INTO archive_bridge_recovery(profile_scope,delivery_id,generation,state,owner_pid,owner_started_at,created_at,updated_at) VALUES(?,?,1,'reserved',?,?,?,?)",
@@ -736,10 +792,22 @@ class WhatsAppInboundArchive:
             )
             if cursor.rowcount != 1:
                 return False
-            db.execute(
-                "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1",
-                (time.time(), self.scope, recovery.delivery_id),
-            )
+            receipt = db.execute(
+                "SELECT album_key FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, recovery.delivery_id),
+            ).fetchone()
+            album_key = str(receipt["album_key"] or "") if receipt is not None else ""
+            if album_key:
+                db.execute(
+                    "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? "
+                    "WHERE profile_scope=? AND album_key=? AND recovery_pending=1",
+                    (time.time(), self.scope, album_key),
+                )
+            else:
+                db.execute(
+                    "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1",
+                    (time.time(), self.scope, recovery.delivery_id),
+                )
             return True
 
     def _verify_owned_object(self, owned_path: str | None, digest: str | None, size: int | None) -> bool:

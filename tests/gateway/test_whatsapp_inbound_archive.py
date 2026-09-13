@@ -1,4 +1,5 @@
 """Private WhatsApp archive foundation: no model/provider projection."""
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -607,6 +608,7 @@ async def test_leased_seven_photo_burst_archives_every_member_then_dispatches_on
     adapter._archive_manifest_capability = object()
     adapter._agent_visible_archive_manifest = Mock(side_effect=lambda materialized: adapter._trusted_archive_manifest(materialized))
     adapter._inbound_album_quiet_seconds = 0.05; adapter._inbound_album_hard_cap_seconds = 1.0
+    adapter._native_inbound_album_quiet_seconds = 0.05; adapter._native_inbound_album_hard_cap_seconds = 1.0
     built = []
 
     async def build(data, *, already_admitted, archive_manifest):
@@ -630,6 +632,8 @@ async def test_leased_seven_photo_burst_archives_every_member_then_dispatches_on
     assert [Path(path).read_bytes() for path in album.media_urls] == [f"photo-{i}".encode() for i in range(7)]
     assert album.text == "\n\n".join(f"caption-{i}" for i in range(7))
     assert [member["message_id"] for member in album.metadata["whatsapp_album_members"]] == [f"album-{i}" for i in range(7)]
+    assert [member["caption"] for member in album.metadata["whatsapp_album_members"]] == [f"caption-{i}" for i in range(7)]
+    assert [member["media_count"] for member in album.metadata["whatsapp_album_members"]] == [1] * 7
     assert adapter._send_read_receipt.await_count == 1
 
 
@@ -680,6 +684,66 @@ async def test_fallback_photo_burst_hard_cap_prevents_an_indefinite_quiet_wait()
     await __import__("asyncio").sleep(0.05)
     adapter.handle_message.assert_awaited_once()
     assert adapter.handle_message.await_args.args[0].text == "one\n\ntwo"
+
+
+@pytest.mark.asyncio
+async def test_native_album_settles_beyond_fallback_quiet_window_without_splitting():
+    """Association metadata gets its own settlement policy, not fallback timing."""
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_album_quiet_seconds = 0.01; adapter._inbound_album_hard_cap_seconds = 0.02
+    adapter._native_inbound_album_quiet_seconds = 0.08; adapter._native_inbound_album_hard_cap_seconds = 0.25
+    adapter._build_message_event = AsyncMock(side_effect=lambda data, **_: MessageEvent(
+        text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+        message_id=data["messageId"], media_urls=[], media_types=[],
+    ))
+    adapter.handle_message = AsyncMock()
+    first = _raw(mid="native-stagger-one", hasMedia=True, mediaType="image", body="one",
+                 nativeMetadata={"album": {"groupId": "stable-parent", "messageIndex": 0}})
+    second = _raw(mid="native-stagger-two", hasMedia=True, mediaType="image", body="two",
+                  nativeMetadata={"album": {"groupId": "stable-parent", "messageIndex": 1}})
+    assert adapter._enqueue_inbound_album_member(first, None, admitted=True)
+    # This exceeds fallback's entire hard cap.  It must still join the native
+    # association instead of manufacturing a second operational turn.
+    await asyncio.sleep(0.04)
+    assert adapter._enqueue_inbound_album_member(second, None, admitted=True)
+    await asyncio.sleep(0.12)
+    adapter.handle_message.assert_awaited_once()
+    album = adapter.handle_message.await_args.args[0]
+    assert album.text == "one\n\ntwo"
+    assert [member["caption"] for member in album.metadata["whatsapp_album_members"]] == ["one", "two"]
+
+
+def test_album_receipts_survive_restart_as_one_recovery_obligation(tmp_path):
+    """Crash after member ACK but before flush cannot recover one turn per photo."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    root = home / "whatsapp" / "inbound-archive-v1"
+    archive = WhatsAppInboundArchive(root, home, cache)
+    album_key = "a" * 64
+    receipts = []
+    for index in range(2):
+        raw = _leased_raw(mid=f"restart-album-{index}", hasMedia=True, mediaType="image",
+                          chatId="15551230000@s.whatsapp.net", senderId="15551230000@s.whatsapp.net",
+                          isGroup=False,
+                          nativeMetadata={"album": {"groupId": "restart-parent", "messageIndex": index}},
+                          lease_kwargs={"delivery": f"{index + 1:x}" * 64})
+        event_id, accepted = archive.record(raw, "operate" if index else "observe")
+        assert accepted
+        receipt = archive.bind_bridge_receipt(event_id, raw["_inboundLease"])
+        receipt = archive.mark_bridge_receipt_ready(receipt)
+        receipt = archive.prepare_bridge_handoff(receipt, album_key=album_key)
+        assert archive.mark_bridge_receipt_acked(receipt)
+        receipts.append(receipt)
+
+    # A fresh process sees only the operational representative; no in-memory
+    # enqueue state is needed to avoid duplicated recovery clarifications.
+    restarted = WhatsAppInboundArchive(root, home, cache)
+    pending = restarted.pending_bridge_recoveries()
+    assert [item.delivery_id for item in pending] == [receipts[1].delivery_id]
+    recovery = restarted.reserve_bridge_recovery(receipts[1].delivery_id)
+    assert recovery is not None
+    assert restarted.register_bridge_recovery_delivery(recovery, "one-album-final")
+    assert restarted.settle_bridge_recovery_delivery(recovery, "one-album-final")
+    assert restarted.pending_bridge_recoveries() == []
 
 
 @pytest.mark.asyncio

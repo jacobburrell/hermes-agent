@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import mimetypes
@@ -66,6 +67,8 @@ class _PendingInboundAlbum:
     members: list[_PendingInboundAlbumMember] = field(default_factory=list)
     first_seen: float = 0.0
     last_seen: float = 0.0
+    native_association: bool = False
+    terminal_seen: bool = False
     task: Optional[asyncio.Task] = None
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
@@ -331,6 +334,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._inbound_album_sequence = 0
         self._inbound_album_quiet_seconds = 0.35
         self._inbound_album_hard_cap_seconds = 1.0
+        # Baileys association records identify an album but normally do not
+        # include a final-member marker.  They therefore get a longer,
+        # association-specific settling window than unassociated media bursts.
+        self._native_inbound_album_quiet_seconds = 2.0
+        self._native_inbound_album_hard_cap_seconds = 8.0
         self._inbound_archive = None
         # Capture the creating adapter's home.  Later multiplex callbacks can
         # run under another profile's context, so never resolve this again via
@@ -538,6 +546,39 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         group = str(group).strip() if isinstance(group, str) else ""
         return "\x1f".join((chat, sender, f"native:{group}" if group else "fallback"))
 
+    def _inbound_album_recovery_key(self, data: Dict[str, Any]) -> str | None:
+        """Return an opaque durable recovery group for one bounded album.
+
+        Native associations are stable across a restart.  Timing-only bursts
+        deliberately include a one-second source timestamp bucket, matching
+        their hard cap, so unrelated later photos can never inherit an old
+        recovery obligation.
+        """
+        key = self._inbound_album_key(data)
+        if key is None:
+            return None
+        if key.endswith("\x1ffallback"):
+            timestamp = data.get("timestamp")
+            try:
+                seconds = int(float(timestamp))
+            except (TypeError, ValueError):
+                return None
+            if seconds > 100_000_000_000:  # milliseconds from non-Baileys bridges
+                seconds //= 1000
+            key = f"{key}\x1f{seconds}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _native_album_is_terminal(data: Dict[str, Any]) -> bool:
+        """Honor an explicit bridge terminal marker, never infer one.
+
+        Current Baileys association records generally omit cardinality.  The
+        bridge may preserve a provider-supplied terminal boolean in the
+        future; only that explicit signal short-circuits native settling.
+        """
+        album = WhatsAppAdapter._native_album_metadata(data)
+        return any(album.get(key) is True for key in ("terminal", "isTerminal", "isLast", "isComplete"))
+
     @staticmethod
     def _album_member_sort_key(member: _PendingInboundAlbumMember) -> tuple[int, int]:
         album = WhatsAppAdapter._native_album_metadata(member.data)
@@ -577,9 +618,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if batch is None:
                     return
                 elapsed = time.monotonic() - batch.first_seen
-                quiet_remaining = self._inbound_album_quiet_seconds - (time.monotonic() - batch.last_seen)
-                hard_remaining = self._inbound_album_hard_cap_seconds - elapsed
-                if quiet_remaining <= 0 or hard_remaining <= 0:
+                if batch.native_association:
+                    quiet_window = self._native_inbound_album_quiet_seconds
+                    hard_cap = self._native_inbound_album_hard_cap_seconds
+                else:
+                    quiet_window = self._inbound_album_quiet_seconds
+                    hard_cap = self._inbound_album_hard_cap_seconds
+                quiet_remaining = quiet_window - (time.monotonic() - batch.last_seen)
+                hard_remaining = hard_cap - elapsed
+                if batch.terminal_seen or quiet_remaining <= 0 or hard_remaining <= 0:
                     break
                 await asyncio.sleep(max(0.0, min(quiet_remaining, hard_remaining)))
 
@@ -597,7 +644,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # all members only now, so observed siblings never received an
             # agent-visible path until an addressed member established intent.
             events: list[MessageEvent] = []
-            recoveries: list[tuple[Any, Any]] = []
+            member_metadata: list[dict[str, Any]] = []
             for member in members:
                 data = dict(member.data)
                 visible = None
@@ -620,11 +667,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if event is None:
                     return
                 events.append(event)
-                recovery = await self._reserve_album_recovery(member)
-                if recovery is False:
-                    return
-                if recovery is not None:
-                    recoveries.append((member.archive, recovery))
+                # Snapshot before merge: captions and media counts belong to
+                # individual source records, not the flattened turn.
+                member_metadata.append({
+                    "message_id": str(getattr(event, "message_id", "") or ""),
+                    "caption": str(getattr(event, "text", "") or ""),
+                    "media_count": len(event.media_urls),
+                })
+
+            recovery_member = next((member for member in members if member.admitted), None)
+            recovery = await self._reserve_album_recovery(recovery_member) if recovery_member else None
+            if recovery is False:
+                return
 
             primary = events[0]
             if not hasattr(primary, "media_text_inlined"):
@@ -645,26 +699,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 primary.metadata = {}
             if reply_contexts:
                 primary.metadata["whatsapp_album_reply_contexts"] = tuple(reply_contexts)
-            primary.metadata["whatsapp_album_members"] = tuple({
-                "message_id": str(getattr(event, "message_id", "") or ""),
-                "caption": str(getattr(event, "text", "") or ""),
-                "media_count": len(event.media_urls),
-            } for event in events)
+            primary.metadata["whatsapp_album_members"] = tuple(member_metadata)
             # The final should be ledgered under the last member so a late
             # duplicate cannot make the already-complete album send again.
             primary.ledger_message_id = getattr(events[-1], "message_id", None)
-            if recoveries:
-                async def _before_ledger_record(obligation_id, *, _recoveries=tuple(recoveries)):
-                    for archive, recovery in _recoveries:
-                        if not await asyncio.to_thread(
-                            archive.register_bridge_recovery_delivery, recovery, obligation_id,
-                        ):
-                            return False
-                    return True
+            if recovery is not None and recovery_member is not None:
+                async def _before_ledger_record(obligation_id, *, _archive=recovery_member.archive, _recovery=recovery):
+                    return await asyncio.to_thread(
+                        _archive.register_bridge_recovery_delivery, _recovery, obligation_id,
+                    )
 
-                async def _after_delivery(obligation_id, *, _recoveries=tuple(recoveries)):
-                    for archive, recovery in _recoveries:
-                        await asyncio.to_thread(archive.settle_bridge_recovery_delivery, recovery, obligation_id)
+                async def _after_delivery(obligation_id, *, _archive=recovery_member.archive, _recovery=recovery):
+                    await asyncio.to_thread(_archive.settle_bridge_recovery_delivery, _recovery, obligation_id)
 
                 primary._bridge_recovery_before_ledger_record = _before_ledger_record
                 primary._bridge_recovery_after_delivery = _after_delivery
@@ -702,13 +748,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._inbound_album_quiet_seconds = 0.35
         if not hasattr(self, "_inbound_album_hard_cap_seconds"):
             self._inbound_album_hard_cap_seconds = 1.0
+        if not hasattr(self, "_native_inbound_album_quiet_seconds"):
+            self._native_inbound_album_quiet_seconds = 2.0
+        if not hasattr(self, "_native_inbound_album_hard_cap_seconds"):
+            self._native_inbound_album_hard_cap_seconds = 8.0
         now = time.monotonic()
         batch = self._pending_inbound_albums.get(key)
         if batch is None:
-            batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(first_seen=now, last_seen=now)
+            batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(
+                first_seen=now, last_seen=now,
+                native_association="\x1fnative:" in key,
+            )
             batch.task = asyncio.create_task(self._flush_inbound_album(key))
         self._inbound_album_sequence += 1
         batch.last_seen = now
+        batch.terminal_seen = batch.terminal_seen or self._native_album_is_terminal(data)
         batch.members.append(_PendingInboundAlbumMember(
             data=dict(data), materialized=materialized, admitted=admitted, archive=archive,
             receipt=receipt, sequence=self._inbound_album_sequence,
@@ -1333,9 +1387,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     # This persistent fence is deliberately before bridge
                                     # ACK: a crash after ACK cannot silently discard work.
                                     # The later recovery slice consumes it without replaying
-                                    # the original model/tool execution.
+                                    # the original model/tool execution.  Album membership
+                                    # is part of that fence, not an in-memory coalescer fact.
                                     receipt = await asyncio.to_thread(
                                         self._inbound_archive_instance().prepare_bridge_handoff, receipt,
+                                        album_key=self._inbound_album_recovery_key(event_data),
                                     )
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
