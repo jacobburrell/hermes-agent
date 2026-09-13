@@ -13,7 +13,7 @@ import subprocess
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -43,6 +43,30 @@ class _ArchiveOwnedManifest:
     capability: object
     paths: tuple[str, ...]
     descriptors: tuple[dict[str, str], ...]
+
+
+@dataclass
+class _PendingInboundAlbumMember:
+    """One already-archived WhatsApp media record awaiting bounded admission.
+
+    The bridge receipt and archive object are deliberately retained here, rather
+    than a built ``MessageEvent``: an unaddressed member must remain an archive
+    observation until another member proves that the *album* is operational.
+    """
+    data: Dict[str, Any]
+    admitted: bool
+    materialized: Any = None
+    archive: Any = None
+    receipt: Any = None
+    sequence: int = 0
+
+
+@dataclass
+class _PendingInboundAlbum:
+    members: list[_PendingInboundAlbumMember] = field(default_factory=list)
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    task: Optional[asyncio.Task] = None
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
 
@@ -299,6 +323,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
+        # Native WhatsApp albums arrive as independent media upserts.  Hold a
+        # profile-private, sender-scoped burst long enough to decide admission
+        # collectively; archive/receipt work still happens for every member
+        # before it reaches this in-memory buffer.
+        self._pending_inbound_albums: Dict[str, _PendingInboundAlbum] = {}
+        self._inbound_album_sequence = 0
+        self._inbound_album_quiet_seconds = 0.35
+        self._inbound_album_hard_cap_seconds = 1.0
         self._inbound_archive = None
         # Capture the creating adapter's home.  Later multiplex callbacks can
         # run under another profile's context, so never resolve this again via
@@ -481,6 +513,207 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         for raw_url in raw_urls:
             slots.append(raw_url if isinstance(raw_url, str) and os.path.isabs(raw_url) and self._is_allowed_profile_bridge_path(raw_url) else None)
         return slots, len(raw_urls)
+
+    @staticmethod
+    def _native_album_metadata(data: Dict[str, Any]) -> dict[str, Any]:
+        metadata = data.get("nativeMetadata")
+        album = metadata.get("album") if isinstance(metadata, dict) else None
+        return album if isinstance(album, dict) else {}
+
+    def _inbound_album_key(self, data: Dict[str, Any]) -> Optional[str]:
+        """Return a profile-local album/burst key, never crossing chat or sender.
+
+        A native association parent is stronger than timing.  Older WhatsApp
+        payloads expose no association at all, so the fallback deliberately
+        uses the canonical enclosing chat *and* sender only; it is bounded by
+        the quiet window and cannot combine different conversations.
+        """
+        if self._classify_bridge_message(data) != MessageType.PHOTO:
+            return None
+        chat = self._normalize_whatsapp_id(data.get("chatId"))
+        sender = self._normalize_whatsapp_id(data.get("senderId") or data.get("from"))
+        if not chat or not sender:
+            return None
+        group = self._native_album_metadata(data).get("groupId")
+        group = str(group).strip() if isinstance(group, str) else ""
+        return "\x1f".join((chat, sender, f"native:{group}" if group else "fallback"))
+
+    @staticmethod
+    def _album_member_sort_key(member: _PendingInboundAlbumMember) -> tuple[int, int]:
+        album = WhatsAppAdapter._native_album_metadata(member.data)
+        index = album.get("messageIndex")
+        # A native index is optional and only trustworthy when it is an
+        # ordinary non-negative integer.  Preserve ingress order otherwise.
+        if isinstance(index, int) and not isinstance(index, bool) and index >= 0:
+            return (0, index)
+        return (1, member.sequence)
+
+    async def _reserve_album_recovery(self, member: _PendingInboundAlbumMember):
+        """Reserve the restart fence only for the one eventual operational turn."""
+        if not member.admitted or member.archive is None or member.receipt is None:
+            return None
+        try:
+            return await asyncio.to_thread(member.archive.reserve_bridge_recovery, member.receipt.delivery_id)
+        except Exception:
+            logger.warning("[%s] WhatsApp album recovery reservation failed", self.name)
+            return False
+
+    @staticmethod
+    def _album_reply_context(event: MessageEvent) -> dict[str, Any] | None:
+        if not getattr(event, "reply_to_message_id", None) or not getattr(event, "reply_to_text", None):
+            return None
+        return {
+            "message_id": str(getattr(event, "reply_to_message_id", "")),
+            "text": str(getattr(event, "reply_to_text", "")),
+            "is_own": bool(getattr(event, "reply_to_is_own_message", False)),
+        }
+
+    async def _flush_inbound_album(self, key: str) -> None:
+        """Flush one bounded media burst after archival has already completed."""
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                batch = self._pending_inbound_albums.get(key)
+                if batch is None:
+                    return
+                elapsed = time.monotonic() - batch.first_seen
+                quiet_remaining = self._inbound_album_quiet_seconds - (time.monotonic() - batch.last_seen)
+                hard_remaining = self._inbound_album_hard_cap_seconds - elapsed
+                if quiet_remaining <= 0 or hard_remaining <= 0:
+                    break
+                await asyncio.sleep(max(0.0, min(quiet_remaining, hard_remaining)))
+
+            batch = self._pending_inbound_albums.pop(key, None)
+            if batch is None:
+                return
+            members = sorted(batch.members, key=self._album_member_sort_key)
+            if not any(member.admitted for member in members):
+                # Each member was durably recorded as observe before it was
+                # placed here.  There is intentionally no model, queue, or
+                # outbound side effect for a wholly ambient album.
+                return
+
+            # A single operational member admits the complete album.  Build
+            # all members only now, so observed siblings never received an
+            # agent-visible path until an addressed member established intent.
+            events: list[MessageEvent] = []
+            recoveries: list[tuple[Any, Any]] = []
+            for member in members:
+                data = dict(member.data)
+                visible = None
+                if member.materialized is not None:
+                    try:
+                        visible = await asyncio.to_thread(self._agent_visible_archive_manifest, member.materialized)
+                    except Exception:
+                        logger.warning("[%s] WhatsApp owned album-media exposure failed", self.name)
+                        return
+                    data["mediaUrls"] = list(visible.paths)
+                try:
+                    quoted_paths = await asyncio.to_thread(self._agent_visible_quoted_media_paths, data)
+                    if quoted_paths is not None:
+                        data["quotedMediaUrls"] = list(quoted_paths)
+                except Exception:
+                    data["quotedMediaUrls"] = []
+                event = await self._build_message_event(
+                    data, already_admitted=True, archive_manifest=visible,
+                )
+                if event is None:
+                    return
+                events.append(event)
+                recovery = await self._reserve_album_recovery(member)
+                if recovery is False:
+                    return
+                if recovery is not None:
+                    recoveries.append((member.archive, recovery))
+
+            primary = events[0]
+            if not hasattr(primary, "media_text_inlined"):
+                primary.media_text_inlined = []
+            reply_contexts = []
+            for event in events[1:]:
+                if not hasattr(event, "media_text_inlined"):
+                    event.media_text_inlined = []
+                primary.media_urls.extend(event.media_urls)
+                primary.media_types.extend(event.media_types)
+                primary.media_text_inlined.extend(event.media_text_inlined)
+                primary.text = BasePlatformAdapter._merge_caption(primary.text, event.text)
+            for event in events:
+                context = self._album_reply_context(event)
+                if context is not None and context not in reply_contexts:
+                    reply_contexts.append(context)
+            if not isinstance(getattr(primary, "metadata", None), dict):
+                primary.metadata = {}
+            if reply_contexts:
+                primary.metadata["whatsapp_album_reply_contexts"] = tuple(reply_contexts)
+            primary.metadata["whatsapp_album_members"] = tuple({
+                "message_id": str(getattr(event, "message_id", "") or ""),
+                "caption": str(getattr(event, "text", "") or ""),
+                "media_count": len(event.media_urls),
+            } for event in events)
+            # The final should be ledgered under the last member so a late
+            # duplicate cannot make the already-complete album send again.
+            primary.ledger_message_id = getattr(events[-1], "message_id", None)
+            if recoveries:
+                async def _before_ledger_record(obligation_id, *, _recoveries=tuple(recoveries)):
+                    for archive, recovery in _recoveries:
+                        if not await asyncio.to_thread(
+                            archive.register_bridge_recovery_delivery, recovery, obligation_id,
+                        ):
+                            return False
+                    return True
+
+                async def _after_delivery(obligation_id, *, _recoveries=tuple(recoveries)):
+                    for archive, recovery in _recoveries:
+                        await asyncio.to_thread(archive.settle_bridge_recovery_delivery, recovery, obligation_id)
+
+                primary._bridge_recovery_before_ledger_record = _before_ledger_record
+                primary._bridge_recovery_after_delivery = _after_delivery
+            await self.handle_message(primary)
+        except Exception:
+            # The members are already durable.  Do not turn a bounded local
+            # coalescer failure into an unobserved task exception or a retry
+            # that could manufacture a second turn after restart.
+            logger.exception("[%s] WhatsApp album flush failed", self.name)
+        finally:
+            batch = self._pending_inbound_albums.get(key)
+            if batch is not None and batch.task is current_task:
+                self._pending_inbound_albums.pop(key, None)
+
+    def _enqueue_inbound_album_member(
+        self, data: Dict[str, Any], materialized=None, *, admitted: bool,
+        archive=None, receipt=None,
+    ) -> bool:
+        """Stage a post-archive photo member and return whether it was accepted.
+
+        The caller has already persisted every ingress member and its receipt;
+        this buffer affects only *when* an operational turn is created.
+        """
+        key = self._inbound_album_key(data)
+        if key is None:
+            return False
+        # Small embedded/test adapters that intentionally bypass ``__init__``
+        # retain the legacy immediate-path fixtures while exercising the same
+        # bounded batch semantics.
+        if not hasattr(self, "_pending_inbound_albums"):
+            self._pending_inbound_albums = {}
+        if not hasattr(self, "_inbound_album_sequence"):
+            self._inbound_album_sequence = 0
+        if not hasattr(self, "_inbound_album_quiet_seconds"):
+            self._inbound_album_quiet_seconds = 0.35
+        if not hasattr(self, "_inbound_album_hard_cap_seconds"):
+            self._inbound_album_hard_cap_seconds = 1.0
+        now = time.monotonic()
+        batch = self._pending_inbound_albums.get(key)
+        if batch is None:
+            batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(first_seen=now, last_seen=now)
+            batch.task = asyncio.create_task(self._flush_inbound_album(key))
+        self._inbound_album_sequence += 1
+        batch.last_seen = now
+        batch.members.append(_PendingInboundAlbumMember(
+            data=dict(data), materialized=materialized, admitted=admitted, archive=archive,
+            receipt=receipt, sequence=self._inbound_album_sequence,
+        ))
+        return True
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``; NaN/Inf/negative/unparseable → ``default`` (fed to asyncio.sleep)."""
@@ -1115,6 +1348,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     # A successful Node ACK without the exact local fence is
                                     # never safe to dispatch as a new turn.
                                     continue
+                            # A photo album is admitted collectively *after* every
+                            # member has completed archive+receipt fencing.  Do this
+                            # before reserving direct recovery: the eventual single
+                            # turn binds every admitted member to one obligation.
+                            if archive_id is not None and self._enqueue_inbound_album_member(
+                                event_data, materialized, admitted=admitted,
+                                archive=(self._inbound_archive_instance() if lease_required else None),
+                                receipt=receipt,
+                            ):
+                                if admitted:
+                                    asyncio.create_task(self._send_read_receipt(msg_data))
+                                continue
                             archive_recovery = None
                             if lease_required:
                                 archive = self._inbound_archive_instance()

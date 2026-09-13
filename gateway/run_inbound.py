@@ -1577,6 +1577,30 @@ class GatewayInboundMixin:
             reply_text = event.reply_to_text
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
             message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
+        # WhatsApp albums can carry more than one native reply context.  Keep
+        # those pointers on the per-turn user content (never the cached
+        # prompt), and accept only the small normalized shape produced by the
+        # adapter.  The ordinary ``reply_to_*`` fields above remain the
+        # primary member's compatibility anchor.
+        contexts = (getattr(event, "metadata", None) or {}).get("whatsapp_album_reply_contexts")
+        if isinstance(contexts, (list, tuple)):
+            primary = (str(getattr(event, "reply_to_message_id", "") or ""),
+                       str(getattr(event, "reply_to_text", "") or ""))
+            extra: list[str] = []
+            for context in contexts:
+                if not isinstance(context, dict):
+                    continue
+                message_id = context.get("message_id")
+                reply_text = context.get("text")
+                if not isinstance(message_id, str) or not message_id or not isinstance(reply_text, str) or not reply_text:
+                    continue
+                if (message_id, reply_text) == primary:
+                    continue
+                who = " your previous message" if context.get("is_own") is True else ""
+                extra.append(f'[Album member replying to{who}: "{reply_text}"]')
+            if extra:
+                album_context = "\n\n".join(extra)
+                message_text = f"{album_context}\n\n{message_text}"
         return message_text
 
     async def _inbound_model_context_length(self, source: SessionSource, session_key: str) -> int:

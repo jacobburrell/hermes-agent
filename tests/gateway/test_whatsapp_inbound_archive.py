@@ -18,6 +18,7 @@ from plugins.platforms.whatsapp.inbound_archive import (
 )
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from gateway.platforms.base import MessageType
+from gateway.platforms.event import MessageEvent
 
 
 @pytest.fixture(autouse=True)
@@ -572,6 +573,113 @@ async def test_operate_builder_receives_only_archive_owned_media_after_materiali
     assert raw["mediaUrls"] == [str(source)]
     cache_image.assert_not_awaited()
     assert adapter.handle_message.await_args.args[0].media_urls == [str(exposed)]
+
+
+@pytest.mark.asyncio
+async def test_leased_seven_photo_burst_archives_every_member_then_dispatches_one_ordered_turn(tmp_path):
+    """The real poll/receipt boundary admits an album once, never seven times.
+
+    The transport fixture is intentionally lease-shaped: the production bridge
+    supplies exactly this fenced event after its native spool has written it.
+    Existing Node digest-contract tests cover the shared JS digest; this test
+    exercises the Python receipt/archive/dispatch half with seven members.
+    """
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    raws = []
+    for index in reversed(range(7)):
+        path = cache / f"bridge-{index}.jpg"; path.write_bytes(f"photo-{index}".encode())
+        raws.append(_leased_raw(
+            mid=f"album-{index}", body=f"caption-{index}", hasMedia=True, mediaType="image",
+            mime="image/jpeg", mediaUrls=[str(path)],
+            nativeMetadata={"album": {"groupId": "native-parent", "role": "child", "messageIndex": index}},
+            lease_kwargs={"delivery": f"{index:x}" * 64},
+        ))
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"; adapter._http_session = _LeaseSession(adapter, raws, archive)
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = Mock(return_value=True)
+    adapter._should_process_message = Mock(side_effect=lambda raw: raw["messageId"] == "album-6")
+    adapter._is_allowed_profile_bridge_path = lambda path: str(path).startswith(str(cache))
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._archive_manifest_capability = object()
+    adapter._agent_visible_archive_manifest = Mock(side_effect=lambda materialized: adapter._trusted_archive_manifest(materialized))
+    adapter._inbound_album_quiet_seconds = 0.05; adapter._inbound_album_hard_cap_seconds = 1.0
+    built = []
+
+    async def build(data, *, already_admitted, archive_manifest):
+        built.append((data, archive_manifest))
+        return MessageEvent(
+            text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+            message_id=data["messageId"], media_urls=list(data["mediaUrls"]), media_types=["image/jpeg"],
+        )
+
+    adapter._build_message_event = AsyncMock(side_effect=build)
+    adapter.handle_message = AsyncMock(); adapter._send_read_receipt = AsyncMock()
+    await adapter._poll_messages()
+
+    assert len(adapter._http_session.posts) == 7  # receipt/ACK is still per durable member
+    with archive._connect() as db:
+        admissions = db.execute("SELECT admission FROM archive_event ORDER BY message_id").fetchall()
+    assert [row["admission"] for row in admissions].count("operate") == 1
+    assert [row["admission"] for row in admissions].count("observe") == 6
+    adapter.handle_message.assert_awaited_once()
+    album = adapter.handle_message.await_args.args[0]
+    assert [Path(path).read_bytes() for path in album.media_urls] == [f"photo-{i}".encode() for i in range(7)]
+    assert album.text == "\n\n".join(f"caption-{i}" for i in range(7))
+    assert [member["message_id"] for member in album.metadata["whatsapp_album_members"]] == [f"album-{i}" for i in range(7)]
+    assert adapter._send_read_receipt.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ambient_photo_burst_stays_archived_and_never_starts_a_turn(tmp_path):
+    """A fallback-timer burst with no addressed member is observe-only."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    raws = []
+    for index in range(3):
+        path = cache / f"ambient-{index}.jpg"; path.write_bytes(b"ambient")
+        raws.append(_leased_raw(
+            mid=f"ambient-{index}", body=f"ambient-{index}", hasMedia=True, mediaType="image",
+            mime="image/jpeg", mediaUrls=[str(path)], lease_kwargs={"delivery": f"{index + 7:x}" * 64},
+        ))
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"; adapter._http_session = _LeaseSession(adapter, raws, archive)
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = Mock(return_value=True); adapter._should_process_message = Mock(return_value=False)
+    adapter._is_allowed_profile_bridge_path = lambda path: str(path).startswith(str(cache))
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._inbound_album_quiet_seconds = 0.01; adapter._inbound_album_hard_cap_seconds = 0.05
+    adapter._build_message_event = AsyncMock(); adapter.handle_message = AsyncMock(); adapter._send_read_receipt = AsyncMock()
+    await adapter._poll_messages()
+
+    adapter._build_message_event.assert_not_awaited(); adapter.handle_message.assert_not_awaited()
+    adapter._send_read_receipt.assert_not_awaited()
+    with archive._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM archive_event WHERE admission='observe'").fetchone()[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_fallback_photo_burst_hard_cap_prevents_an_indefinite_quiet_wait():
+    """No native album association still has a finite bounded admission delay."""
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_album_quiet_seconds = 0.20; adapter._inbound_album_hard_cap_seconds = 0.03
+    adapter._build_message_event = AsyncMock(side_effect=lambda data, **_: MessageEvent(
+        text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+        message_id=data["messageId"], media_urls=[], media_types=[],
+    ))
+    adapter.handle_message = AsyncMock()
+    first = _raw(mid="fallback-one", hasMedia=True, mediaType="image", body="one")
+    second = _raw(mid="fallback-two", hasMedia=True, mediaType="image", body="two")
+    assert adapter._enqueue_inbound_album_member(first, None, admitted=True)
+    await __import__("asyncio").sleep(0.015)
+    assert adapter._enqueue_inbound_album_member(second, None, admitted=True)
+    await __import__("asyncio").sleep(0.05)
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "one\n\ntwo"
 
 
 @pytest.mark.asyncio

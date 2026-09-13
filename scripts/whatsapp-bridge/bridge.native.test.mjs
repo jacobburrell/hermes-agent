@@ -145,6 +145,38 @@ import {
   console.log('  ✓ inbound quoted metadata includes quoted text');
 }
 
+// -- native album association metadata -----------------------------------
+{
+  const event = await extractBridgeEvent({
+    msg: {
+      key: { id: 'album-child-2', remoteJid: '120363001234567890@g.us', fromMe: false },
+      messageTimestamp: 123,
+      message: {
+        imageMessage: {
+          caption: 'second caption',
+          mimetype: 'image/jpeg',
+          contextInfo: {
+            messageAssociation: {
+              associationParentMessageKey: { id: 'album-parent-1' },
+              messageIndex: 2,
+            },
+          },
+        },
+      },
+    },
+    chatId: '120363001234567890@g.us',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    downloadMedia: async () => Buffer.from('image'),
+    writeMediaFile: async () => '/tmp/album-child-2.jpg',
+    cacheDirs: { image: '/tmp' },
+  });
+  assert.deepEqual(event.nativeMetadata.album, {
+    groupId: 'album-parent-1', role: 'child', messageIndex: 2,
+  });
+  console.log('  ✓ native media association exposes stable album identity and order');
+}
+
 // -- native quote ownership metadata -------------------------------------
 {
   // Baileys can omit remoteJid for a native reply in the enclosing chat.  It

@@ -417,6 +417,36 @@ export async function extractBridgeEvent({
   const mediaUrls = [];
   const nativeMetadata = {};
 
+  // WhatsApp represents a native media album through message association
+  // metadata.  The exact carrier has changed across Baileys/protocol
+  // versions, so read only the documented association shapes and require a
+  // stable parent id before advertising an album.  In particular, do not
+  // manufacture a grouping from a timestamp: Python has a bounded local
+  // quiet-window fallback for bridges that omit this metadata.
+  const albumAssociation = [
+    messageContent.messageContextInfo?.messageAssociation,
+    contextInfo?.messageAssociation,
+    contextInfo?.messageContextInfo?.messageAssociation,
+  ].find(value => value && typeof value === 'object');
+  const albumParent = albumAssociation && [
+    albumAssociation.associationParentMessageKey,
+    albumAssociation.parentMessageKey,
+  ].find(value => value && typeof value === 'object');
+  const albumGroupId = albumAssociation && (
+    albumParent?.id || albumAssociation.groupId || albumAssociation.albumId
+  );
+  const albumIndex = albumAssociation && (
+    albumAssociation.messageIndex ?? albumAssociation.index
+  );
+  if (typeof albumGroupId === 'string' && albumGroupId.trim()) {
+    const parsedIndex = Number(albumIndex);
+    nativeMetadata.album = {
+      groupId: albumGroupId.trim(),
+      role: 'child',
+      ...(Number.isInteger(parsedIndex) && parsedIndex >= 0 ? { messageIndex: parsedIndex } : {}),
+    };
+  }
+
   const mediaFailures = [];
 
   const saveMedia = async ({ mediaMessage, dir, prefix, fallbackExt, fileName: name, type }) => {

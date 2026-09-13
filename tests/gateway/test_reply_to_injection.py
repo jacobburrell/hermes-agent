@@ -152,3 +152,18 @@ async def test_reply_prefix_still_injected_when_text_in_history():
     assert result.endswith("What's the best time to go?")
 
 
+def test_whatsapp_album_reply_contexts_are_preserved_as_turn_local_pointers():
+    """Multiple media members must not lose their native reply references."""
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="album@g.us", chat_type="group")
+    event = MessageEvent(
+        text="captions", source=source, reply_to_message_id="first", reply_to_text="first quote",
+        metadata={"whatsapp_album_reply_contexts": (
+            {"message_id": "first", "text": "first quote", "is_own": False},
+            {"message_id": "second", "text": "second quote", "is_own": True},
+        )},
+    )
+    result = GatewayRunner._prepend_inbound_reply_context(event, source, event.text)
+    assert result.startswith('[Album member replying to your previous message: "second quote"]')
+    assert '[Replying to: "first quote"]' in result
+    assert result.endswith("captions")
+
