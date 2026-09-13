@@ -39,6 +39,19 @@ class BridgeReceipt:
     recovery_pending: bool
 
 
+@dataclass(frozen=True)
+class BridgeRecovery:
+    """One private, generation-fenced recovery clarification candidate."""
+    delivery_id: str
+    event_digest: str
+    event_id: int
+    generation: int
+    chat_id: str
+    is_group: bool
+    state: str
+    obligation_id: str | None
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -201,6 +214,18 @@ class WhatsAppInboundArchive:
                 ready INTEGER NOT NULL DEFAULT 0,
                 recovery_pending INTEGER NOT NULL DEFAULT 0,
                 acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, delivery_id)
+            );
+            CREATE TABLE IF NOT EXISTS archive_bridge_recovery (
+                profile_scope TEXT NOT NULL,
+                delivery_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                obligation_id TEXT,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(profile_scope, delivery_id)
@@ -473,6 +498,142 @@ class WhatsAppInboundArchive:
                    ORDER BY updated_at,delivery_id""", (self.scope,)
             ).fetchall()
             return [self._receipt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _recovery_owner_stamp() -> tuple[int, int | None]:
+        """Use pid + start time so a recycled pid cannot steal a live handoff."""
+        pid = os.getpid()
+        try:
+            from gateway.status import get_process_start_time
+            return pid, get_process_start_time(pid)
+        except Exception:
+            return pid, None
+
+    @staticmethod
+    def _recovery_owner_alive(pid: Any, started_at: Any) -> bool:
+        try:
+            from gateway.delivery_ledger import _owner_alive
+            return bool(_owner_alive(pid, started_at))
+        except Exception:
+            return False
+
+    def _recovery_from_row(self, row: sqlite3.Row) -> BridgeRecovery:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ArchiveRejected("invalid archived bridge recovery payload") from exc
+        if not isinstance(payload, Mapping):
+            raise ArchiveRejected("invalid archived bridge recovery payload")
+        chat_id = str(row["chat_id"] or "").strip()
+        if not chat_id:
+            raise ArchiveRejected("missing bridge recovery chat")
+        is_group = bool(payload.get("isGroup")) or chat_id.lower().endswith("@g.us")
+        return BridgeRecovery(
+            delivery_id=str(row["delivery_id"]),
+            event_digest=str(row["bridge_event_digest"]), event_id=int(row["event_id"]),
+            generation=int(row["generation"]), chat_id=chat_id, is_group=is_group,
+            state=str(row["state"]), obligation_id=(str(row["obligation_id"]) if row["obligation_id"] else None),
+        )
+
+    def reserve_bridge_recovery(self, delivery_id: str) -> BridgeRecovery | None:
+        """Claim one ACKed handoff for a no-model recovery clarification.
+
+        Only ACKed ``recovery_pending`` records are eligible.  Group records
+        are settled silently; a direct record can be owned by one live startup
+        worker, and a dead worker is generation-rearmed under ``BEGIN
+        IMMEDIATE``.  This method never sends or invokes a model.
+        """
+        delivery_id = str(delivery_id or "").lower()
+        if len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id):
+            raise ArchiveRejected("invalid bridge recovery delivery")
+        owner_pid, owner_started = self._recovery_owner_stamp()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT receipt.*, event.payload_json, event.chat_id,
+                          recovery.generation, recovery.state, recovery.obligation_id,
+                          recovery.owner_pid, recovery.owner_started_at
+                   FROM archive_bridge_receipt AS receipt
+                   JOIN archive_event AS event ON event.id=receipt.event_id
+                   LEFT JOIN archive_bridge_recovery AS recovery
+                     ON recovery.profile_scope=receipt.profile_scope
+                    AND recovery.delivery_id=receipt.delivery_id
+                   WHERE receipt.profile_scope=? AND receipt.delivery_id=?
+                     AND receipt.recovery_pending=1 AND receipt.acknowledged=1""",
+                (self.scope, delivery_id),
+            ).fetchone()
+            if row is None:
+                return None
+            # SQLite aliases duplicate receipt columns, so construct a narrow
+            # source row for the public recovery value instead of relying on
+            # ambiguous mapping keys.
+            payload = json.loads(str(row["payload_json"]))
+            chat_id = str(row["chat_id"] or "").strip()
+            is_group = bool(payload.get("isGroup")) or chat_id.lower().endswith("@g.us")
+            now = time.time()
+            if row["state"] is None:
+                if is_group:
+                    db.execute(
+                        "INSERT INTO archive_bridge_recovery(profile_scope,delivery_id,generation,state,created_at,updated_at) VALUES(?,?,1,'held_group',?,?)",
+                        (self.scope, delivery_id, now, now),
+                    )
+                    db.execute(
+                        "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? WHERE profile_scope=? AND delivery_id=?",
+                        (now, self.scope, delivery_id),
+                    )
+                    return None
+                db.execute(
+                    "INSERT INTO archive_bridge_recovery(profile_scope,delivery_id,generation,state,owner_pid,owner_started_at,created_at,updated_at) VALUES(?,?,1,'reserved',?,?,?,?)",
+                    (self.scope, delivery_id, owner_pid, owner_started, now, now),
+                )
+                return BridgeRecovery(delivery_id, str(row["bridge_event_digest"]), int(row["event_id"]), 1, chat_id, False, "reserved", None)
+            state = str(row["state"])
+            if state != "reserved":
+                return None
+            if self._recovery_owner_alive(row["owner_pid"], row["owner_started_at"]):
+                return None
+            generation = int(row["generation"]) + 1
+            cursor = db.execute(
+                """UPDATE archive_bridge_recovery
+                   SET generation=?,owner_pid=?,owner_started_at=?,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND generation=?
+                     AND state='reserved' AND obligation_id IS NULL""",
+                (generation, owner_pid, owner_started, now, self.scope, delivery_id, int(row["generation"])),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return BridgeRecovery(delivery_id, str(row["bridge_event_digest"]), int(row["event_id"]), generation, chat_id, False, "reserved", None)
+
+    def register_bridge_recovery_delivery(self, recovery: BridgeRecovery, obligation_id: str) -> bool:
+        """Atomically bind the ordinary delivery-ledger row to this recovery."""
+        if recovery.is_group or not obligation_id:
+            return False
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_bridge_recovery SET state='delivery_registered',obligation_id=?,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND generation=?
+                     AND state='reserved' AND obligation_id IS NULL""",
+                (str(obligation_id), time.time(), self.scope, recovery.delivery_id, recovery.generation),
+            )
+            return cursor.rowcount == 1
+
+    def settle_bridge_recovery_delivery(self, recovery: BridgeRecovery, obligation_id: str) -> bool:
+        """Close the archived handoff only after its exact final is accounted for."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE archive_bridge_recovery SET state='delivered',updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND generation=?
+                     AND state='delivery_registered' AND obligation_id=?""",
+                (time.time(), self.scope, recovery.delivery_id, recovery.generation, str(obligation_id)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            db.execute(
+                "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1",
+                (time.time(), self.scope, recovery.delivery_id),
+            )
+            return True
 
     def _verify_owned_object(self, owned_path: str | None, digest: str | None, size: int | None) -> bool:
         if not owned_path or not digest or size is None:

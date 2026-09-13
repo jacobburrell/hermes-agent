@@ -161,6 +161,38 @@ async def test_acked_handoff_remains_recoverable_but_duplicate_poll_never_dispat
     adapter.handle_message.assert_not_awaited()
 
 
+def test_bridge_recovery_reservation_is_direct_only_and_generation_fenced(tmp_path):
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    root = home / "whatsapp" / "inbound-archive-v1"
+
+    def prepared(archive, raw, delivery, digest):
+        event_id, _ = archive.record(raw, "operate")
+        receipt = archive.bind_bridge_receipt(event_id, _lease(delivery=delivery, digest=digest))
+        receipt = archive.mark_bridge_receipt_ready(receipt)
+        receipt = archive.prepare_bridge_handoff(receipt)
+        assert archive.mark_bridge_receipt_acked(receipt)
+
+    direct = WhatsAppInboundArchive(root, home, home / "cache")
+    prepared(direct, _raw(mid="direct", chatId="1555@s.whatsapp.net", isGroup=False), "1" * 64, "2" * 64)
+    # Separate SQLite connections emulate concurrent startup workers.  Only
+    # one can reserve; its live pid/start fence keeps the other from rearming.
+    other = WhatsAppInboundArchive(root, home, home / "cache")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reservations = list(pool.map(lambda archive: archive.reserve_bridge_recovery("1" * 64), (direct, other)))
+    [recovery] = [item for item in reservations if item is not None]
+    assert recovery.chat_id == "1555@s.whatsapp.net" and not recovery.is_group and recovery.generation == 1
+    assert sum(item is not None for item in reservations) == 1
+    assert direct.register_bridge_recovery_delivery(recovery, "ledger-row")
+    assert not other.register_bridge_recovery_delivery(recovery, "ledger-row-two")
+    assert direct.settle_bridge_recovery_delivery(recovery, "ledger-row")
+    assert direct.pending_bridge_recoveries() == []
+
+    grouped = WhatsAppInboundArchive(home / "whatsapp" / "group-archive", home, home / "cache")
+    prepared(grouped, _raw(mid="group", isGroup=True), "3" * 64, "4" * 64)
+    assert grouped.reserve_bridge_recovery("3" * 64) is None
+    assert grouped.pending_bridge_recoveries() == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "lease",
