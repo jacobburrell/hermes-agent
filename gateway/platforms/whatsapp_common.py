@@ -240,7 +240,7 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
 
     def _message_matches_mention_patterns(self, data: Dict[str, Any]) -> bool:
         body = str(data.get("body") or "")
-        return any(pattern.search(body) for pattern in self._mention_patterns or ())
+        return any(pattern.search(body) for pattern in getattr(self, "_mention_patterns", ()) or ())
 
     def _is_explicit_group_trigger(self, data: Dict[str, Any]) -> bool:
         """Existing explicit rails; ambient prose is deliberately not inferred."""

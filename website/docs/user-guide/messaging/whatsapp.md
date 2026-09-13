@@ -252,9 +252,11 @@ gateway:
         addressed_followup_window_seconds: 30  # 1–120; default 0 (off)
 ```
 
-The window is profile-, group-, and sender-scoped. Any authorized intervening
-group message closes it, and the state survives a gateway restart. This is not
-language inference: unrelated ambient messages remain archived silently.
+The window is profile-, group-, and sender-scoped. It starts only from an
+explicit trigger (or a configured free-response chat); a bare continuation does
+not renew it. Any authorized intervening group message closes it, and an
+unexpired explicit anchor survives a gateway restart. This is not language
+inference: unrelated ambient messages remain archived silently.
 
 ### Quoted Replies
 

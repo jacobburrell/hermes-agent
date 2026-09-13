@@ -59,14 +59,16 @@ def _record(adapter, data):
     """Mirror the adapter's poll-path archive handoff without a transport mock."""
     admitted = adapter._should_process_message(data)
     followup = data.get("_addressed_followup_context")
+    explicit = adapter._is_explicit_group_trigger(data)
+    free_response = adapter._normalize_whatsapp_id(data["chatId"]) in adapter._whatsapp_free_response_chats()
     anchor = bool(
-        admitted and (
-            adapter._is_explicit_group_trigger(data) or isinstance(followup, dict)
-        )
+        admitted and (explicit or free_response)
     )
+    preserve = bool(admitted and not anchor and isinstance(followup, dict))
     adapter._inbound_archive_instance().record(
         data, "operate" if admitted else "observe",
         followup_anchor=anchor,
+        preserve_followup_anchor=preserve,
         followup_chat_id=adapter._normalize_whatsapp_id(data["chatId"]),
         followup_sender_id=adapter._normalize_whatsapp_id(data["senderId"]),
     )
@@ -136,6 +138,28 @@ async def test_same_sender_addressed_followup_is_durable_and_turn_local(tmp_path
     prompt = GatewayRunner._prepend_inbound_reply_context(event, event.source, event.text)
     assert prompt.startswith('[Continuing your just-addressed message: "@Jack review item A"]')
     assert prompt.endswith("Actually, use item B instead.")
+
+
+@pytest.mark.asyncio
+async def test_continuation_chain_cannot_extend_original_explicit_deadline(tmp_path):
+    home = tmp_path / "jackwhatsapp"; (home / "cache").mkdir(parents=True)
+    adapter = _adapter(home, window=30)
+    first_events = []
+    await _poll_once(adapter, _message("explicit", "@Jack review item A", mentioned=True), first_events)
+    with adapter._inbound_archive_instance()._connect() as db:
+        original = db.execute("SELECT created_at FROM archive_addressed_followup_anchor").fetchone()[0]
+
+    early_events = []
+    await _poll_once(adapter, _message("early", "Correction: use item B."), early_events)
+    assert len(early_events) == 1
+    with adapter._inbound_archive_instance()._connect() as db:
+        assert db.execute("SELECT created_at FROM archive_addressed_followup_anchor").fetchone()[0] == original
+        db.execute("UPDATE archive_addressed_followup_anchor SET created_at=?", (time.time() - 31,))
+
+    late_events = []
+    await _poll_once(adapter, _message("late", "And item C."), late_events)
+    assert late_events == []
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

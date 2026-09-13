@@ -472,15 +472,15 @@ class WhatsAppInboundArchive:
     def record(
         self, raw: Mapping[str, Any], admission: str, *,
         followup_anchor: bool = False,
+        preserve_followup_anchor: bool = False,
         followup_chat_id: str | None = None,
         followup_sender_id: str | None = None,
     ) -> tuple[int, bool]:
         """Persist one inbound event and update its local continuation fence.
 
-        Every newly archived group event clears that chat's anchor. Only an
-        explicit/proven continuation can install the next one, making an
-        intervening message a durable invalidation rather than an in-memory
-        best effort.
+        Every newly archived group event clears that chat's anchor. An explicit
+        trigger can install the next one. A *proven* continuation can preserve
+        the existing anchor but never refresh its original local deadline.
         """
         if admission not in {"drop", "observe", "operate"}: raise ArchiveRejected("invalid admission")
         data = self._payload(raw); chat, sender = map(_normal, (data.get("chatId"), data.get("senderId"))); mid = str(data.get("messageId") or "").strip()
@@ -489,8 +489,17 @@ class WhatsAppInboundArchive:
         anchor_sender = _normal(followup_sender_id)
         if bool(followup_anchor) and (admission != "operate" or not anchor_chat or not anchor_sender):
             raise ArchiveRejected("invalid addressed followup anchor")
+        if bool(preserve_followup_anchor) and (admission != "operate" or followup_anchor or not anchor_chat or not anchor_sender):
+            raise ArchiveRejected("invalid addressed followup preservation")
         digest = _digest(data); album = data.get("album") if isinstance(data.get("album"), dict) else {}
         with self._connect() as db:
+            if preserve_followup_anchor:
+                anchor_row = db.execute(
+                    "SELECT sender_id FROM archive_addressed_followup_anchor WHERE profile_scope=? AND chat_id=?",
+                    (self.scope, anchor_chat),
+                ).fetchone()
+                if anchor_row is None or str(anchor_row["sender_id"]) != anchor_sender:
+                    raise ArchiveRejected("addressed followup anchor changed")
             row = db.execute("SELECT id,event_digest FROM archive_event WHERE profile_scope=? AND chat_id=? AND message_id=?", (self.scope,chat,mid)).fetchone()
             if row:
                 if row["event_digest"] != digest:
@@ -500,7 +509,7 @@ class WhatsAppInboundArchive:
             created_at = time.time()
             cur = db.execute("INSERT INTO archive_event(profile_scope,chat_id,sender_id,message_id,admission,event_digest,payload_json,source_timestamp_ms,album_group,album_role,album_index,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (self.scope,chat,sender,mid,admission,digest,_canonical(data),self._source_timestamp_ms(data.get("timestamp")),album.get("groupId"),album.get("role"),album.get("messageIndex"),created_at))
             event_id = int(cur.lastrowid)
-            if anchor_chat:
+            if anchor_chat and not preserve_followup_anchor:
                 db.execute(
                     "DELETE FROM archive_addressed_followup_anchor WHERE profile_scope=? AND chat_id=?",
                     (self.scope, anchor_chat),

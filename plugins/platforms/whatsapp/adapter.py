@@ -1444,13 +1444,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             # established DM/group/mention admission decision.
                             admitted = self._should_process_message(msg_data)
                             followup_context = msg_data.get("_addressed_followup_context")
+                            explicit_trigger = self._is_explicit_group_trigger(msg_data)
+                            free_response_trigger = bool(
+                                msg_data.get("isGroup")
+                                and getattr(self, "config", None) is not None
+                                and self._normalize_whatsapp_id(msg_data.get("chatId"))
+                                in self._whatsapp_free_response_chats()
+                            )
                             followup_anchor = bool(
                                 msg_data.get("isGroup")
                                 and admitted
-                                and (
-                                    self._is_explicit_group_trigger(msg_data)
-                                    or isinstance(followup_context, dict)
-                                )
+                                and (explicit_trigger or free_response_trigger)
+                            )
+                            preserve_followup_anchor = bool(
+                                msg_data.get("isGroup")
+                                and admitted
+                                and not followup_anchor
+                                and isinstance(followup_context, dict)
                             )
                             if self._is_archive_authorized(msg_data):
                                 try:
@@ -1459,6 +1469,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                         msg_data,
                                         "operate" if admitted else "observe",
                                         followup_anchor=followup_anchor,
+                                        preserve_followup_anchor=preserve_followup_anchor,
                                         followup_chat_id=(self._normalize_whatsapp_id(msg_data.get("chatId")) if msg_data.get("isGroup") else None),
                                         followup_sender_id=(self._normalize_whatsapp_id(msg_data.get("senderId") or msg_data.get("from")) if msg_data.get("isGroup") else None),
                                     )
