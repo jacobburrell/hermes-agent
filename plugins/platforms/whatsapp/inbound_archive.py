@@ -27,6 +27,17 @@ class MaterializationResult:
     owned_descriptors: tuple[dict[str, str], ...]
 
 
+@dataclass(frozen=True)
+class BridgeReceipt:
+    """Exact fenced bridge acknowledgement stored beside an archived event."""
+    delivery_id: str
+    event_digest: str
+    request: dict[str, object]
+    ready: bool
+    acknowledged: bool
+    recovery_pending: bool
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -57,7 +68,31 @@ class WhatsAppInboundArchive:
             CREATE TABLE IF NOT EXISTS archive_event (id INTEGER PRIMARY KEY, profile_scope TEXT NOT NULL, chat_id TEXT NOT NULL, sender_id TEXT NOT NULL, message_id TEXT NOT NULL, admission TEXT NOT NULL, event_digest TEXT NOT NULL, payload_json TEXT NOT NULL, album_group TEXT, album_role TEXT, album_index INTEGER, created_at REAL NOT NULL, UNIQUE(profile_scope,chat_id,message_id));
             CREATE TABLE IF NOT EXISTS archive_attachment (event_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, descriptor_json TEXT NOT NULL, owned_path TEXT, sha256 TEXT, size INTEGER, download_status TEXT NOT NULL, album_ordinal INTEGER, PRIMARY KEY(event_id,ordinal));
             CREATE TABLE IF NOT EXISTS archive_collision (id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL, candidate_digest TEXT NOT NULL, created_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS archive_bridge_receipt (
+                profile_scope TEXT NOT NULL,
+                delivery_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                bridge_event_digest TEXT NOT NULL,
+                consumer_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                recovery_pending INTEGER NOT NULL DEFAULT 0,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, delivery_id)
+            );
             """)
+            # Existing profile archives predate the receipt table.  The sole
+            # additive column is deliberately default-false: an old row can
+            # never be mistaken for an acknowledged runtime handoff.
+            columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_bridge_receipt)")}
+            if "recovery_pending" not in columns:
+                db.execute(
+                    "ALTER TABLE archive_bridge_receipt "
+                    "ADD COLUMN recovery_pending INTEGER NOT NULL DEFAULT 0"
+                )
         self._secure()
 
     def _validate_paths(self):
@@ -117,6 +152,195 @@ class WhatsAppInboundArchive:
                 return int(row["id"]), True
             cur = db.execute("INSERT INTO archive_event(profile_scope,chat_id,sender_id,message_id,admission,event_digest,payload_json,album_group,album_role,album_index,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (self.scope,chat,sender,mid,admission,digest,_canonical(data),album.get("groupId"),album.get("role"),album.get("messageIndex"),time.time()))
             return int(cur.lastrowid), True
+
+    @staticmethod
+    def _receipt_identity(lease: Mapping[str, Any]) -> tuple[str, str, dict[str, object]]:
+        """Validate the bridge's fenced lease without retaining arbitrary payload."""
+        if not isinstance(lease, Mapping):
+            raise ArchiveRejected("missing inbound bridge lease")
+        delivery_id = str(lease.get("deliveryId") or "").lower()
+        event_digest = str(lease.get("eventDigest") or "").lower()
+        consumer_id = str(lease.get("consumerId") or "").strip()
+        token = str(lease.get("token") or "")
+        try:
+            epoch = int(lease.get("epoch"))
+        except (TypeError, ValueError) as exc:
+            raise ArchiveRejected("invalid inbound bridge lease epoch") from exc
+        if (
+            len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id)
+            or len(event_digest) != 64 or any(char not in "0123456789abcdef" for char in event_digest)
+            or not consumer_id or len(consumer_id) > 128 or not token or len(token) > 256 or epoch < 1
+        ):
+            raise ArchiveRejected("invalid inbound bridge lease")
+        return delivery_id, event_digest, {
+            "consumerId": consumer_id,
+            "deliveryId": delivery_id,
+            "epoch": epoch,
+            "token": token,
+        }
+
+    @staticmethod
+    def _receipt_from_row(row: sqlite3.Row) -> BridgeReceipt:
+        request: dict[str, object] = {
+            "consumerId": str(row["consumer_id"]),
+            "deliveryId": str(row["delivery_id"]),
+            "epoch": int(row["epoch"]),
+            "token": str(row["token"]),
+        }
+        return BridgeReceipt(
+            delivery_id=str(row["delivery_id"]), event_digest=str(row["bridge_event_digest"]),
+            request=request, ready=bool(row["ready"]), acknowledged=bool(row["acknowledged"]),
+            recovery_pending=bool(row["recovery_pending"]),
+        )
+
+    def bind_bridge_receipt(self, event_id: int, lease: Mapping[str, Any], *, ready: bool = False) -> BridgeReceipt:
+        """Persist/refresh one exact bridge lease after archive commit, before ACK."""
+        delivery_id, event_digest, request = self._receipt_identity(lease)
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            event = db.execute(
+                "SELECT id FROM archive_event WHERE id=? AND profile_scope=?", (event_id, self.scope)
+            ).fetchone()
+            if event is None:
+                raise ArchiveRejected("bridge receipt event escaped profile")
+            row = db.execute(
+                "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, delivery_id),
+            ).fetchone()
+            if row is not None:
+                if str(row["bridge_event_digest"]) != event_digest or int(row["event_id"]) != event_id:
+                    db.execute(
+                        "INSERT INTO archive_collision(event_id,candidate_digest,created_at) VALUES(?,?,?)",
+                        (event_id, event_digest, now),
+                    )
+                    raise ArchiveRejected("inbound bridge delivery digest collision")
+                if not bool(row["acknowledged"]):
+                    db.execute(
+                        """UPDATE archive_bridge_receipt
+                           SET consumer_id=?,epoch=?,token=?,ready=MAX(ready,?),updated_at=?
+                           WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?""",
+                        (request["consumerId"], request["epoch"], request["token"], int(ready), now,
+                         self.scope, delivery_id, event_digest),
+                    )
+                    row = db.execute(
+                        "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                        (self.scope, delivery_id),
+                    ).fetchone()
+                return self._receipt_from_row(row)
+            db.execute(
+                """INSERT INTO archive_bridge_receipt(
+                       profile_scope,delivery_id,event_id,bridge_event_digest,consumer_id,epoch,token,ready,acknowledged,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,0,?,?)""",
+                (self.scope, delivery_id, event_id, event_digest, request["consumerId"], request["epoch"],
+                 request["token"], int(ready), now, now),
+            )
+            row = db.execute(
+                "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, delivery_id),
+            ).fetchone()
+            return self._receipt_from_row(row)
+
+    def mark_bridge_receipt_ready(self, receipt: BridgeReceipt) -> BridgeReceipt:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_bridge_receipt SET ready=1,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=? AND acknowledged=0""",
+                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+            )
+            if cursor.rowcount != 1:
+                raise ArchiveRejected("inbound bridge receipt changed before ready")
+            row = db.execute(
+                "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, receipt.delivery_id),
+            ).fetchone()
+            return self._receipt_from_row(row)
+
+    def prepare_bridge_handoff(self, receipt: BridgeReceipt) -> BridgeReceipt:
+        """Durably record the post-ACK recovery obligation before bridge ACK.
+
+        A bridge ACK removes the spool record.  This row is consequently the
+        handoff fence which a later runtime-recovery slice must inspect: it
+        may send one ordinary recovery clarification, but must never replay
+        the archived message as a new model turn.
+        """
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_bridge_receipt SET recovery_pending=1,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=?
+                     AND ready=1 AND acknowledged=0""",
+                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+            )
+            if cursor.rowcount != 1:
+                raise ArchiveRejected("inbound bridge receipt changed before handoff")
+            row = db.execute(
+                "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, receipt.delivery_id),
+            ).fetchone()
+            return self._receipt_from_row(row)
+
+    def renew_bridge_receipt(self, receipt: BridgeReceipt, lease: Mapping[str, Any]) -> BridgeReceipt:
+        delivery_id, event_digest, request = self._receipt_identity(lease)
+        if (
+            delivery_id != receipt.delivery_id or event_digest != receipt.event_digest
+            or request["consumerId"] != receipt.request["consumerId"]
+            or request["epoch"] != receipt.request["epoch"] or request["token"] == receipt.request["token"]
+        ):
+            raise ArchiveRejected("inbound bridge renewal changed receipt identity")
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_bridge_receipt SET token=?,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=? AND acknowledged=0""",
+                (request["token"], time.time(), self.scope, delivery_id, event_digest,
+                 request["consumerId"], request["epoch"], receipt.request["token"]),
+            )
+            if cursor.rowcount != 1:
+                raise ArchiveRejected("inbound bridge receipt changed during renewal")
+            row = db.execute(
+                "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, delivery_id),
+            ).fetchone()
+            return self._receipt_from_row(row)
+
+    def mark_bridge_receipt_acked(self, receipt: BridgeReceipt) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_bridge_receipt SET acknowledged=1,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=?
+                     AND ready=1 AND recovery_pending=1 AND acknowledged=0""",
+                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+            )
+            return cursor.rowcount == 1
+
+    def pending_bridge_receipts(self) -> list[BridgeReceipt]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM archive_bridge_receipt
+                   WHERE profile_scope=? AND ready=1 AND acknowledged=0
+                   ORDER BY created_at,delivery_id""", (self.scope,)
+            ).fetchall()
+            return [self._receipt_from_row(row) for row in rows]
+
+    def pending_bridge_recoveries(self) -> list[BridgeReceipt]:
+        """ACKed deliveries that still need the later runtime recovery fence.
+
+        This intentionally returns durable metadata only.  The ingress slice
+        does not run a model or emit a recovery message during startup.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM archive_bridge_receipt
+                   WHERE profile_scope=? AND recovery_pending=1 AND acknowledged=1
+                   ORDER BY updated_at,delivery_id""", (self.scope,)
+            ).fetchall()
+            return [self._receipt_from_row(row) for row in rows]
 
     def _verify_owned_object(self, owned_path: str | None, digest: str | None, size: int | None) -> bool:
         if not owned_path or not digest or size is None:

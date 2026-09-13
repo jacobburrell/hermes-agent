@@ -9,6 +9,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -303,6 +304,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # the process-wide/context-local getter.
         self._inbound_archive_home = Path(get_hermes_home()).resolve()
         self._archive_manifest_capability = object()
+        # Opaque per-adapter consumer ID for the bridge's fenced inbound lease.
+        # It is transport metadata, not user-facing configuration.
+        self._inbound_consumer_id = f"wa-{uuid.uuid4().hex}"
 
     def _profile_cache_dirs(self) -> tuple[Path, Path, Path, Path]:
         """Profile-owned image, audio, video and document cache roots.
@@ -856,14 +860,123 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] {bridge_exit}")
         return bool(bridge_exit)
 
+    def _inbound_lease_for(self, data: Dict[str, Any]) -> Optional[dict[str, Any]]:
+        lease = data.get("_inboundLease")
+        if not isinstance(lease, dict):
+            return None
+        consumer = str(lease.get("consumerId") or "")
+        delivery_id = str(lease.get("deliveryId") or "").lower()
+        digest = str(lease.get("eventDigest") or "").lower()
+        token = str(lease.get("token") or "")
+        try:
+            epoch = int(lease.get("epoch"))
+            expires_at = int(lease.get("expiresAt"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            consumer != getattr(self, "_inbound_consumer_id", "")
+            or len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id)
+            or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+            or not token or len(token) > 256 or epoch < 1
+            # A bridge must never hand Python an already-expired lease.  Do
+            # not ACK or dispatch if a delayed poll response crosses expiry.
+            or expires_at <= int(time.time() * 1000)
+        ):
+            return None
+        return lease
+
+    async def _ack_inbound_receipt(self, receipt) -> bool:
+        try:
+            async with self._bridge_req("post", "messages/ack", 10, json=receipt.request) as response:
+                if response.status != 200:
+                    return False
+                payload = await response.json()
+                return str(payload.get("status") or "") in {"acknowledged", "already_acknowledged"}
+        except Exception:
+            return False
+
+    async def _renew_inbound_receipt(self, archive, receipt):
+        try:
+            async with self._bridge_req("post", "messages/renew", 10, json=receipt.request) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+            lease = payload.get("delivery") if isinstance(payload, dict) else None
+            if not isinstance(lease, dict):
+                return None
+            try:
+                expires_at = int(lease.get("expiresAt"))
+            except (TypeError, ValueError):
+                return None
+            if expires_at <= int(time.time() * 1000):
+                return None
+            renewed = await asyncio.to_thread(archive.renew_bridge_receipt, receipt, lease)
+            # Return expiry separately: it is scheduling metadata, whereas the
+            # persisted request contains only the exact ACK fence.
+            return renewed, expires_at
+        except Exception:
+            return None
+
+    async def _materialize_with_inbound_lease(self, archive, archive_id: int, data: Dict[str, Any], paths, attachment_count: int, receipt):
+        """Keep the bridge lease live while durable media ownership may block on I/O."""
+        current = [receipt]
+        expires_at = [int(data.get("_inboundLease", {}).get("expiresAt") or 0)]
+        lost = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def renewer():
+            try:
+                while not stopped.is_set():
+                    # Bridge expiry is milliseconds; renew well before its 30s default
+                    # without turning a short local copy into a busy-loop.
+                    delay = max(0.25, min(8.0, max(0.75, (expires_at[0] / 1000 - time.time()) / 3)))
+                    try:
+                        await asyncio.wait_for(stopped.wait(), timeout=delay)
+                        return
+                    except asyncio.TimeoutError:
+                        renewed_result = await self._renew_inbound_receipt(archive, current[0])
+                        if renewed_result is None:
+                            lost.set()
+                            return
+                        renewed, new_expiry = renewed_result
+                        current[0] = renewed
+                        expires_at[0] = new_expiry
+            except asyncio.CancelledError:
+                return
+
+        task = asyncio.create_task(renewer())
+        try:
+            result = await asyncio.to_thread(
+                archive.materialize, archive_id, data, paths,
+                expected_attachment_count=attachment_count,
+            )
+        finally:
+            stopped.set()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        return result, current[0], not lost.is_set()
+
     async def _poll_messages(self) -> None:
         while self._running:
             if not self._http_session or await self._report_bridge_exit():
                 break
             try:
-                async with self._bridge_req("get", "messages", 30) as resp:
+                consumer_id = getattr(self, "_inbound_consumer_id", None)
+                params = {"consumerId": consumer_id} if consumer_id else None
+                async with self._bridge_req("get", "messages", 30, params=params) as resp:
                     if resp.status == 200:
                         for msg_data in await resp.json():
+                            # Real bridge polling is lease-only.  A few
+                            # direct, non-bridge embedding callers historically
+                            # invoked this adapter without __init__; preserve
+                            # that source's legacy path without allowing an
+                            # initialized bridge adapter to bypass the fence.
+                            lease_required = hasattr(self, "_inbound_consumer_id")
+                            lease = self._inbound_lease_for(msg_data) if lease_required else None
+                            if lease_required and lease is None:
+                                logger.warning("[%s] WhatsApp bridge returned an invalid inbound lease", self.name)
+                                continue
                             # Archive before dispatch, but never let retention alter the
                             # established DM/group/mention admission decision.
                             admitted = self._should_process_message(msg_data)
@@ -883,21 +996,70 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     continue
                             else:
                                 archive_id = None
+                            if archive_id is None and lease_required:
+                                # The later admission slice will define terminal disposition
+                                # for unauthorized traffic. Do not settle a leased record here.
+                                continue
+                            receipt = None
+                            if lease_required:
+                                try:
+                                    receipt = await asyncio.to_thread(
+                                        self._inbound_archive_instance().bind_bridge_receipt,
+                                        archive_id, lease,
+                                    )
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp inbound receipt staging failed; suppressing dispatch", self.name)
+                                    continue
+                                if receipt.acknowledged:
+                                    # The archived input is intentionally left for the
+                                    # restart-recovery fence; never execute it again.
+                                    continue
                             event_data = dict(msg_data)
                             manifest = None
                             materialized = None
                             if archive_id is not None and msg_data.get("hasMedia"):
                                 try:
                                     media_paths, attachment_count = await self._archive_media_slots(msg_data)
-                                    materialized = await asyncio.to_thread(
-                                        self._inbound_archive_instance().materialize,
-                                        archive_id, msg_data, media_paths,
-                                        expected_attachment_count=attachment_count,
-                                    )
+                                    if lease_required:
+                                        materialized, receipt, lease_live = await self._materialize_with_inbound_lease(
+                                            self._inbound_archive_instance(), archive_id, msg_data,
+                                            media_paths, attachment_count, receipt,
+                                        )
+                                        if not lease_live:
+                                            continue
+                                    else:
+                                        materialized = await asyncio.to_thread(
+                                            self._inbound_archive_instance().materialize,
+                                            archive_id, msg_data, media_paths,
+                                            expected_attachment_count=attachment_count,
+                                        )
                                     if not materialized.complete:
                                         continue
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
+                                    continue
+                            if lease_required:
+                                try:
+                                    receipt = await asyncio.to_thread(
+                                        self._inbound_archive_instance().mark_bridge_receipt_ready, receipt,
+                                    )
+                                    # This persistent fence is deliberately before bridge
+                                    # ACK: a crash after ACK cannot silently discard work.
+                                    # The later recovery slice consumes it without replaying
+                                    # the original model/tool execution.
+                                    receipt = await asyncio.to_thread(
+                                        self._inbound_archive_instance().prepare_bridge_handoff, receipt,
+                                    )
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
+                                    continue
+                                if not await self._ack_inbound_receipt(receipt):
+                                    continue
+                                if not await asyncio.to_thread(
+                                    self._inbound_archive_instance().mark_bridge_receipt_acked, receipt,
+                                ):
+                                    # A successful Node ACK without the exact local fence is
+                                    # never safe to dispatch as a new turn.
                                     continue
                             # Observed traffic is archived but never enters a model turn.
                             if not admitted:
