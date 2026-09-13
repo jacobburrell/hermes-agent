@@ -730,7 +730,9 @@ def test_album_receipts_survive_restart_as_one_recovery_obligation(tmp_path):
         assert accepted
         receipt = archive.bind_bridge_receipt(event_id, raw["_inboundLease"])
         receipt = archive.mark_bridge_receipt_ready(receipt)
-        receipt = archive.prepare_bridge_handoff(receipt, album_key=album_key)
+        receipt = archive.prepare_bridge_handoff(
+            receipt, album_key=album_key, recovery_key="b" * 64,
+        )
         assert archive.mark_bridge_receipt_acked(receipt)
         receipts.append(receipt)
 
@@ -765,7 +767,7 @@ def test_fallback_batch_identity_crosses_source_seconds_and_recovers_once(tmp_pa
         assert accepted
         receipt = archive.bind_bridge_receipt(event_id, raw["_inboundLease"])
         receipt = archive.mark_bridge_receipt_ready(receipt)
-        receipt = archive.prepare_bridge_handoff(receipt, album_key=batch[1].recovery_key)
+        receipt = archive.prepare_bridge_handoff(receipt, recovery_key=batch[1].recovery_key)
         assert archive.mark_bridge_receipt_acked(receipt)
         receipts.append(receipt)
     assert len({receipt.album_key for receipt in receipts}) == 1
@@ -775,6 +777,80 @@ def test_fallback_batch_identity_crosses_source_seconds_and_recovers_once(tmp_pa
     # and must not reject the expected multi-row update.
     assert restarted.settle_bridge_observation(receipts[-1])
     assert restarted.pending_bridge_recoveries() == []
+
+
+def test_late_native_recovery_generation_survives_original_settlement(tmp_path):
+    """A settled original association cannot erase an ACKed continuation."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    association_key, original_key, continuation_key = "a" * 64, "b" * 64, "c" * 64
+    original = _leased_raw(
+        mid="generation-original", chatId="15551230000@s.whatsapp.net", senderId="15551230000@s.whatsapp.net",
+        isGroup=False, lease_kwargs={"delivery": "1" * 64},
+    )
+    original_id, accepted = archive.record(original, "operate"); assert accepted
+    original_receipt = archive.bind_bridge_receipt(original_id, original["_inboundLease"])
+    original_receipt = archive.mark_bridge_receipt_ready(original_receipt)
+    original_receipt = archive.prepare_bridge_handoff(
+        original_receipt, album_key=association_key, recovery_key=original_key,
+    )
+    assert archive.mark_bridge_receipt_acked(original_receipt)
+    assert archive.close_album_handoff(association_key, primary_event_id=original_id)
+    original_recovery = archive.reserve_bridge_recovery(original_receipt.delivery_id)
+    assert original_recovery is not None
+    assert archive.register_bridge_recovery_delivery(original_recovery, "original-final")
+    assert archive.settle_bridge_recovery_delivery(original_recovery, "original-final")
+
+    late = _leased_raw(
+        mid="generation-late", chatId="15551230000@s.whatsapp.net", senderId="15551230000@s.whatsapp.net",
+        isGroup=False, lease_kwargs={"delivery": "2" * 64},
+    )
+    late_id, accepted = archive.record(late, "observe"); assert accepted
+    assert archive.link_late_album_member(association_key, late_id)
+    late_receipt = archive.bind_bridge_receipt(late_id, late["_inboundLease"])
+    late_receipt = archive.mark_bridge_receipt_ready(late_receipt)
+    late_receipt = archive.prepare_bridge_handoff(
+        late_receipt, album_key=association_key, recovery_key=continuation_key,
+    )
+    assert archive.mark_bridge_receipt_acked(late_receipt)
+
+    # This models a crash after continuation ACK but before the continuation's
+    # model boundary: only its generation remains pending, and it closes once.
+    restarted = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    assert [item.delivery_id for item in restarted.pending_bridge_recoveries()] == [late_receipt.delivery_id]
+    continuation = restarted.reserve_bridge_recovery(late_receipt.delivery_id)
+    assert continuation is not None
+    assert restarted.register_bridge_recovery_delivery(continuation, "continuation-final")
+    assert restarted.settle_bridge_recovery_delivery(continuation, "continuation-final")
+    assert restarted.pending_bridge_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_album_flush_waits_for_member_pinned_during_receipt_commit():
+    """Expiry during ACK fencing cannot detach a member into a second batch."""
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_album_quiet_seconds = 0.01; adapter._inbound_album_hard_cap_seconds = 0.02
+    adapter._native_inbound_album_quiet_seconds = 0.01; adapter._native_inbound_album_hard_cap_seconds = 0.02
+    adapter._build_message_event = AsyncMock(side_effect=lambda data, **_: MessageEvent(
+        text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+        message_id=data["messageId"], media_urls=[], media_types=[],
+    ))
+    adapter.handle_message = AsyncMock()
+    first = _raw(mid="pin-one", timestamp=99, body="one", hasMedia=True, mediaType="image")
+    second = _raw(mid="pin-two", timestamp=100, body="two", hasMedia=True, mediaType="image")
+    first_batch = adapter._pin_inbound_album_batch(first)
+    assert first_batch is not None
+    assert adapter._enqueue_inbound_album_member(first, None, admitted=True, batch_info=first_batch)
+    second_batch = adapter._pin_inbound_album_batch(second)
+    assert second_batch is not None and second_batch[1] is first_batch[1]
+    # The quiet and hard windows both expire while the second member is still
+    # in its durable-commit interval, but flush must wait for the pin.
+    await asyncio.sleep(0.04)
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._enqueue_inbound_album_member(second, None, admitted=True, batch_info=second_batch)
+    await asyncio.sleep(0.04)
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "one\n\ntwo"
 
 
 @pytest.mark.asyncio

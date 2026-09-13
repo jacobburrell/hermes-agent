@@ -40,6 +40,9 @@ class BridgeReceipt:
     # Album members share one recovery fence.  This is an opaque, profile
     # private digest; it is never exposed through metadata or diagnostics.
     album_key: str | None = None
+    # One dispatch generation of an album.  This intentionally differs from
+    # ``album_key`` so a late continuation cannot be settled by its original.
+    recovery_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +220,7 @@ class WhatsAppInboundArchive:
                 ready INTEGER NOT NULL DEFAULT 0,
                 recovery_pending INTEGER NOT NULL DEFAULT 0,
                 album_key TEXT,
+                recovery_key TEXT,
                 acknowledged INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -264,9 +268,11 @@ class WhatsAppInboundArchive:
                 )
             if "album_key" not in columns:
                 db.execute("ALTER TABLE archive_bridge_receipt ADD COLUMN album_key TEXT")
+            if "recovery_key" not in columns:
+                db.execute("ALTER TABLE archive_bridge_receipt ADD COLUMN recovery_key TEXT")
             db.execute(
-                "CREATE INDEX IF NOT EXISTS archive_bridge_receipt_album_recovery "
-                "ON archive_bridge_receipt(profile_scope,album_key,recovery_pending,acknowledged)"
+                "CREATE INDEX IF NOT EXISTS archive_bridge_receipt_recovery_generation "
+                "ON archive_bridge_receipt(profile_scope,recovery_key,recovery_pending,acknowledged)"
             )
             event_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_event)")}
             if "source_timestamp_ms" not in event_columns:
@@ -373,6 +379,7 @@ class WhatsAppInboundArchive:
             request=request, ready=bool(row["ready"]), acknowledged=bool(row["acknowledged"]),
             recovery_pending=bool(row["recovery_pending"]),
             album_key=(str(row["album_key"]) if row["album_key"] else None),
+            recovery_key=(str(row["recovery_key"]) if row["recovery_key"] else None),
         )
 
     def bind_bridge_receipt(self, event_id: int, lease: Mapping[str, Any], *, ready: bool = False) -> BridgeReceipt:
@@ -450,7 +457,9 @@ class WhatsAppInboundArchive:
             ).fetchone()
             return self._receipt_from_row(row)
 
-    def prepare_bridge_handoff(self, receipt: BridgeReceipt, *, album_key: str | None = None) -> BridgeReceipt:
+    def prepare_bridge_handoff(
+        self, receipt: BridgeReceipt, *, album_key: str | None = None, recovery_key: str | None = None,
+    ) -> BridgeReceipt:
         """Durably record the post-ACK recovery obligation before bridge ACK.
 
         A bridge ACK removes the spool record.  This row is consequently the
@@ -459,17 +468,17 @@ class WhatsAppInboundArchive:
         the archived message as a new model turn.
         """
         if album_key is not None:
-            album_key = str(album_key).lower()
-            if len(album_key) != 64 or any(char not in "0123456789abcdef" for char in album_key):
-                raise ArchiveRejected("invalid inbound album recovery key")
+            album_key = self._validated_album_key(album_key)
+        if recovery_key is not None:
+            recovery_key = self._validated_album_key(recovery_key)
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE archive_bridge_receipt SET recovery_pending=1,
-                       album_key=COALESCE(?,album_key),updated_at=?
+                       album_key=COALESCE(?,album_key),recovery_key=COALESCE(?,recovery_key),updated_at=?
                    WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
                      AND consumer_id=? AND epoch=? AND token=?
                      AND ready=1 AND acknowledged=0""",
-                (album_key, time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                (album_key, recovery_key, time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
                  receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
             )
             if cursor.rowcount != 1:
@@ -506,7 +515,7 @@ class WhatsAppInboundArchive:
                        closed_at=excluded.closed_at""",
                 (self.scope, album_key, int(primary_event_id), time.time()),
             )
-            return cursor.rowcount == 1
+            return cursor.rowcount > 0
 
     def is_closed_operational_album(self, album_key: str) -> bool:
         album_key = self._validated_album_key(album_key)
@@ -595,7 +604,7 @@ class WhatsAppInboundArchive:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT album_key FROM archive_bridge_receipt
+                """SELECT recovery_key FROM archive_bridge_receipt
                    WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
                      AND consumer_id=? AND epoch=? AND token=?
                      AND recovery_pending=1 AND acknowledged=1""",
@@ -604,12 +613,12 @@ class WhatsAppInboundArchive:
             ).fetchone()
             if row is None:
                 return False
-            album_key = str(row["album_key"] or "")
-            if album_key and not exact_only:
+            recovery_key = str(row["recovery_key"] or "")
+            if recovery_key and not exact_only:
                 cursor = db.execute(
                     """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
-                       WHERE profile_scope=? AND album_key=? AND recovery_pending=1""",
-                    (time.time(), self.scope, album_key),
+                       WHERE profile_scope=? AND recovery_key=? AND recovery_pending=1""",
+                    (time.time(), self.scope, recovery_key),
                 )
             else:
                 cursor = db.execute(
@@ -684,12 +693,12 @@ class WhatsAppInboundArchive:
                    WHERE receipt.profile_scope=?
                      AND receipt.recovery_pending=1 AND receipt.acknowledged=1
                      AND (
-                       receipt.album_key IS NULL OR receipt.delivery_id=(
+                       receipt.recovery_key IS NULL OR receipt.delivery_id=(
                          SELECT candidate.delivery_id
                          FROM archive_bridge_receipt AS candidate
                          JOIN archive_event AS candidate_event ON candidate_event.id=candidate.event_id
                          WHERE candidate.profile_scope=receipt.profile_scope
-                           AND candidate.album_key=receipt.album_key
+                           AND candidate.recovery_key=receipt.recovery_key
                            AND candidate.recovery_pending=1 AND candidate.acknowledged=1
                          ORDER BY CASE candidate_event.admission WHEN 'operate' THEN 0 ELSE 1 END,
                                   candidate.updated_at,candidate.delivery_id
@@ -780,7 +789,7 @@ class WhatsAppInboundArchive:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             receipt = db.execute(
-                """SELECT album_key FROM archive_bridge_receipt
+                """SELECT recovery_key FROM archive_bridge_receipt
                    WHERE profile_scope=? AND delivery_id=?
                      AND recovery_pending=1 AND acknowledged=1""",
                 (self.scope, delivery_id),
@@ -800,12 +809,12 @@ class WhatsAppInboundArchive:
             )
             if disposition.rowcount != 1:
                 return False
-            album_key = str(receipt["album_key"] or "")
-            if album_key:
+            recovery_key = str(receipt["recovery_key"] or "")
+            if recovery_key:
                 cursor = db.execute(
                     """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
-                       WHERE profile_scope=? AND album_key=? AND recovery_pending=1""",
-                    (now, self.scope, album_key),
+                       WHERE profile_scope=? AND recovery_key=? AND recovery_pending=1""",
+                    (now, self.scope, recovery_key),
                 )
             else:
                 cursor = db.execute(
@@ -813,7 +822,7 @@ class WhatsAppInboundArchive:
                        WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1""",
                     (now, self.scope, delivery_id),
                 )
-            return cursor.rowcount == 1
+            return cursor.rowcount > 0
 
     @staticmethod
     def _recovery_owner_stamp() -> tuple[int, int | None]:
@@ -893,12 +902,12 @@ class WhatsAppInboundArchive:
                         "INSERT INTO archive_bridge_recovery(profile_scope,delivery_id,generation,state,created_at,updated_at) VALUES(?,?,1,'held_group',?,?)",
                         (self.scope, delivery_id, now, now),
                     )
-                    album_key = str(row["album_key"] or "")
-                    if album_key:
+                    recovery_key = str(row["recovery_key"] or "")
+                    if recovery_key:
                         db.execute(
                             "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? "
-                            "WHERE profile_scope=? AND album_key=? AND recovery_pending=1",
-                            (now, self.scope, album_key),
+                            "WHERE profile_scope=? AND recovery_key=? AND recovery_pending=1",
+                            (now, self.scope, recovery_key),
                         )
                     else:
                         db.execute(
@@ -955,15 +964,15 @@ class WhatsAppInboundArchive:
             if cursor.rowcount != 1:
                 return False
             receipt = db.execute(
-                "SELECT album_key FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
+                "SELECT recovery_key FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
                 (self.scope, recovery.delivery_id),
             ).fetchone()
-            album_key = str(receipt["album_key"] or "") if receipt is not None else ""
-            if album_key:
+            recovery_key = str(receipt["recovery_key"] or "") if receipt is not None else ""
+            if recovery_key:
                 db.execute(
                     "UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=? "
-                    "WHERE profile_scope=? AND album_key=? AND recovery_pending=1",
-                    (time.time(), self.scope, album_key),
+                    "WHERE profile_scope=? AND recovery_key=? AND recovery_pending=1",
+                    (time.time(), self.scope, recovery_key),
                 )
             else:
                 db.execute(

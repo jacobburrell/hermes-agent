@@ -70,7 +70,9 @@ class _PendingInboundAlbum:
     last_seen: float = 0.0
     native_association: bool = False
     terminal_seen: bool = False
+    association_key: str | None = None
     recovery_key: str = ""
+    committing: int = 0
     continuation: bool = False
     continuation_context: dict[str, Any] | None = None
     task: Optional[asyncio.Task] = None
@@ -550,7 +552,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         group = str(group).strip() if isinstance(group, str) else ""
         return "\x1f".join((chat, sender, f"native:{group}" if group else "fallback"))
 
-    def _native_album_recovery_key(self, data: Dict[str, Any]) -> str | None:
+    def _native_album_association_key(self, data: Dict[str, Any]) -> str | None:
         """Return the stable opaque identity for a native association only."""
         key = self._inbound_album_key(data)
         if key is None or "\x1fnative:" not in key:
@@ -560,10 +562,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _album_batch_for_data(self, data: Dict[str, Any]) -> tuple[str, _PendingInboundAlbum] | None:
         """Get the actual in-memory batch and its durable recovery identity.
 
-        Fallback batches receive a fresh opaque identity when the first member
-        arrives.  That identity, rather than a source timestamp, is persisted
-        before every ACK, so a quiet-window burst may safely cross a clock
-        second.  Native associations use their stable parent identity.
+        Every dispatched batch receives a fresh opaque recovery generation.
+        Native associations additionally retain a stable parent identity for
+        late-member linkage; that parent is never used as a recovery fence.
         """
         key = self._inbound_album_key(data)
         if key is None:
@@ -574,14 +575,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         batch = self._pending_inbound_albums.get(key)
         if batch is None:
             native = "\x1fnative:" in key
-            recovery_key = self._native_album_recovery_key(data) if native else None
-            if recovery_key is None:
-                recovery_key = hashlib.sha256(f"{key}\x1f{uuid.uuid4().hex}".encode("utf-8")).hexdigest()
+            association_key = self._native_album_association_key(data) if native else None
+            recovery_key = hashlib.sha256(f"{key}\x1f{uuid.uuid4().hex}".encode("utf-8")).hexdigest()
             batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(
                 first_seen=now, last_seen=now, native_association=native,
-                recovery_key=recovery_key,
+                association_key=association_key, recovery_key=recovery_key,
             )
         return key, batch
+
+    def _pin_inbound_album_batch(self, data: Dict[str, Any]) -> tuple[str, _PendingInboundAlbum] | None:
+        """Pin a batch across archive receipt preparation and bridge ACK.
+
+        The flush task may already be waiting for a previous member's quiet
+        window.  A pin makes its boundary wait until this member carries the
+        same durable recovery generation into the actual batch.
+        """
+        batch_info = self._album_batch_for_data(data)
+        if batch_info is not None:
+            batch_info[1].committing += 1
+        return batch_info
+
+    @staticmethod
+    def _release_inbound_album_batch(batch_info: tuple[str, _PendingInboundAlbum] | None) -> None:
+        if batch_info is not None and batch_info[1].committing > 0:
+            batch_info[1].committing -= 1
 
     @staticmethod
     def _native_album_is_terminal(data: Dict[str, Any]) -> bool:
@@ -632,6 +649,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 batch = self._pending_inbound_albums.get(key)
                 if batch is None:
                     return
+                if batch.committing:
+                    # Do not split a member that has selected this batch but
+                    # is still being durably fenced before ACK.
+                    await asyncio.sleep(0.002)
+                    continue
                 elapsed = time.monotonic() - batch.first_seen
                 if batch.native_association:
                     quiet_window = self._native_inbound_album_quiet_seconds
@@ -726,11 +748,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # A native association has no reliable cardinality.  Persist the
             # original operational batch before dispatch so a later sibling
             # can become a linked continuation rather than a new album.
-            if batch.native_association and batch.recovery_key and not batch.continuation:
+            if batch.native_association and batch.association_key and not batch.continuation:
                 archive_member = next((member for member in members if member.archive is not None and member.archive_id is not None), None)
                 if archive_member is not None and not await asyncio.to_thread(
                     archive_member.archive.close_album_handoff,
-                    batch.recovery_key, primary_event_id=archive_member.archive_id,
+                    batch.association_key, primary_event_id=archive_member.archive_id,
                 ):
                     return
             if recovery is not None and recovery_member is not None:
@@ -759,13 +781,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self, data: Dict[str, Any], materialized=None, *, admitted: bool,
         archive=None, receipt=None, archive_id: int | None = None,
         continuation_context: dict[str, Any] | None = None, continuation: bool = False,
+        batch_info: tuple[str, _PendingInboundAlbum] | None = None,
     ) -> bool:
         """Stage a post-archive photo member and return whether it was accepted.
 
         The caller has already persisted every ingress member and its receipt;
         this buffer affects only *when* an operational turn is created.
         """
-        batch_info = self._album_batch_for_data(data)
+        batch_info = batch_info or self._album_batch_for_data(data)
         if batch_info is None:
             return False
         key, batch = batch_info
@@ -785,19 +808,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not hasattr(self, "_native_inbound_album_hard_cap_seconds"):
             self._native_inbound_album_hard_cap_seconds = 8.0
         now = time.monotonic()
-        if batch.task is None:
-            batch.task = asyncio.create_task(self._flush_inbound_album(key))
-        self._inbound_album_sequence += 1
-        batch.last_seen = now
-        batch.terminal_seen = batch.terminal_seen or self._native_album_is_terminal(data)
-        batch.continuation = batch.continuation or continuation
-        if continuation_context is not None:
-            batch.continuation_context = dict(continuation_context)
-        batch.members.append(_PendingInboundAlbumMember(
-            data=dict(data), materialized=materialized, admitted=admitted, archive=archive,
-            receipt=receipt, archive_id=archive_id, sequence=self._inbound_album_sequence,
-        ))
-        return True
+        try:
+            if batch.task is None:
+                batch.task = asyncio.create_task(self._flush_inbound_album(key))
+            self._inbound_album_sequence += 1
+            batch.last_seen = now
+            batch.terminal_seen = batch.terminal_seen or self._native_album_is_terminal(data)
+            batch.continuation = batch.continuation or continuation
+            if continuation_context is not None:
+                batch.continuation_context = dict(continuation_context)
+            batch.members.append(_PendingInboundAlbumMember(
+                data=dict(data), materialized=materialized, admitted=admitted, archive=archive,
+                receipt=receipt, archive_id=archive_id, sequence=self._inbound_album_sequence,
+            ))
+            return True
+        finally:
+            self._release_inbound_album_batch(batch_info)
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``; NaN/Inf/negative/unparseable → ``default`` (fed to asyncio.sleep)."""
@@ -1412,7 +1438,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             late_native_member = False
                             continuation_context = None
                             if lease_required and archive_id is not None:
-                                native_key = self._native_album_recovery_key(event_data)
+                                native_key = self._native_album_association_key(event_data)
                                 if native_key is not None:
                                     archive = self._inbound_archive_instance()
                                     try:
@@ -1436,7 +1462,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             # retained by the in-memory coalescer and the
                             # durable recovery fence; source timestamps are not
                             # a reliable album boundary.
-                            album_batch = self._album_batch_for_data(event_data) if archive_id is not None else None
+                            album_batch = self._pin_inbound_album_batch(event_data) if archive_id is not None else None
+                            album_association_key = album_batch[1].association_key if album_batch is not None else None
                             album_recovery_key = album_batch[1].recovery_key if album_batch is not None else None
                             if late_native_member:
                                 # The archive promotion above makes the late
@@ -1455,18 +1482,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     # is part of that fence, not an in-memory coalescer fact.
                                     receipt = await asyncio.to_thread(
                                         self._inbound_archive_instance().prepare_bridge_handoff, receipt,
-                                        album_key=album_recovery_key,
+                                        album_key=album_association_key, recovery_key=album_recovery_key,
                                     )
                                 except Exception:
+                                    self._release_inbound_album_batch(album_batch)
                                     logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
                                     continue
                                 if not await self._ack_inbound_receipt(receipt):
+                                    self._release_inbound_album_batch(album_batch)
                                     continue
                                 if not await asyncio.to_thread(
                                     self._inbound_archive_instance().mark_bridge_receipt_acked, receipt,
                                 ):
                                     # A successful Node ACK without the exact local fence is
                                     # never safe to dispatch as a new turn.
+                                    self._release_inbound_album_batch(album_batch)
                                     continue
                             # A photo album is admitted collectively *after* every
                             # member has completed archive+receipt fencing.  Do this
@@ -1478,6 +1508,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 receipt=receipt, archive_id=archive_id,
                                 continuation_context=continuation_context,
                                 continuation=late_native_member,
+                                batch_info=album_batch,
                             ):
                                 if admitted:
                                     asyncio.create_task(self._send_read_receipt(msg_data))
