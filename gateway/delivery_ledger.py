@@ -341,6 +341,28 @@ def bridge_recovery_obligation(delivery_id: str, generation: int) -> Optional[Di
     }
 
 
+def hold_bridge_recovery_obligation(delivery_id: str, generation: int, *, reason: str) -> bool:
+    """Stop an ambiguously attempted recovery clarification from blind resend.
+
+    A normal final may use at-least-once redelivery because the user already
+    has a substantive answer to compare.  The recovery clarification itself
+    is the only user-visible evidence of an interrupted inbound turn; after a
+    crash mid-send its acceptance is unknowable.  Hold it for explicit
+    operator recovery instead of manufacturing a duplicate bubble.
+    """
+    normalized_id, normalized_generation = _bridge_recovery_correlation(delivery_id, generation)
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='held',updated_at=?,last_error=?
+               WHERE bridge_recovery_delivery_id=? AND bridge_recovery_generation=?
+                 AND state IN ('attempting','failed')""",
+            (time.time(), str(reason or "recovery delivery ambiguous")[:500],
+             normalized_id, normalized_generation),
+        )
+    return bool(cursor.rowcount)
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

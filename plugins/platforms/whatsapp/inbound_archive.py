@@ -499,6 +499,113 @@ class WhatsAppInboundArchive:
             ).fetchall()
             return [self._receipt_from_row(row) for row in rows]
 
+    def bridge_recovery(self, delivery_id: str) -> BridgeRecovery | None:
+        """Return a pending recovery's durable state without claiming it.
+
+        Startup uses this after a crash between archive registration and the
+        ordinary final ledger write.  It is intentionally metadata-only: no
+        inbound text, media, or model execution can be recovered through this
+        method.
+        """
+        delivery_id = str(delivery_id or "").lower()
+        if len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id):
+            raise ArchiveRejected("invalid bridge recovery delivery")
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT receipt.delivery_id, receipt.bridge_event_digest, receipt.event_id,
+                          event.payload_json, event.chat_id, recovery.generation,
+                          recovery.state, recovery.obligation_id
+                   FROM archive_bridge_receipt AS receipt
+                   JOIN archive_event AS event ON event.id=receipt.event_id
+                   LEFT JOIN archive_bridge_recovery AS recovery
+                     ON recovery.profile_scope=receipt.profile_scope
+                    AND recovery.delivery_id=receipt.delivery_id
+                   WHERE receipt.profile_scope=? AND receipt.delivery_id=?
+                     AND receipt.recovery_pending=1 AND receipt.acknowledged=1""",
+                (self.scope, delivery_id),
+            ).fetchone()
+            if row is None or row["state"] is None:
+                return None
+            payload = json.loads(str(row["payload_json"]))
+            chat_id = str(row["chat_id"] or "").strip()
+            if not chat_id:
+                raise ArchiveRejected("missing bridge recovery chat")
+            return BridgeRecovery(
+                delivery_id=str(row["delivery_id"]), event_digest=str(row["bridge_event_digest"]),
+                event_id=int(row["event_id"]), generation=int(row["generation"]), chat_id=chat_id,
+                is_group=bool(payload.get("isGroup")) or chat_id.lower().endswith("@g.us"),
+                state=str(row["state"]),
+                obligation_id=(str(row["obligation_id"]) if row["obligation_id"] else None),
+            )
+
+    def bridge_handoff_admission(self, delivery_id: str) -> str | None:
+        """Admission stored with an ACKed handoff, without exposing its body.
+
+        The adapter preserves the ingress handoff for every authorised record.
+        Startup consumes ``observe`` records silently, while only an
+        ``operate`` record may enter the no-model direct recovery path.
+        """
+        delivery_id = str(delivery_id or "").lower()
+        if len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id):
+            raise ArchiveRejected("invalid bridge recovery delivery")
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT event.admission
+                   FROM archive_bridge_receipt AS receipt
+                   JOIN archive_event AS event ON event.id=receipt.event_id
+                   WHERE receipt.profile_scope=? AND receipt.delivery_id=?
+                     AND receipt.recovery_pending=1 AND receipt.acknowledged=1""",
+                (self.scope, delivery_id),
+            ).fetchone()
+        if row is None:
+            return None
+        admission = str(row["admission"] or "")
+        if admission not in {"observe", "operate"}:
+            raise ArchiveRejected("invalid bridge recovery admission")
+        return admission
+
+    def discard_bridge_recovery(self, delivery_id: str, *, state: str = "held_silent") -> bool:
+        """Close a no-turn bridge handoff without generating outbound text.
+
+        Observe-only and invalid events have no agent work to recover.  Keeping
+        their receipt pending would later manufacture a direct-message
+        clarification even though the inbound path intentionally stayed silent.
+        """
+        delivery_id = str(delivery_id or "").lower()
+        if len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id):
+            raise ArchiveRejected("invalid bridge recovery delivery")
+        if state not in {"held_silent", "held_group"}:
+            raise ArchiveRejected("invalid bridge recovery disposition")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            receipt = db.execute(
+                """SELECT 1 FROM archive_bridge_receipt
+                   WHERE profile_scope=? AND delivery_id=?
+                     AND recovery_pending=1 AND acknowledged=1""",
+                (self.scope, delivery_id),
+            ).fetchone()
+            if receipt is None:
+                return False
+            now = time.time()
+            disposition = db.execute(
+                """INSERT INTO archive_bridge_recovery(
+                       profile_scope,delivery_id,generation,state,created_at,updated_at)
+                   VALUES(?,?,1,?,?,?)
+                   ON CONFLICT(profile_scope,delivery_id) DO UPDATE SET
+                       state=excluded.state,updated_at=excluded.updated_at
+                   WHERE archive_bridge_recovery.state IN ('reserved','held_silent','held_group')
+                     AND archive_bridge_recovery.obligation_id IS NULL""",
+                (self.scope, delivery_id, state, now, now),
+            )
+            if disposition.rowcount != 1:
+                return False
+            cursor = db.execute(
+                """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1""",
+                (now, self.scope, delivery_id),
+            )
+            return cursor.rowcount == 1
+
     @staticmethod
     def _recovery_owner_stamp() -> tuple[int, int | None]:
         """Use pid + start time so a recycled pid cannot steal a live handoff."""

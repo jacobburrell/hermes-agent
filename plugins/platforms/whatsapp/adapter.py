@@ -1076,6 +1076,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     # A successful Node ACK without the exact local fence is
                                     # never safe to dispatch as a new turn.
                                     continue
+                            archive_recovery = None
+                            if lease_required:
+                                archive = self._inbound_archive_instance()
+                                if admitted:
+                                    try:
+                                        # Direct records gain a reserved generation
+                                        # which is bound to the ordinary final
+                                        # ledger below.  Group records are settled
+                                        # quietly here: recovery must never add a
+                                        # visible group bubble.
+                                        archive_recovery = await asyncio.to_thread(
+                                            archive.reserve_bridge_recovery, receipt.delivery_id,
+                                        )
+                                    except Exception:
+                                        logger.warning("[%s] WhatsApp bridge recovery reservation failed; suppressing dispatch", self.name)
+                                        continue
                             # Observed traffic is archived but never enters a model turn.
                             if not admitted:
                                 continue
@@ -1092,12 +1108,46 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 event_data, already_admitted=True, archive_manifest=manifest,
                             )
                             if event:
+                                if archive_recovery is not None:
+                                    # These are private in-process fences, not
+                                    # bridge metadata or model-visible fields.
+                                    # Archive registration precedes ledger
+                                    # creation, so a crash in the tiny gap is
+                                    # resumed from the ordinary ledger rather
+                                    # than silently losing or re-running work.
+                                    event._bridge_recovery_delivery_id = archive_recovery.delivery_id
+                                    event._bridge_recovery_generation = archive_recovery.generation
+
+                                    async def _before_ledger_record(obligation_id, *, _archive=archive,
+                                                                    _recovery=archive_recovery):
+                                        return await asyncio.to_thread(
+                                            _archive.register_bridge_recovery_delivery,
+                                            _recovery, obligation_id,
+                                        )
+
+                                    async def _after_delivery(obligation_id, *, _archive=archive,
+                                                              _recovery=archive_recovery):
+                                        await asyncio.to_thread(
+                                            _archive.settle_bridge_recovery_delivery,
+                                            _recovery, obligation_id,
+                                        )
+
+                                    event._bridge_recovery_before_ledger_record = _before_ledger_record
+                                    event._bridge_recovery_after_delivery = _after_delivery
                                 # Fire-and-forget: a slow bridge /read must not delay dispatch.
                                 asyncio.create_task(self._send_read_receipt(msg_data))
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
                                     await self.handle_message(event)
+                            elif archive_recovery is not None:
+                                # Parsing failed after the durable archive and
+                                # before a real turn existed.  Leave no
+                                # synthetic recovery message for malformed
+                                # input.
+                                await asyncio.to_thread(
+                                    archive.discard_bridge_recovery, receipt.delivery_id,
+                                )
             except asyncio.CancelledError:
                 break
             except Exception as e:

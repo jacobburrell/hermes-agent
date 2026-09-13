@@ -149,6 +149,20 @@ class TestProducerHook:
         assert settled == []
 
     @pytest.mark.asyncio
+    async def test_recovery_archive_bind_failure_is_quiet(self):
+        adapter = _Adapter()
+        event = _event()
+        event._bridge_recovery_delivery_id = "e" * 64
+        event._bridge_recovery_generation = 1
+        event._bridge_recovery_before_ledger_record = AsyncMock(return_value=False)
+
+        await _run(adapter, event)
+
+        assert adapter.sent == []
+        event._bridge_recovery_before_ledger_record.assert_awaited_once()
+        assert _rows() == []
+
+    @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
         adapter = _Adapter()
         adapter.send = AsyncMock(

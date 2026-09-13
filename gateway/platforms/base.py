@@ -3918,8 +3918,11 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
+        is_bridge_recovery = getattr(event, "_bridge_recovery_delivery_id", None) is not None
+        if is_ephemeral_response or (
+            not is_bridge_recovery and str(event.text or "").lstrip().startswith(
+                ("/", self.typed_command_prefix or "!"))
+        ):
             return None
         try:
             from gateway.delivery_ledger import (
@@ -3934,6 +3937,18 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
+            before_record = getattr(event, "_bridge_recovery_before_ledger_record", None)
+            if callable(before_record):
+                # The archive moves its direct restart handoff to
+                # delivery_registered before this ordinary final is written.
+                # If that fence is no longer ours, fail closed: a recovery
+                # clarification must never send without a durable receipt
+                # binding that startup can reconcile.
+                before_result = before_record(obligation_id)
+                if inspect.isawaitable(before_result):
+                    before_result = await before_result
+                if before_result is not True:
+                    return None
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
@@ -4075,6 +4090,13 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        if (getattr(event, "_bridge_recovery_delivery_id", None) is not None
+                and obligation_id is None):
+            # A normal ledger best-effort failure must not generally suppress a
+            # user final.  The restart-recovery clarification is different:
+            # its archive/ledger correlation is the proof that sending it is
+            # safe, so do not create an unaccountable bubble.
+            return SendResult(success=False, error="bridge_recovery_ledger_unavailable"), delivery_adapter
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:

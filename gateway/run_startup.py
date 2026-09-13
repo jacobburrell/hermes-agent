@@ -258,6 +258,180 @@ class GatewayStartupMixin:
             "background boot-path send failed after gate release: see traceback", track=True,
         )
 
+    def _whatsapp_recovery_adapters(self) -> list[BasePlatformAdapter]:
+        """Connected WhatsApp owners, once each, including multiplex profiles."""
+        candidates = list((getattr(self, "adapters", None) or {}).values())
+        for profile_adapters in (getattr(self, "_profile_adapters", None) or {}).values():
+            candidates.extend(profile_adapters.values())
+        result, seen = [], set()
+        for adapter in candidates:
+            if id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            platform = getattr(adapter, "platform", None)
+            if getattr(platform, "value", platform) != Platform.WHATSAPP.value:
+                continue
+            if not callable(getattr(adapter, "_inbound_archive_instance", None)):
+                continue
+            result.append(adapter)
+        return result
+
+    @staticmethod
+    def _bridge_recovery_source(adapter: BasePlatformAdapter, recovery) -> SessionSource:
+        """Source for a direct no-model recovery final, preserving its owner.
+
+        The archived receipt stays the authority for content/media.  This
+        source is only routing metadata for the already-determined final and
+        deliberately does not fabricate a sender, quote, or message body.
+        """
+        profile = getattr(adapter, "_owner_profile", None)
+        return SessionSource(
+            platform=Platform.WHATSAPP, chat_id=recovery.chat_id, chat_type="dm",
+            user_id=recovery.chat_id, profile=(str(profile) if profile and profile != "default" else None),
+        )
+
+    async def _settle_bridge_recovery(self, archive, recovery, obligation_id: str) -> bool:
+        try:
+            return bool(await asyncio.to_thread(
+                archive.settle_bridge_recovery_delivery, recovery, obligation_id,
+            ))
+        except Exception:
+            logger.warning("WhatsApp bridge recovery settlement failed", exc_info=True)
+            return False
+
+    async def _deliver_bridge_recovery_final(self, adapter: BasePlatformAdapter, archive, recovery) -> None:
+        """Send exactly one plain, no-model direct recovery clarification.
+
+        This method never feeds the archived message back through admission,
+        hooks, tools, or the model.  It uses the normal final-delivery ledger
+        solely so the send and receipt settlement share one durable identity.
+        """
+        from gateway.delivery_ledger import (
+            bridge_recovery_obligation, compute_obligation_id,
+            hold_bridge_recovery_obligation,
+        )
+
+        source = self._bridge_recovery_source(adapter, recovery)
+        # Keep wording deliberately human and nontechnical.  It must not leak
+        # gateway/bridge/provider details or imply that work was completed.
+        content = "I was interrupted before I could finish that request. Please send it again."
+        session_key = build_session_key(source, profile=source.profile)
+        obligation_id = compute_obligation_id(session_key, recovery.delivery_id, content)
+        existing = await asyncio.to_thread(
+            bridge_recovery_obligation, recovery.delivery_id, recovery.generation,
+        )
+        if existing is not None:
+            if recovery.state == "reserved" and recovery.obligation_id is None:
+                # Compatibility for a process that wrote the ordinary ledger
+                # immediately before this archive-registration fence landed.
+                # Bind that exact existing row; never create a second one.
+                registered = await asyncio.to_thread(
+                    archive.register_bridge_recovery_delivery, recovery, existing["obligation_id"],
+                )
+                if not registered:
+                    return
+                recovery = await asyncio.to_thread(archive.bridge_recovery, recovery.delivery_id)
+                if recovery is None:
+                    return
+            if existing["obligation_id"] != recovery.obligation_id:
+                logger.error("WhatsApp bridge recovery ledger identity mismatch; holding recovery")
+                await asyncio.to_thread(
+                    hold_bridge_recovery_obligation, recovery.delivery_id, recovery.generation,
+                    reason="recovery obligation identity mismatch",
+                )
+                return
+            if existing["state"] == "delivered":
+                await self._settle_bridge_recovery(archive, recovery, existing["obligation_id"])
+                return
+            if existing["state"] in {"attempting", "failed", "held"}:
+                # The transport may already have accepted this exact
+                # clarification.  Do not turn an uncertain outcome into a
+                # duplicate message; retain a durable, operator-visible hold.
+                if existing["state"] != "held":
+                    await asyncio.to_thread(
+                        hold_bridge_recovery_obligation, recovery.delivery_id, recovery.generation,
+                        reason="recovery delivery outcome ambiguous",
+                    )
+                return
+            if existing["state"] != "pending":
+                logger.error("WhatsApp bridge recovery has unexpected ledger state %s", existing["state"])
+                return
+        else:
+            if recovery.state == "reserved":
+                registered = await asyncio.to_thread(
+                    archive.register_bridge_recovery_delivery, recovery, obligation_id,
+                )
+                if not registered:
+                    return
+                # The durable recovery row owns this exact final now.  A
+                # crash before the ledger write is recovered below from the
+                # delivery_registered archive state.
+                recovery = await asyncio.to_thread(archive.bridge_recovery, recovery.delivery_id)
+                if recovery is None:
+                    return
+            if recovery.state != "delivery_registered" or recovery.obligation_id != obligation_id:
+                logger.error("WhatsApp bridge recovery has no compatible delivery registration")
+                return
+
+        event = MessageEvent(
+            text="", message_type=MessageType.TEXT, source=source,
+            message_id=recovery.delivery_id, ledger_message_id=recovery.delivery_id,
+            internal=True, allow_gateway_control=False,
+        )
+        event._bridge_recovery_delivery_id = recovery.delivery_id
+        event._bridge_recovery_generation = recovery.generation
+
+        async def _after_delivery(oid, *, _archive=archive, _recovery=recovery):
+            await self._settle_bridge_recovery(_archive, _recovery, oid)
+
+        event._bridge_recovery_after_delivery = _after_delivery
+        try:
+            await adapter.send_final_ledgered(
+                event, session_key, content, {}, reply_to=None, is_ephemeral_response=False,
+            )
+        except Exception:
+            # The ordinary delivery ledger owns the failed state.  A later
+            # boot sees it as ambiguous and holds rather than blind-resending.
+            logger.warning("WhatsApp bridge recovery final send failed", exc_info=True)
+
+    async def _recover_pending_whatsapp_bridge_handoffs(self) -> None:
+        """Reconcile ACKed bridge handoffs without replaying their original turn."""
+        for adapter in self._whatsapp_recovery_adapters():
+            try:
+                archive = adapter._inbound_archive_instance()
+                receipts = await asyncio.to_thread(archive.pending_bridge_recoveries)
+            except Exception:
+                logger.warning("WhatsApp bridge recovery archive unavailable", exc_info=True)
+                continue
+            for receipt in receipts:
+                try:
+                    admission = await asyncio.to_thread(
+                        archive.bridge_handoff_admission, receipt.delivery_id,
+                    )
+                    if admission != "operate":
+                        # Ambient traffic remains independently archived and
+                        # ACKed.  It was never an agent turn, so settle its
+                        # restart handoff privately instead of inventing a
+                        # direct recovery final.
+                        await asyncio.to_thread(archive.discard_bridge_recovery, receipt.delivery_id)
+                        continue
+                    recovery = await asyncio.to_thread(archive.bridge_recovery, receipt.delivery_id)
+                    if recovery is None or recovery.state == "reserved":
+                        # ``bridge_recovery`` is observational.  A reserved
+                        # row must be claimed through the archive's
+                        # generation/owner fence before this worker may bind
+                        # a ledger row or send anything.
+                        recovery = await asyncio.to_thread(archive.reserve_bridge_recovery, receipt.delivery_id)
+                    if recovery is None:
+                        # Group recovery is deliberately settled silently by
+                        # reserve_bridge_recovery; no external group text.
+                        continue
+                    if recovery.is_group:
+                        continue
+                    await self._deliver_bridge_recovery_final(adapter, archive, recovery)
+                except Exception:
+                    logger.warning("WhatsApp bridge handoff recovery failed", exc_info=True)
+
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False
     ) -> list:
@@ -408,6 +582,35 @@ class GatewayStartupMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
+            recovery_delivery_id = row.get("bridge_recovery_delivery_id")
+            recovery_generation = row.get("bridge_recovery_generation")
+            recovery = archive = None
+            if recovery_delivery_id:
+                # A pending recovery final has never started a send and may
+                # use the existing ledger row.  Any earlier attempting/failed
+                # state is transport-ambiguous: hold it, never blind-resend.
+                if row.get("needs_marker"):
+                    try:
+                        from gateway.delivery_ledger import hold_bridge_recovery_obligation
+                        await asyncio.to_thread(
+                            hold_bridge_recovery_obligation, recovery_delivery_id, recovery_generation,
+                            reason="recovery delivery outcome ambiguous during redelivery",
+                        )
+                    except Exception:
+                        logger.warning("WhatsApp bridge recovery hold failed", exc_info=True)
+                    continue
+                try:
+                    archive = adapter._inbound_archive_instance()
+                    recovery = await asyncio.to_thread(archive.bridge_recovery, recovery_delivery_id)
+                    if (recovery is None or recovery.is_group
+                            or recovery.generation != recovery_generation
+                            or recovery.state != "delivery_registered"
+                            or recovery.obligation_id != row["obligation_id"]):
+                        logger.error("WhatsApp bridge recovery redelivery identity mismatch; withholding send")
+                        continue
+                except Exception:
+                    logger.warning("WhatsApp bridge recovery lookup failed", exc_info=True)
+                    continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
@@ -420,6 +623,8 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if recovery is not None:
+                        await self._settle_bridge_recovery(archive, recovery, row["obligation_id"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
@@ -1315,6 +1520,12 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
+        # The WhatsApp bridge may have ACKed an archived inbound record just
+        # before this process died. Reconcile that narrow handoff before the
+        # general resume path; it never replays model/tool work and groups stay
+        # silent. Ordinary delivery-ledger rows then prevent resume from
+        # generating another turn for the same final.
+        await self._recover_pending_whatsapp_bridge_handoffs()
         # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
         # control sleep here once froze every platform).
         # Restart notification, home-channel startup notice, and obligation redelivery all call
