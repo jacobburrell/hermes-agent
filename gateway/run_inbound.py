@@ -1569,6 +1569,15 @@ class GatewayInboundMixin:
                     f"{message_text}"
                 )
 
+        followup_context = (getattr(event, "metadata", None) or {}).get("whatsapp_addressed_followup_context")
+        if isinstance(followup_context, dict):
+            followup_text = followup_context.get("text")
+            if isinstance(followup_text, str) and followup_text and len(followup_text) <= 4096:
+                # This is turn-local context following the adapter's durable
+                # same-chat/sender admission proof.  Never change cached
+                # history or infer a continuation from ambient group text.
+                message_text = f'[Continuing your just-addressed message: "{followup_text}"]\n\n{message_text}'
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer even when the quoted text is already in history:
             # it's disambiguation (*which* prior message), not deduplication.

@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -56,6 +57,13 @@ class BridgeRecovery:
     is_group: bool
     state: str
     obligation_id: str | None
+
+
+@dataclass(frozen=True)
+class AddressedFollowupAnchor:
+    """One local, sender-scoped continuation anchor for a WhatsApp group."""
+    message_id: str
+    text: str
 
 
 def _canonical(value: Any) -> str:
@@ -254,6 +262,14 @@ class WhatsAppInboundArchive:
                 linked_at REAL NOT NULL,
                 PRIMARY KEY(profile_scope, album_key, event_id)
             );
+            CREATE TABLE IF NOT EXISTS archive_addressed_followup_anchor (
+                profile_scope TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, chat_id)
+            );
             CREATE INDEX IF NOT EXISTS archive_event_profile_sequence ON archive_event(profile_scope, id DESC);
             CREATE INDEX IF NOT EXISTS archive_event_profile_chat_sequence ON archive_event(profile_scope, chat_id, id DESC);
             """)
@@ -325,10 +341,154 @@ class WhatsAppInboundArchive:
         if isinstance(album, dict): out["album"] = {k: album.get(k) for k in ("groupId", "role", "messageIndex") if k in album}
         return out
 
-    def record(self, raw: Mapping[str, Any], admission: str) -> tuple[int, bool]:
+    @staticmethod
+    def _source_timestamp_ms(value: Any) -> int | None:
+        """Convert an integral bridge Unix-seconds timestamp to milliseconds."""
+        sqlite_max = (1 << 63) - 1
+        max_seconds = sqlite_max // 1000
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            seconds = value
+        elif isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                return None
+            seconds = int(value)
+        elif isinstance(value, str):
+            decimal = value.strip()
+            if not re.fullmatch(r"\d+", decimal) or len(decimal) > len(str(max_seconds)):
+                return None
+            seconds = int(decimal)
+        else:
+            return None
+        return seconds * 1000 if 0 <= seconds <= max_seconds else None
+
+    @staticmethod
+    def _bounded_int(value: Any, *, minimum: int = 0, maximum: int = (1 << 63) - 1) -> int | None:
+        if isinstance(value, bool):
+            return None
+        return value if isinstance(value, int) and minimum <= value <= maximum else None
+
+    @staticmethod
+    def _safe_metadata_identifier(value: Any, *, maximum: int = 512) -> str:
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        if (not value or len(value) > maximum or "/" in value or "\\" in value
+                or re.match(r"^[a-z][a-z0-9+.-]{0,31}:", value, re.IGNORECASE)):
+            return ""
+        return value
+
+    @staticmethod
+    def _opaque_metadata_reference(value: Any, *, maximum: int = 512) -> str:
+        """Return a stable non-content reference for an unsafe persisted ID."""
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        if not value or len(value) > maximum:
+            return ""
+        return "opaque:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _safe_event_identity(cls, value: Any) -> str:
+        return cls._safe_metadata_identifier(value) or cls._opaque_metadata_reference(value)
+
+    @staticmethod
+    def _safe_archived_at_ms(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(seconds) or not 0 <= seconds <= ((1 << 63) - 1) / 1000:
+            return None
+        return int(seconds * 1000)
+
+    @staticmethod
+    def _safe_media_type(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        value = value.lower()
+        return value if re.fullmatch(r"[a-z0-9_-]{1,64}", value) else ""
+
+    @staticmethod
+    def _safe_attachment_descriptor(value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, str] = {}
+        kind = WhatsAppInboundArchive._safe_media_type(value.get("kind"))
+        if kind:
+            result["kind"] = kind
+        mime = value.get("mime")
+        if isinstance(mime, str) and re.fullmatch(
+            r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}", mime.lower()
+        ):
+            result["mime"] = mime.lower()
+        file_name = value.get("file_name")
+        if isinstance(file_name, str) and file_name and len(file_name) <= 512:
+            result["file_name_sha256"] = hashlib.sha256(file_name.encode("utf-8")).hexdigest()
+        return result
+
+    @staticmethod
+    def _safe_album_metadata(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, Any] = {}
+        group_id = value.get("groupId")
+        if isinstance(group_id, str) and group_id and len(group_id) <= 512:
+            result["group_ref"] = hashlib.sha256(group_id.encode("utf-8")).hexdigest()
+        role = value.get("role")
+        if isinstance(role, str) and role in {"parent", "child"}:
+            result["role"] = role
+        message_index = WhatsAppInboundArchive._bounded_int(value.get("messageIndex"), maximum=1_000_000)
+        if message_index is not None:
+            result["message_index"] = message_index
+        return result or None
+
+    @staticmethod
+    def _metadata_payload(payload_json: str) -> dict[str, Any]:
+        """Project only local provenance metadata, never message or quote text."""
+        empty = {"quote": None, "album": None, "has_media": False, "media_type": ""}
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            return empty
+        if not isinstance(payload, dict):
+            return empty
+        quote = {
+            "message_id": WhatsAppInboundArchive._safe_metadata_identifier(payload.get("quotedMessageId")),
+            "participant_id": _normal(WhatsAppInboundArchive._safe_metadata_identifier(payload.get("quotedParticipant"))),
+            "remote_chat_id": _normal(WhatsAppInboundArchive._safe_metadata_identifier(payload.get("quotedRemoteJid"))),
+            "outbound_by_jack": bool(payload.get("quotedOutboundByJack")),
+        }
+        return {
+            "quote": quote if any(quote.values()) else None,
+            "album": WhatsAppInboundArchive._safe_album_metadata(payload.get("album")),
+            "has_media": bool(payload.get("hasMedia")),
+            "media_type": WhatsAppInboundArchive._safe_media_type(payload.get("mediaType")),
+        }
+
+    def record(
+        self, raw: Mapping[str, Any], admission: str, *,
+        followup_anchor: bool = False,
+        followup_chat_id: str | None = None,
+        followup_sender_id: str | None = None,
+    ) -> tuple[int, bool]:
+        """Persist one inbound event and update its local continuation fence.
+
+        Every newly archived group event clears that chat's anchor. Only an
+        explicit/proven continuation can install the next one, making an
+        intervening message a durable invalidation rather than an in-memory
+        best effort.
+        """
         if admission not in {"drop", "observe", "operate"}: raise ArchiveRejected("invalid admission")
         data = self._payload(raw); chat, sender = map(_normal, (data.get("chatId"), data.get("senderId"))); mid = str(data.get("messageId") or "").strip()
         if not all((chat, sender, mid)): raise ArchiveRejected("missing stable archive identity")
+        anchor_chat = _normal(followup_chat_id)
+        anchor_sender = _normal(followup_sender_id)
+        if bool(followup_anchor) and (admission != "operate" or not anchor_chat or not anchor_sender):
+            raise ArchiveRejected("invalid addressed followup anchor")
         digest = _digest(data); album = data.get("album") if isinstance(data.get("album"), dict) else {}
         with self._connect() as db:
             row = db.execute("SELECT id,event_digest FROM archive_event WHERE profile_scope=? AND chat_id=? AND message_id=?", (self.scope,chat,mid)).fetchone()
@@ -337,8 +497,140 @@ class WhatsAppInboundArchive:
                     db.execute("INSERT INTO archive_collision(event_id,candidate_digest,created_at) VALUES(?,?,?)", (row["id"],digest,time.time()))
                     return int(row["id"]), False
                 return int(row["id"]), True
-            cur = db.execute("INSERT INTO archive_event(profile_scope,chat_id,sender_id,message_id,admission,event_digest,payload_json,album_group,album_role,album_index,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (self.scope,chat,sender,mid,admission,digest,_canonical(data),album.get("groupId"),album.get("role"),album.get("messageIndex"),time.time()))
-            return int(cur.lastrowid), True
+            created_at = time.time()
+            cur = db.execute("INSERT INTO archive_event(profile_scope,chat_id,sender_id,message_id,admission,event_digest,payload_json,source_timestamp_ms,album_group,album_role,album_index,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (self.scope,chat,sender,mid,admission,digest,_canonical(data),self._source_timestamp_ms(data.get("timestamp")),album.get("groupId"),album.get("role"),album.get("messageIndex"),created_at))
+            event_id = int(cur.lastrowid)
+            if anchor_chat:
+                db.execute(
+                    "DELETE FROM archive_addressed_followup_anchor WHERE profile_scope=? AND chat_id=?",
+                    (self.scope, anchor_chat),
+                )
+                if followup_anchor:
+                    db.execute(
+                        "INSERT INTO archive_addressed_followup_anchor(profile_scope,chat_id,sender_id,event_id,created_at) VALUES(?,?,?,?,?)",
+                        (self.scope, anchor_chat, anchor_sender, event_id, created_at),
+                    )
+            return event_id, True
+
+    def addressed_followup_anchor(
+        self, chat_id: str, sender_id: str, window_seconds: float,
+    ) -> AddressedFollowupAnchor | None:
+        """Return a valid same-chat/sender anchor, otherwise fail closed.
+
+        The TTL is local archive time rather than an untrusted bridge
+        timestamp, so stale or forged payloads cannot extend it and it remains
+        valid across restart.
+        """
+        if isinstance(window_seconds, bool):
+            return None
+        try:
+            window = float(window_seconds)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(window) or not 0 < window <= 120:
+            return None
+        chat, sender = _normal(chat_id), _normal(sender_id)
+        if not chat or not sender or not self.path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT anchor.created_at,event.message_id,event.payload_json
+                   FROM archive_addressed_followup_anchor AS anchor
+                   JOIN archive_event AS event ON event.id=anchor.event_id
+                   WHERE anchor.profile_scope=? AND anchor.chat_id=? AND anchor.sender_id=?""",
+                (self.scope, chat, sender),
+            ).fetchone()
+            if row is None:
+                return None
+            if time.time() - float(row["created_at"]) > window:
+                db.execute(
+                    "DELETE FROM archive_addressed_followup_anchor WHERE profile_scope=? AND chat_id=?",
+                    (self.scope, chat),
+                )
+                return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return None
+        text = payload.get("body") if isinstance(payload, dict) else None
+        if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+            return None
+        return AddressedFollowupAnchor(str(row["message_id"]), text.strip())
+
+    def recent_context_metadata(self, *, chat_id: str | None = None, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        """Return bounded, profile-private provenance only; never prompt content."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("context metadata limit must be an integer from 1 through 1000")
+        normalized_chat = None if chat_id is None else _normal(chat_id)
+        if chat_id is not None and not normalized_chat:
+            raise ValueError("context metadata chat identity must be nonempty")
+        if not self.path.exists():
+            return ()
+        where, params = "event.profile_scope = ?", [self.scope]
+        if normalized_chat is not None:
+            where += " AND event.chat_id = ?"
+            params.append(normalized_chat)
+        params.append(limit)
+        with self._connect() as db:
+            rows = db.execute(
+                f"""SELECT event.id, event.chat_id, event.sender_id, event.message_id,
+                           event.admission, event.payload_json, event.source_timestamp_ms,
+                           event.created_at,
+                           (SELECT COUNT(*) FROM archive_collision collision
+                              WHERE collision.event_id = event.id) AS collision_count
+                      FROM archive_event event WHERE {where}
+                  ORDER BY event.id DESC LIMIT ?""", params,
+            ).fetchall()
+            if not rows:
+                return ()
+            event_ids = [int(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in event_ids)
+            attachments: dict[int, list[dict[str, Any]]] = {event_id: [] for event_id in event_ids}
+            for attachment in db.execute(
+                f"""SELECT event_id, ordinal, descriptor_json, sha256, size, download_status, album_ordinal
+                      FROM archive_attachment WHERE event_id IN ({placeholders})
+                  ORDER BY event_id DESC, ordinal ASC""", event_ids,
+            ):
+                try:
+                    descriptor = json.loads(attachment["descriptor_json"])
+                except (TypeError, ValueError):
+                    descriptor = {}
+                attachments[int(attachment["event_id"])].append({
+                    "ordinal": int(attachment["ordinal"]),
+                    "descriptor": self._safe_attachment_descriptor(descriptor),
+                    "content_sha256": (
+                        str(attachment["sha256"])
+                        if isinstance(attachment["sha256"], str)
+                        and re.fullmatch(r"[a-f0-9]{64}", attachment["sha256"])
+                        else ""
+                    ),
+                    "size": self._bounded_int(attachment["size"]),
+                    "status": str(attachment["download_status"])
+                    if attachment["download_status"] in {"owned", "missing_or_rejected", "deleted_or_replaced"}
+                    else "unknown",
+                    "album_ordinal": self._bounded_int(attachment["album_ordinal"], maximum=1_000_000),
+                })
+        result = []
+        for row in reversed(rows):
+            metadata = self._metadata_payload(row["payload_json"])
+            result.append({
+                "archive_ref": f"archive_event:{int(row['id'])}",
+                "sequence": int(row["id"]),
+                "chat_id": self._safe_event_identity(row["chat_id"]),
+                "sender_id": self._safe_event_identity(row["sender_id"]),
+                "message_id": self._safe_event_identity(row["message_id"]),
+                "admission": str(row["admission"])
+                if row["admission"] in {"drop", "observe", "operate"} else "unknown",
+                "source_timestamp_ms": self._bounded_int(row["source_timestamp_ms"]),
+                "archived_at_ms": self._safe_archived_at_ms(row["created_at"]),
+                "collision_count": int(row["collision_count"]),
+                "quote": metadata["quote"],
+                "album": metadata["album"],
+                "has_media": metadata["has_media"],
+                "media_type": metadata["media_type"],
+                "attachments": tuple(attachments[int(row["id"])]),
+            })
+        return tuple(result)
 
     @staticmethod
     def _receipt_identity(lease: Mapping[str, Any]) -> tuple[str, str, dict[str, object]]:

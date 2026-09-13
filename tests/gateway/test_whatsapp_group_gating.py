@@ -197,6 +197,24 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
     assert __import__("os").environ["WHATSAPP_GROUP_ALLOWED_USERS"] == "120363001234567890@g.us"
 
 
+def test_config_keeps_addressed_followup_window_profile_scoped(monkeypatch, tmp_path):
+    """The opt-in is YAML behavior, never a process-wide environment toggle."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n"
+        "  addressed_followup_window_seconds: 30\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("WHATSAPP_ADDRESSED_FOLLOWUP_WINDOW_SECONDS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config.platforms[Platform.WHATSAPP].extra["addressed_followup_window_seconds"] == 30
+    assert "WHATSAPP_ADDRESSED_FOLLOWUP_WINDOW_SECONDS" not in __import__("os").environ
+
+
 # --- Broadcast / status / newsletter pseudo-chats are always dropped ---
 
 

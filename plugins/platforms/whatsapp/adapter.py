@@ -507,6 +507,38 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         data["_whatsapp_owned_quoted_manifest"] = manifest
         return manifest.paths
 
+    def _addressed_followup_context(self, data: Dict[str, Any]) -> dict[str, str] | None:
+        """Prove a bare group correction belongs to Jack's prior addressed turn.
+
+        The SQLite anchor is scoped by this adapter's profile, canonical chat
+        and canonical sender.  It is cleared by every subsequent authorized
+        group event, so neither another person nor ordinary ambient traffic can
+        keep a prior turn open.  Archive lookup failure is a denial.
+        """
+        cached = data.get("_addressed_followup_context")
+        if isinstance(cached, dict):
+            return cached
+        if cached is False or not data.get("isGroup"):
+            return None
+        window = self._whatsapp_addressed_followup_window_seconds()
+        chat = self._normalize_whatsapp_id(data.get("chatId"))
+        sender = self._normalize_whatsapp_id(data.get("senderId") or data.get("from"))
+        if not window or not chat or not sender:
+            data["_addressed_followup_context"] = False
+            return None
+        try:
+            anchor = self._inbound_archive_instance().addressed_followup_anchor(chat, sender, window)
+        except Exception:
+            logger.warning("[%s] WhatsApp addressed-followup archive lookup failed", self.name)
+            data["_addressed_followup_context"] = False
+            return None
+        if anchor is None:
+            data["_addressed_followup_context"] = False
+            return None
+        context = {"message_id": anchor.message_id, "text": anchor.text}
+        data["_addressed_followup_context"] = context
+        return context
+
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
         """Keep authorized inbound evidence locally without changing admission."""
         chat_id = str(data.get("chatId") or "")
@@ -1411,12 +1443,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             # Archive before dispatch, but never let retention alter the
                             # established DM/group/mention admission decision.
                             admitted = self._should_process_message(msg_data)
+                            followup_context = msg_data.get("_addressed_followup_context")
+                            followup_anchor = bool(
+                                msg_data.get("isGroup")
+                                and admitted
+                                and (
+                                    self._is_explicit_group_trigger(msg_data)
+                                    or isinstance(followup_context, dict)
+                                )
+                            )
                             if self._is_archive_authorized(msg_data):
                                 try:
                                     archive_id, accepted = await asyncio.to_thread(
                                         self._inbound_archive_instance().record,
                                         msg_data,
                                         "operate" if admitted else "observe",
+                                        followup_anchor=followup_anchor,
+                                        followup_chat_id=(self._normalize_whatsapp_id(msg_data.get("chatId")) if msg_data.get("isGroup") else None),
+                                        followup_sender_id=(self._normalize_whatsapp_id(msg_data.get("senderId") or msg_data.get("from")) if msg_data.get("isGroup") else None),
                                     )
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound archive failed; suppressing dispatch", self.name)
@@ -1775,6 +1819,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ("whatsapp_native_type", str(data.get("nativeType") or "").strip()),
                 ("whatsapp_native", native_metadata if isinstance(native_metadata, dict) else None),
             ) if v}
+            followup_context = data.get("_addressed_followup_context")
+            if isinstance(followup_context, dict):
+                text = followup_context.get("text")
+                message_id = followup_context.get("message_id")
+                if isinstance(text, str) and text and len(text) <= 4096 and isinstance(message_id, str) and message_id:
+                    metadata["whatsapp_addressed_followup_context"] = {
+                        "message_id": message_id,
+                        "text": text,
+                    }
             # ``fromOwner`` = owner-typed inbound fromMe (gated by WHATSAPP_FORWARD_OWNER_MESSAGES at the bridge); surfaced as
             # metadata AND a text prefix so the marker survives downstream failures before silent_ingest.
             if data.get("fromOwner"):
@@ -1896,7 +1949,12 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
     """``apply_yaml_config_fn`` (#24849): config.yaml whatsapp: keys → WHATSAPP_* env (env wins; skipped under
     a multiplexed secondary profile's scope, #80099) + ``PlatformConfig.extra`` (extra-first readers)."""
-    return _apply_yaml_bridge(whatsapp_cfg, _YAML_BRIDGE)
+    seeded = _apply_yaml_bridge(whatsapp_cfg, _YAML_BRIDGE) or {}
+    # This is deliberately extra-only: an addressed-followup window is
+    # profile-scoped behavior, not process-wide environment state.
+    if "addressed_followup_window_seconds" in whatsapp_cfg:
+        seeded["addressed_followup_window_seconds"] = whatsapp_cfg["addressed_followup_window_seconds"]
+    return seeded or None
 
 
 

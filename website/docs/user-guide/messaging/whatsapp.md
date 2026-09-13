@@ -238,6 +238,24 @@ gateway:
 
 Set `text_batch_delay_seconds: 0` to dispatch each message immediately (disables batching).
 
+### Addressed Follow-ups in Groups
+
+Groups remain mention/reply-gated by default. To let a brief correction from
+the **same person** continue after they explicitly addressed the bot, opt in
+per WhatsApp profile:
+
+```yaml
+gateway:
+  platforms:
+    whatsapp:
+      extra:
+        addressed_followup_window_seconds: 30  # 1–120; default 0 (off)
+```
+
+The window is profile-, group-, and sender-scoped. Any authorized intervening
+group message closes it, and the state survives a gateway restart. This is not
+language inference: unrelated ambient messages remain archived silently.
+
 ### Quoted Replies
 
 Replying to (quoting) an earlier message gives the agent the quoted text as context. Quoting an image, voice note, video or document also attaches that file to the turn, so "what is this?" under a quoted image works — whether the attachment came from another person or from the bot itself (a cron-delivered chart, a generated image). WhatsApp only ships a thumbnail stub with a quote, so the file is resolved from the bridge's download cache (inbound media, in-memory for the bridge's lifetime) or from a local index of the bot's own sends (last 1000 messages); quotes of anything older arrive without the attachment.

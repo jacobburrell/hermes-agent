@@ -97,6 +97,22 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         return self._coerce_allow_list(
             _extra_or_wsecret(self.config.extra, "free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS"))
 
+    def _whatsapp_addressed_followup_window_seconds(self) -> float:
+        """Opt-in, bounded continuation window for a WhatsApp group.
+
+        This is intentionally a config.yaml-only behavior setting.  A process
+        environment variable would make multiplexed profile behavior depend on
+        whichever profile happened to start first.
+        """
+        value = self.config.extra.get("addressed_followup_window_seconds", 0)
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return seconds if 0 < seconds <= 120 else 0.0
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config (list) or env var (CSV)."""
@@ -226,6 +242,15 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         body = str(data.get("body") or "")
         return any(pattern.search(body) for pattern in self._mention_patterns or ())
 
+    def _is_explicit_group_trigger(self, data: Dict[str, Any]) -> bool:
+        """Existing explicit rails; ambient prose is deliberately not inferred."""
+        return (
+            str(data.get("body") or "").strip().startswith("/")
+            or self._message_is_reply_to_bot(data)
+            or self._message_mentions_bot(data)
+            or self._message_matches_mention_patterns(data)
+        )
+
     def _clean_bot_mention_text(self, text: str, data: Dict[str, Any]) -> str:
         if not text:
             return text
@@ -249,12 +274,13 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         # Group messages: check mention / free-response settings
         if chat_id in self._whatsapp_free_response_chats() or not self._whatsapp_require_mention():
             return True
-        return (
-            str(data.get("body") or "").strip().startswith("/")
-            or self._message_is_reply_to_bot(data)
-            or self._message_mentions_bot(data)
-            or self._message_matches_mention_patterns(data)
-        )
+        if self._is_explicit_group_trigger(data):
+            return True
+        # Only the Baileys adapter currently supplies this durable proof. API
+        # variants intentionally stay explicit-only until they have an
+        # equivalent profile-private archive; never infer from ambient prose.
+        resolver = getattr(self, "_addressed_followup_context", None)
+        return bool(callable(resolver) and resolver(data))
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:
