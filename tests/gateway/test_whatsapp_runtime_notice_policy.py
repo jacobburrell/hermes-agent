@@ -235,6 +235,41 @@ def test_notice_policy_uses_scoped_resolver_and_retains_last_known_good(monkeypa
     assert runner._notice_policy_config_for_source(source) == (resolved, True)
 
 
+@pytest.mark.parametrize("invalid_root", ("[]\n", "false\n", "0\n"))
+def test_notice_policy_real_profile_rejects_falsey_non_mapping_roots(tmp_path, invalid_root) -> None:
+    """The global resolver's compatibility coercion cannot validate notice policy."""
+    source = _source()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("display:\n  platforms:\n    whatsapp:\n      tool_progress: new\n", encoding="utf-8")
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+
+    known_good, valid = runner._notice_policy_config_for_source(source)
+    assert valid is True
+    assert known_good["display"]["platforms"]["whatsapp"]["tool_progress"] == "new"
+
+    config_path.write_text(invalid_root, encoding="utf-8")
+    assert runner._notice_policy_config_for_source(source) == (known_good, True)
+
+    unseen = object.__new__(GatewayRunner)
+    unseen.config = SimpleNamespace(multiplex_profiles=False)
+    unseen._resolve_profile_home_for_source = lambda _source: tmp_path
+    assert unseen._notice_policy_config_for_source(source) == ({}, False)
+
+
+def test_notice_policy_real_profile_accepts_empty_mapping(tmp_path) -> None:
+    """An explicitly empty mapping remains a valid, deliberately quiet policy."""
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+
+    config, valid = runner._notice_policy_config_for_source(_source())
+    assert valid is True
+    assert isinstance(config, dict)
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_rechecks_live_policy_before_edit_and_fallback_send(monkeypatch) -> None:
     """A live WhatsApp mute takes effect between heartbeat transport operations."""

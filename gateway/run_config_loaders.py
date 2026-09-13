@@ -69,6 +69,17 @@ class GatewayConfigLoadersMixin:
             cache_key = str(config_path.resolve(strict=False))
             if not config_path.exists():
                 return cache.get(cache_key, ({}, False))
+            # ``load_config_readonly`` intentionally treats falsey YAML roots
+            # as an empty config for general backwards compatibility.  That is
+            # unsafe for a delivery policy: ``[]``, ``false``, and ``0`` must
+            # not be accepted as a freshly-valid quiet/noisy decision.  This
+            # is validation only; the supported resolver below still owns
+            # defaults, managed overlays, environment expansion, and caching.
+            from utils import fast_safe_load
+            with config_path.open(encoding="utf-8") as raw_file:
+                raw_root = fast_safe_load(raw_file)
+            if raw_root is not None and not isinstance(raw_root, dict):
+                return cache.get(cache_key, ({}, False))
             # Keep this path on the same scoped, managed-overlay-aware resolver as
             # an actual gateway turn.  Reading raw YAML here used to make a broken
             # overlay look like an empty-but-valid config, which could reopen a
