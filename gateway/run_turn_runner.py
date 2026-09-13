@@ -176,6 +176,8 @@ class TurnRunner:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
         from gateway.warning_notifications import render_notification
+        if not self._runner._transient_notice_enabled_for_source(ctx.source):
+            return
         status = kwargs.get("status")
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
@@ -881,7 +883,9 @@ class TurnRunner:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
-        if ctx.mute_notification_reply or not self._status_live():
+        if (ctx.mute_notification_reply or not self._status_live()
+                or not self._runner._transient_notice_enabled_for_source(ctx.source)):
+            return
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
@@ -1157,7 +1161,9 @@ class TurnRunner:
         sync worker thread; hop onto the gateway loop. Fired-once latch lives on the cached agent."""
         from gateway.run import render_notice_line
         from gateway.warning_notifications import is_diagnostic_notice, render_notification
-        if self._ctx.mute_notification_reply or not self._status_live():
+        if (self._ctx.mute_notification_reply or not self._status_live()
+                or not self._runner._transient_notice_enabled_for_source(self._ctx.source)):
+            return
             return
         diagnostic = is_diagnostic_notice(notice)
         def present():
@@ -1181,7 +1187,7 @@ class TurnRunner:
         pending_lock = threading.Lock()
 
         def deliver(message: str) -> None:
-            if self._status_live():
+            if self._status_live() and self._runner._memory_notification_mode_for_source(ctx.source) != "off":
                 self._send_status_text(
                     message,
                     _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
@@ -1264,10 +1270,7 @@ class TurnRunner:
         # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
         # `display:` present-but-null yields None, not the {} default (same `or {}` guard as
         # display_config.py / runtime_footer.py).
-        mem_notif = (ctx.user_config.get("display") or {}).get("memory_notifications")
-        if isinstance(mem_notif, bool):
-            mem_notif = "on" if mem_notif else "off"
-        agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+        agent.memory_notifications = runner._memory_notification_mode_for_source(ctx.source)
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).

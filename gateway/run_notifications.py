@@ -117,6 +117,9 @@ class GatewayNotificationsMixin:
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         from gateway.run import _is_slack_ignored_channel
+        if not self._transient_notice_enabled_for_source(source):
+            logger.debug("Suppressing runtime notice for %s/%s", getattr(source, "platform", "?"), getattr(source, "chat_id", "?"))
+            return
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -705,10 +708,17 @@ class GatewayNotificationsMixin:
             if not platform_str or not chat_id:
                 return None
             platform = Platform(platform_str)
+            profile = self._marker_profile(data)
+            if not self._transient_notice_enabled_for_target(
+                platform, str(chat_id), thread_id=str(thread_id) if thread_id else None,
+                chat_type=str(data.get("chat_type") or "group"), profile=profile,
+            ):
+                logger.info("Restart notification suppressed by runtime notice policy for %s:%s", platform_str, chat_id)
+                return None
             # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
             # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
             transport = resolve_delivery_transport(
-                platform, self.config, self._adapters_for_profile(self._marker_profile(data)))
+                platform, self.config, self._adapters_for_profile(profile))
             if transport is None:
                 logger.debug("Restart notification skipped: no live transport for %s", platform_str)
                 return None
@@ -859,6 +869,13 @@ class GatewayNotificationsMixin:
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
                     platform.value,
                 )
+                continue
+            if not self._transient_notice_enabled_for_target(
+                platform, str(home.chat_id), thread_id=getattr(home, "thread_id", None),
+                chat_type=str(getattr(home, "chat_type", None) or "group"),
+                profile=getattr(transport.adapter, "_owner_profile", None),
+            ):
+                logger.info("Home-channel startup notification suppressed by runtime notice policy for %s:%s", platform.value, home.chat_id)
                 continue
             target = _notice_target_key(platform.value, home.chat_id, home.thread_id)
             if target in skipped or target in delivered:

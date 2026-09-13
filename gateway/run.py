@@ -599,8 +599,15 @@ _CONTEXT_OVERFLOW_REPLY = (
     "Use /compress to shorten the history, or /new to start a fresh conversation.")
 
 
-def _gateway_provider_error_reply(text: str) -> str:
-    """Map raw provider/API errors to a short user-safe Telegram reply."""
+def _gateway_provider_error_reply(text: str, platform: Any = None) -> str:
+    """Map raw provider/API errors to a short user-safe platform reply.
+
+    WhatsApp's final answer is intentionally terse: it is the sole visible
+    terminal outcome for an addressed request, while retry/fallback/billing
+    diagnostics remain in gateway logs.
+    """
+    if _gateway_platform_value(platform) in {"whatsapp", "whatsapp_cloud"}:
+        return "I couldn’t complete your request this time. Please try again later."
     for pattern, reply in _PROVIDER_ERROR_REPLIES:
         if pattern.search(text):
             return reply
@@ -657,7 +664,7 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
+        return _gateway_provider_error_reply(redacted, platform)
     return redacted
 
 
@@ -678,7 +685,7 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     ):
         return None
     if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
+        return _gateway_provider_error_reply(text, platform)
     return text
 
 

@@ -23,6 +23,14 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "suppress_warning_notifications": False,
     "long_running_notifications": True,
+    # Operational diagnostics are not conversational answers.  Platforms with a
+    # permanent public transcript may opt out independently of final delivery.
+    "runtime_notices": True,
+    # Background memory work continues when this is off; this only controls its
+    # user-facing completion bubble.
+    "memory_notifications": "on",
+    # The acknowledgement is distinct from queue/steer state mutation.
+    "busy_ack_enabled": True,
     "busy_ack_detail": True,
     "busy_steer_ack_enabled": True,  # busy_input_mode=steer echo; the text still lands in the run
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
@@ -59,8 +67,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "feishu": _TIER_MEDIUM,
     "buzz": _TIER_MEDIUM,  # Nostr: edits in place but channels are shared community spaces
     "signal": _TIER_LOW,
-    "whatsapp": _TIER_MEDIUM,  # Baileys bridge supports /edit
-    "whatsapp_cloud": _TIER_LOW,  # adapter lacks edit_message; promote once it lands
+    # WhatsApp messages are permanent, customer-visible chat records.  New
+    # profiles are final-answer-first: runtime diagnostics and busy acks stay
+    # internal unless that WhatsApp platform explicitly opts in.
+    "whatsapp": {**_TIER_LOW, "busy_ack_enabled": False, "runtime_notices": False,
+                 "memory_notifications": "off"},
+    "whatsapp_cloud": {**_TIER_LOW, "busy_ack_enabled": False, "runtime_notices": False,
+                       "memory_notifications": "off"},
     "photon": _TIER_LOW,  # permanent-message iMessage inboxes (no edit)
     "bluebubbles": _TIER_LOW,
     "weixin": _TIER_LOW,
@@ -189,9 +202,12 @@ _NORMALISERS: dict[str, Any] = {
     "interim_assistant_messages": _norm_bool,
     "suppress_warning_notifications": _norm_suppress_warning_notifications,
     "long_running_notifications": _norm_long_running,
+    "runtime_notices": _norm_bool,
+    "busy_ack_enabled": _norm_bool,
     "busy_ack_detail": _norm_bool,
     "busy_steer_ack_enabled": _norm_bool,
     "thinking_progress": _norm_bool,
+    "memory_notifications": _norm_choice(("off", "on", "verbose")),
     "cleanup_progress": _norm_cleanup_progress,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),

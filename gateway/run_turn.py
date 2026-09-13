@@ -476,7 +476,7 @@ class GatewayTurnMixin:
         try:
             should_notify = reset_reason == "suspended"
             adapter = self._adapter_for_source(source) if should_notify else None
-            if adapter:
+            if adapter and self._transient_notice_enabled_for_source(source):
                 notice = (
                     "◐ Session reset after being stopped. "
                     f"Conversation history cleared.\n"
@@ -821,6 +821,9 @@ class GatewayTurnMixin:
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
         try:
+            if not self._transient_notice_enabled_for_source(source):
+                logger.debug("Suppressed %s by runtime notice policy", what)
+                return
             _adapter = self._adapter_for_source(source)
             if _adapter and source.chat_id:
                 await _adapter.emit_warning(source.chat_id, message, metadata=meta,
@@ -4031,7 +4034,7 @@ class GatewayTurnMixin:
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
-        if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
+        if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off" or not self._long_running_notifications_enabled_for_source(turn_ctx.source):
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata

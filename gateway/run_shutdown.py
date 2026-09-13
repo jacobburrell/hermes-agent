@@ -971,6 +971,15 @@ class GatewayShutdownMixin:
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
+                if source is not None:
+                    if not self._transient_notice_enabled_for_source(source):
+                        logger.info("Shutdown notification suppressed by runtime notice policy for %s:%s", platform.value, chat_id)
+                        continue
+                elif not self._transient_notice_enabled_for_target(
+                    platform, chat_id, thread_id=thread_id, profile=profile,
+                ):
+                    logger.info("Shutdown notification suppressed by runtime notice policy for %s:%s", platform.value, chat_id)
+                    continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
                     reply_to_message_id = getattr(restart_source, "message_id", None)

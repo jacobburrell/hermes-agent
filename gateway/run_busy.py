@@ -769,7 +769,7 @@ class GatewayBusySessionMixin:
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
-        if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
+        if not self._busy_ack_enabled_for_source(event.source):
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 

@@ -42,6 +42,147 @@ _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 class GatewayConfigLoadersMixin:
     """Config/env loaders (busy modes, reasoning, service tier, timeouts, fallback) for GatewayRunner."""
 
+    def _notice_policy_config_for_source(self, source: SessionSource) -> tuple[dict, bool]:
+        """Read the routed profile's display policy with last-known-good semantics.
+
+        Notice visibility is a delivery policy, so it must follow the source
+        profile rather than the process launch profile.  A partially-written
+        YAML file must not turn WhatsApp diagnostics back on; after one valid
+        read we keep that profile's last known good policy until it parses
+        again.  Before any valid read WhatsApp fails closed.
+        """
+        from gateway.run import _multiplex_profile_homes
+
+        cache = self.__dict__.setdefault("_notice_policy_config_by_home", {})
+        try:
+            profile_home = self._resolve_profile_home_for_source(source)
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                requested = str(getattr(source, "profile", "") or "").strip()
+                if requested:
+                    served = dict(_multiplex_profile_homes(self.config))
+                    expected = served.get(requested)
+                    if expected is None or profile_home.resolve(strict=False) != expected.resolve(strict=False):
+                        logger.warning("Rejecting notice-policy read for unserved profile %r", requested)
+                        return {}, False
+            config_path = Path(profile_home) / "config.yaml"
+            cache_key = str(config_path.resolve(strict=False))
+            if not config_path.exists():
+                return cache.get(cache_key, ({}, False))
+            from hermes_cli.config import _expand_env_vars, read_user_config_raw
+            config = read_user_config_raw(config_path)
+            try:
+                from hermes_cli import managed_scope
+                config = managed_scope.apply_managed_overlay(config)
+            except Exception:
+                logger.debug("Managed overlay unavailable for notice policy", exc_info=True)
+            config = _expand_env_vars(config)
+            if not isinstance(config, dict):
+                raise ValueError("notice-policy config is not a mapping")
+            result = (config, True)
+            cache[cache_key] = result
+            return result
+        except Exception:
+            logger.warning("Could not read routed notice policy; retaining last known good", exc_info=True)
+            try:
+                return cache.get(cache_key, ({}, False))
+            except UnboundLocalError:
+                return {}, False
+
+    @staticmethod
+    def _is_whatsapp_source(source: SessionSource) -> bool:
+        return getattr(getattr(source, "platform", None), "value", getattr(source, "platform", "")) in {
+            "whatsapp", "whatsapp_cloud"}
+
+    def _transient_notice_enabled_for_source(self, source: SessionSource) -> bool:
+        """Whether non-final runtime diagnostics may leave this source's chat."""
+        from gateway.run import _gateway_surface_passes_raw_text, _platform_config_key
+        from gateway.display_config import resolve_display_setting
+
+        if _gateway_surface_passes_raw_text(source.platform):
+            return True
+        config, valid = self._notice_policy_config_for_source(source)
+        whatsapp = self._is_whatsapp_source(source)
+        if whatsapp and not valid:
+            return False
+        return bool(resolve_display_setting(
+            config, _platform_config_key(source.platform), "runtime_notices", not whatsapp))
+
+    def _transient_notice_enabled_for_target(
+        self, platform: Platform, chat_id: str, *, thread_id: Optional[str] = None,
+        chat_type: str = "group", profile: Optional[str] = None,
+    ) -> bool:
+        """Apply the same policy to a persisted lifecycle target without an inbound event."""
+        return self._transient_notice_enabled_for_source(SessionSource(
+            platform=platform, chat_id=str(chat_id), chat_type=chat_type,
+            thread_id=thread_id, profile=profile,
+        ))
+
+    def _memory_notification_mode_for_source(self, source: SessionSource) -> str:
+        """Resolve memory-review visibility without changing memory persistence."""
+        from gateway.run import _platform_config_key
+        from gateway.display_config import resolve_display_setting
+
+        config, valid = self._notice_policy_config_for_source(source)
+        key = _platform_config_key(source.platform)
+        if self._is_whatsapp_source(source):
+            if not valid:
+                return "off"
+            # Do not reinterpret an old global "on" as WhatsApp opt-in.
+            display = config.get("display") if isinstance(config, dict) else None
+            platforms = display.get("platforms") if isinstance(display, dict) else None
+            platform_config = platforms.get(key) if isinstance(platforms, dict) else None
+            if not isinstance(platform_config, dict) or "memory_notifications" not in platform_config:
+                return "off"
+        value = resolve_display_setting(config, key, "memory_notifications", "on")
+        return value if value in {"off", "on", "verbose"} else "off"
+
+    def _progress_notices_enabled_for_source(self, source: SessionSource) -> bool:
+        """Require an explicit WhatsApp platform opt-in for tool/thinking progress."""
+        from gateway.run import _gateway_surface_passes_raw_text, _platform_config_key
+        from gateway.display_config import resolve_display_setting
+
+        if _gateway_surface_passes_raw_text(source.platform) or not self._is_whatsapp_source(source):
+            return True
+        config, valid = self._notice_policy_config_for_source(source)
+        if not valid:
+            return False
+        key = _platform_config_key(source.platform)
+        display = config.get("display") if isinstance(config, dict) else None
+        platforms = display.get("platforms") if isinstance(display, dict) else None
+        platform_config = platforms.get(key) if isinstance(platforms, dict) else None
+        if not isinstance(platform_config, dict):
+            return False
+        tool_mode = resolve_display_setting(config, key, "tool_progress", "off")
+        thinking = resolve_display_setting(config, key, "thinking_progress", False)
+        return tool_mode not in {"off", "log", None} or bool(thinking)
+
+    def _long_running_notifications_enabled_for_source(self, source: SessionSource) -> bool:
+        """Live source-aware gate for periodic working heartbeats."""
+        from gateway.run import _gateway_surface_passes_raw_text, _platform_config_key
+        from gateway.display_config import resolve_display_setting
+
+        if _gateway_surface_passes_raw_text(source.platform) or not self._is_whatsapp_source(source):
+            return True
+        config, valid = self._notice_policy_config_for_source(source)
+        if not valid:
+            return False
+        value = resolve_display_setting(config, _platform_config_key(source.platform), "long_running_notifications", False)
+        return bool(value) and str(value).strip().lower() != "off"
+
+    def _busy_ack_enabled_for_source(self, source: SessionSource) -> bool:
+        """Live config gate for the busy acknowledgement; queue state is unaffected."""
+        from gateway.run import _gateway_surface_passes_raw_text, _platform_config_key
+        from gateway.display_config import resolve_display_setting
+
+        if _gateway_surface_passes_raw_text(source.platform):
+            return True
+        config, valid = self._notice_policy_config_for_source(source)
+        whatsapp = self._is_whatsapp_source(source)
+        if whatsapp and not valid:
+            return False
+        return bool(resolve_display_setting(
+            config, _platform_config_key(source.platform), "busy_ack_enabled", not whatsapp))
+
     @staticmethod
     def _cfg_str(section: str, key: str) -> str:
         """``<section>.<key>`` from the gateway runtime config as a stripped string ("" when unset)."""

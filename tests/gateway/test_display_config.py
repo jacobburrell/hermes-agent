@@ -158,6 +158,14 @@ class TestPlatformDefaults:
         for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
+    def test_whatsapp_runtime_diagnostics_are_off_by_default(self):
+        from gateway.display_config import resolve_display_setting
+
+        for plat in ("whatsapp", "whatsapp_cloud"):
+            assert resolve_display_setting({}, plat, "runtime_notices") is False
+            assert resolve_display_setting({}, plat, "memory_notifications") == "off"
+            assert resolve_display_setting({}, plat, "busy_ack_enabled") is False
+
 
     def test_telegram_mobile_chatter_defaults(self):
         """Telegram keeps real mid-turn signal (interim commentary + heartbeats)
@@ -344,5 +352,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 
