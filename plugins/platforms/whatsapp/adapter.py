@@ -59,6 +59,7 @@ class _PendingInboundAlbumMember:
     materialized: Any = None
     archive: Any = None
     receipt: Any = None
+    archive_id: int | None = None
     sequence: int = 0
 
 
@@ -69,6 +70,9 @@ class _PendingInboundAlbum:
     last_seen: float = 0.0
     native_association: bool = False
     terminal_seen: bool = False
+    recovery_key: str = ""
+    continuation: bool = False
+    continuation_context: dict[str, Any] | None = None
     task: Optional[asyncio.Task] = None
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
@@ -546,27 +550,38 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         group = str(group).strip() if isinstance(group, str) else ""
         return "\x1f".join((chat, sender, f"native:{group}" if group else "fallback"))
 
-    def _inbound_album_recovery_key(self, data: Dict[str, Any]) -> str | None:
-        """Return an opaque durable recovery group for one bounded album.
+    def _native_album_recovery_key(self, data: Dict[str, Any]) -> str | None:
+        """Return the stable opaque identity for a native association only."""
+        key = self._inbound_album_key(data)
+        if key is None or "\x1fnative:" not in key:
+            return None
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
-        Native associations are stable across a restart.  Timing-only bursts
-        deliberately include a one-second source timestamp bucket, matching
-        their hard cap, so unrelated later photos can never inherit an old
-        recovery obligation.
+    def _album_batch_for_data(self, data: Dict[str, Any]) -> tuple[str, _PendingInboundAlbum] | None:
+        """Get the actual in-memory batch and its durable recovery identity.
+
+        Fallback batches receive a fresh opaque identity when the first member
+        arrives.  That identity, rather than a source timestamp, is persisted
+        before every ACK, so a quiet-window burst may safely cross a clock
+        second.  Native associations use their stable parent identity.
         """
         key = self._inbound_album_key(data)
         if key is None:
             return None
-        if key.endswith("\x1ffallback"):
-            timestamp = data.get("timestamp")
-            try:
-                seconds = int(float(timestamp))
-            except (TypeError, ValueError):
-                return None
-            if seconds > 100_000_000_000:  # milliseconds from non-Baileys bridges
-                seconds //= 1000
-            key = f"{key}\x1f{seconds}"
-        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+        if not hasattr(self, "_pending_inbound_albums"):
+            self._pending_inbound_albums = {}
+        now = time.monotonic()
+        batch = self._pending_inbound_albums.get(key)
+        if batch is None:
+            native = "\x1fnative:" in key
+            recovery_key = self._native_album_recovery_key(data) if native else None
+            if recovery_key is None:
+                recovery_key = hashlib.sha256(f"{key}\x1f{uuid.uuid4().hex}".encode("utf-8")).hexdigest()
+            batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(
+                first_seen=now, last_seen=now, native_association=native,
+                recovery_key=recovery_key,
+            )
+        return key, batch
 
     @staticmethod
     def _native_album_is_terminal(data: Dict[str, Any]) -> bool:
@@ -697,12 +712,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     reply_contexts.append(context)
             if not isinstance(getattr(primary, "metadata", None), dict):
                 primary.metadata = {}
+            if batch.continuation:
+                primary.metadata["whatsapp_album_continuation"] = True
+                original_context = batch.continuation_context
+                if original_context is not None and original_context not in reply_contexts:
+                    reply_contexts.insert(0, original_context)
             if reply_contexts:
                 primary.metadata["whatsapp_album_reply_contexts"] = tuple(reply_contexts)
             primary.metadata["whatsapp_album_members"] = tuple(member_metadata)
             # The final should be ledgered under the last member so a late
             # duplicate cannot make the already-complete album send again.
             primary.ledger_message_id = getattr(events[-1], "message_id", None)
+            # A native association has no reliable cardinality.  Persist the
+            # original operational batch before dispatch so a later sibling
+            # can become a linked continuation rather than a new album.
+            if batch.native_association and batch.recovery_key and not batch.continuation:
+                archive_member = next((member for member in members if member.archive is not None and member.archive_id is not None), None)
+                if archive_member is not None and not await asyncio.to_thread(
+                    archive_member.archive.close_album_handoff,
+                    batch.recovery_key, primary_event_id=archive_member.archive_id,
+                ):
+                    return
             if recovery is not None and recovery_member is not None:
                 async def _before_ledger_record(obligation_id, *, _archive=recovery_member.archive, _recovery=recovery):
                     return await asyncio.to_thread(
@@ -727,16 +757,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def _enqueue_inbound_album_member(
         self, data: Dict[str, Any], materialized=None, *, admitted: bool,
-        archive=None, receipt=None,
+        archive=None, receipt=None, archive_id: int | None = None,
+        continuation_context: dict[str, Any] | None = None, continuation: bool = False,
     ) -> bool:
         """Stage a post-archive photo member and return whether it was accepted.
 
         The caller has already persisted every ingress member and its receipt;
         this buffer affects only *when* an operational turn is created.
         """
-        key = self._inbound_album_key(data)
-        if key is None:
+        batch_info = self._album_batch_for_data(data)
+        if batch_info is None:
             return False
+        key, batch = batch_info
         # Small embedded/test adapters that intentionally bypass ``__init__``
         # retain the legacy immediate-path fixtures while exercising the same
         # bounded batch semantics.
@@ -753,19 +785,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not hasattr(self, "_native_inbound_album_hard_cap_seconds"):
             self._native_inbound_album_hard_cap_seconds = 8.0
         now = time.monotonic()
-        batch = self._pending_inbound_albums.get(key)
-        if batch is None:
-            batch = self._pending_inbound_albums[key] = _PendingInboundAlbum(
-                first_seen=now, last_seen=now,
-                native_association="\x1fnative:" in key,
-            )
+        if batch.task is None:
             batch.task = asyncio.create_task(self._flush_inbound_album(key))
         self._inbound_album_sequence += 1
         batch.last_seen = now
         batch.terminal_seen = batch.terminal_seen or self._native_album_is_terminal(data)
+        batch.continuation = batch.continuation or continuation
+        if continuation_context is not None:
+            batch.continuation_context = dict(continuation_context)
         batch.members.append(_PendingInboundAlbumMember(
             data=dict(data), materialized=materialized, admitted=admitted, archive=archive,
-            receipt=receipt, sequence=self._inbound_album_sequence,
+            receipt=receipt, archive_id=archive_id, sequence=self._inbound_album_sequence,
         ))
         return True
 
@@ -1379,6 +1409,40 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound media archive failed; suppressing dispatch", self.name)
                                     continue
+                            late_native_member = False
+                            continuation_context = None
+                            if lease_required and archive_id is not None:
+                                native_key = self._native_album_recovery_key(event_data)
+                                if native_key is not None:
+                                    archive = self._inbound_archive_instance()
+                                    try:
+                                        late_native_member = await asyncio.to_thread(
+                                            archive.is_closed_operational_album, native_key,
+                                        )
+                                        if late_native_member and not await asyncio.to_thread(
+                                            archive.link_late_album_member, native_key, archive_id,
+                                        ):
+                                            logger.warning("[%s] WhatsApp late native album link failed", self.name)
+                                            continue
+                                        if late_native_member:
+                                            continuation_context = await asyncio.to_thread(
+                                                archive.album_handoff_reply_context, native_key,
+                                            )
+                                    except Exception:
+                                        logger.warning("[%s] WhatsApp native album state lookup failed", self.name)
+                                        continue
+                            # Establish the actual bounded batch *before* its
+                            # receipt is prepared.  The same opaque identity is
+                            # retained by the in-memory coalescer and the
+                            # durable recovery fence; source timestamps are not
+                            # a reliable album boundary.
+                            album_batch = self._album_batch_for_data(event_data) if archive_id is not None else None
+                            album_recovery_key = album_batch[1].recovery_key if album_batch is not None else None
+                            if late_native_member:
+                                # The archive promotion above makes the late
+                                # sibling one operational continuation of the
+                                # addressed original batch, never ambient text.
+                                admitted = True
                             if lease_required:
                                 try:
                                     receipt = await asyncio.to_thread(
@@ -1391,7 +1455,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     # is part of that fence, not an in-memory coalescer fact.
                                     receipt = await asyncio.to_thread(
                                         self._inbound_archive_instance().prepare_bridge_handoff, receipt,
-                                        album_key=self._inbound_album_recovery_key(event_data),
+                                        album_key=album_recovery_key,
                                     )
                                 except Exception:
                                     logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
@@ -1411,7 +1475,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             if archive_id is not None and self._enqueue_inbound_album_member(
                                 event_data, materialized, admitted=admitted,
                                 archive=(self._inbound_archive_instance() if lease_required else None),
-                                receipt=receipt,
+                                receipt=receipt, archive_id=archive_id,
+                                continuation_context=continuation_context,
+                                continuation=late_native_member,
                             ):
                                 if admitted:
                                     asyncio.create_task(self._send_read_receipt(msg_data))

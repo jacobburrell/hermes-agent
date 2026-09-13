@@ -234,6 +234,24 @@ class WhatsAppInboundArchive:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(profile_scope, delivery_id)
             );
+            CREATE TABLE IF NOT EXISTS archive_album_handoff (
+                profile_scope TEXT NOT NULL,
+                album_key TEXT NOT NULL,
+                operational INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                primary_event_id INTEGER,
+                closed_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, album_key)
+            );
+            CREATE TABLE IF NOT EXISTS archive_album_late_member (
+                profile_scope TEXT NOT NULL,
+                album_key TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                linked_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, album_key, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS archive_event_profile_sequence ON archive_event(profile_scope, id DESC);
+            CREATE INDEX IF NOT EXISTS archive_event_profile_chat_sequence ON archive_event(profile_scope, chat_id, id DESC);
             """)
             # Existing profile archives predate the receipt table.  The sole
             # additive column is deliberately default-false: an old row can
@@ -253,6 +271,9 @@ class WhatsAppInboundArchive:
             event_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_event)")}
             if "source_timestamp_ms" not in event_columns:
                 db.execute("ALTER TABLE archive_event ADD COLUMN source_timestamp_ms INTEGER")
+            album_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_album_handoff)")}
+            if "primary_event_id" not in album_columns:
+                db.execute("ALTER TABLE archive_album_handoff ADD COLUMN primary_event_id INTEGER")
         self._secure()
 
     def _validate_paths(self):
@@ -459,6 +480,147 @@ class WhatsAppInboundArchive:
             ).fetchone()
             return self._receipt_from_row(row)
 
+    @staticmethod
+    def _validated_album_key(album_key: str) -> str:
+        album_key = str(album_key or "").lower()
+        if len(album_key) != 64 or any(char not in "0123456789abcdef" for char in album_key):
+            raise ArchiveRejected("invalid inbound album recovery key")
+        return album_key
+
+    def close_album_handoff(self, album_key: str, *, primary_event_id: int) -> bool:
+        """Persist a completed native association before ordinary turn dispatch.
+
+        Association metadata has no reliable cardinality on all Baileys paths.
+        A later sibling is therefore retained as a linked continuation of this
+        completed association rather than reclassified as a new user turn.
+        """
+        album_key = self._validated_album_key(album_key)
+        with self._connect() as db:
+            cursor = db.execute(
+                """INSERT INTO archive_album_handoff(
+                       profile_scope,album_key,operational,state,primary_event_id,closed_at
+                   ) VALUES(?,?,1,'closed',?,?)
+                   ON CONFLICT(profile_scope,album_key) DO UPDATE SET
+                       operational=1,state='closed',
+                       primary_event_id=COALESCE(archive_album_handoff.primary_event_id,excluded.primary_event_id),
+                       closed_at=excluded.closed_at""",
+                (self.scope, album_key, int(primary_event_id), time.time()),
+            )
+            return cursor.rowcount == 1
+
+    def is_closed_operational_album(self, album_key: str) -> bool:
+        album_key = self._validated_album_key(album_key)
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM archive_album_handoff
+                   WHERE profile_scope=? AND album_key=? AND state='closed' AND operational=1""",
+                (self.scope, album_key),
+            ).fetchone()
+            return row is not None
+
+    def link_late_album_member(self, album_key: str, event_id: int) -> bool:
+        """Associate a post-close native sibling with its original album."""
+        album_key = self._validated_album_key(album_key)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            closed = db.execute(
+                """SELECT 1 FROM archive_album_handoff
+                   WHERE profile_scope=? AND album_key=? AND state='closed' AND operational=1""",
+                (self.scope, album_key),
+            ).fetchone()
+            event = db.execute(
+                "SELECT 1 FROM archive_event WHERE profile_scope=? AND id=?",
+                (self.scope, int(event_id)),
+            ).fetchone()
+            if closed is None or event is None:
+                return False
+            # An already-authorized sibling of an operational association is
+            # itself operational, but only as the explicit continuation below;
+            # it never re-enters generic ambient admission.
+            promoted = db.execute(
+                "UPDATE archive_event SET admission='operate' WHERE profile_scope=? AND id=?",
+                (self.scope, int(event_id)),
+            )
+            if promoted.rowcount != 1:
+                return False
+            cursor = db.execute(
+                """INSERT INTO archive_album_late_member(profile_scope,album_key,event_id,linked_at)
+                   VALUES(?,?,?,?) ON CONFLICT(profile_scope,album_key,event_id) DO NOTHING""",
+                (self.scope, album_key, int(event_id), time.time()),
+            )
+            if cursor.rowcount == 1:
+                return True
+            return db.execute(
+                """SELECT 1 FROM archive_album_late_member
+                   WHERE profile_scope=? AND album_key=? AND event_id=?""",
+                (self.scope, album_key, int(event_id)),
+            ).fetchone() is not None
+
+    def album_handoff_reply_context(self, album_key: str) -> dict[str, object] | None:
+        """Return only the original quote pointer needed by a continuation."""
+        album_key = self._validated_album_key(album_key)
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT event.payload_json FROM archive_album_handoff AS handoff
+                   JOIN archive_event AS event ON event.id=handoff.primary_event_id
+                   WHERE handoff.profile_scope=? AND handoff.album_key=?
+                     AND handoff.state='closed' AND handoff.operational=1""",
+                (self.scope, album_key),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        message_id = str(payload.get("quotedMessageId") or "").strip()
+        text = str(payload.get("quotedText") or "").strip()
+        if not message_id or not text:
+            return None
+        return {
+            "message_id": message_id,
+            "text": text,
+            "is_own": bool(payload.get("quotedOutboundByJack")),
+        }
+
+    def settle_bridge_observation(self, receipt: BridgeReceipt, *, exact_only: bool = False) -> bool:
+        """Close a silent observation handoff without generating a recovery.
+
+        Whole ambient albums are intentionally settled together.  A late
+        sibling of an already-dispatched native album passes ``exact_only`` so
+        it cannot clear the original turn's still-live recovery fence.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT album_key FROM archive_bridge_receipt
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=?
+                     AND recovery_pending=1 AND acknowledged=1""",
+                (self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+            ).fetchone()
+            if row is None:
+                return False
+            album_key = str(row["album_key"] or "")
+            if album_key and not exact_only:
+                cursor = db.execute(
+                    """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
+                       WHERE profile_scope=? AND album_key=? AND recovery_pending=1""",
+                    (time.time(), self.scope, album_key),
+                )
+            else:
+                cursor = db.execute(
+                    """UPDATE archive_bridge_receipt SET recovery_pending=0,updated_at=?
+                       WHERE profile_scope=? AND delivery_id=? AND recovery_pending=1""",
+                    (time.time(), self.scope, receipt.delivery_id),
+                )
+            # A grouped update deliberately clears more than one member; the
+            # expected success condition is at least one protected receipt.
+            return cursor.rowcount > 0
+
     def renew_bridge_receipt(self, receipt: BridgeReceipt, lease: Mapping[str, Any]) -> BridgeReceipt:
         delivery_id, event_digest, request = self._receipt_identity(lease)
         if (
@@ -493,7 +655,7 @@ class WhatsAppInboundArchive:
                 (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
                  receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
             )
-            return cursor.rowcount == 1
+            return cursor.rowcount > 0
 
     def pending_bridge_receipts(self) -> list[BridgeReceipt]:
         with self._connect() as db:

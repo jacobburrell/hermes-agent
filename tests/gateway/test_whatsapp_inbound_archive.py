@@ -746,6 +746,100 @@ def test_album_receipts_survive_restart_as_one_recovery_obligation(tmp_path):
     assert restarted.pending_bridge_recoveries() == []
 
 
+def test_fallback_batch_identity_crosses_source_seconds_and_recovers_once(tmp_path):
+    """A quiet-window batch identity is not a per-message timestamp bucket."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    adapter = object.__new__(WhatsAppAdapter)
+    receipts = []
+    for index in range(7):
+        raw = _leased_raw(
+            mid=f"fallback-cross-second-{index}", timestamp=99 if index < 3 else 100,
+            hasMedia=True, mediaType="image", chatId="15551230000@s.whatsapp.net",
+            senderId="15551230000@s.whatsapp.net", isGroup=False,
+            lease_kwargs={"delivery": f"{index + 1:x}" * 64},
+        )
+        batch = adapter._album_batch_for_data(raw)
+        assert batch is not None
+        event_id, accepted = archive.record(raw, "operate" if index == 6 else "observe")
+        assert accepted
+        receipt = archive.bind_bridge_receipt(event_id, raw["_inboundLease"])
+        receipt = archive.mark_bridge_receipt_ready(receipt)
+        receipt = archive.prepare_bridge_handoff(receipt, album_key=batch[1].recovery_key)
+        assert archive.mark_bridge_receipt_acked(receipt)
+        receipts.append(receipt)
+    assert len({receipt.album_key for receipt in receipts}) == 1
+    restarted = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    assert [item.delivery_id for item in restarted.pending_bridge_recoveries()] == [receipts[-1].delivery_id]
+    # Whole-observation settlement intentionally affects every grouped receipt
+    # and must not reject the expected multi-row update.
+    assert restarted.settle_bridge_observation(receipts[-1])
+    assert restarted.pending_bridge_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_late_native_sibling_is_one_linked_operational_continuation(tmp_path):
+    """A post-flush native member is not silently dropped or reinterpreted ambiently."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+
+    def leased(index, *, body, quote=False):
+        path = cache / f"late-native-{index}.jpg"; path.write_bytes(f"late-{index}".encode())
+        return _leased_raw(
+            mid=f"late-native-{index}", body=body, hasMedia=True, mediaType="image", mime="image/jpeg",
+            mediaUrls=[str(path)], quotedMessageId="quote-original" if quote else None,
+            quotedText="original reply context" if quote else None, quotedOutboundByJack=quote,
+            nativeMetadata={"album": {"groupId": "late-parent", "messageIndex": index}},
+            lease_kwargs={"delivery": f"{index + 1:x}" * 64},
+        )
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1; adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = Mock(return_value=True)
+    # Only the original is directly addressed.  The late sibling must still
+    # reach one operational continuation through the closed association.
+    adapter._should_process_message = Mock(side_effect=lambda raw: raw["messageId"] == "late-native-0")
+    adapter._is_allowed_profile_bridge_path = lambda path: str(path).startswith(str(cache))
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._archive_manifest_capability = object()
+    adapter._agent_visible_archive_manifest = Mock(side_effect=lambda materialized: adapter._trusted_archive_manifest(materialized))
+    adapter._native_inbound_album_quiet_seconds = 0.01; adapter._native_inbound_album_hard_cap_seconds = 0.03
+    adapter._inbound_album_quiet_seconds = 0.01; adapter._inbound_album_hard_cap_seconds = 0.03
+
+    async def build(data, *, already_admitted, archive_manifest):
+        return MessageEvent(
+            text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+            message_id=data["messageId"], media_urls=list(data["mediaUrls"]), media_types=["image/jpeg"],
+        )
+
+    adapter._build_message_event = AsyncMock(side_effect=build)
+    adapter.handle_message = AsyncMock(); adapter._send_read_receipt = AsyncMock()
+    first = leased(0, body="original", quote=True)
+    adapter._http_session = _LeaseSession(adapter, [first], archive)
+    await adapter._poll_messages()
+    await asyncio.sleep(0.06)
+    assert adapter.handle_message.await_count == 1
+
+    late = leased(1, body="late sibling")
+    adapter._running = True
+    adapter._http_session = _LeaseSession(adapter, [late], archive)
+    await adapter._poll_messages()
+    await asyncio.sleep(0.06)
+    assert adapter.handle_message.await_count == 2
+    continuation = adapter.handle_message.await_args.args[0]
+    assert continuation.metadata["whatsapp_album_continuation"] is True
+    assert continuation.metadata["whatsapp_album_reply_contexts"] == ({
+        "message_id": "quote-original", "text": "original reply context", "is_own": True,
+    },)
+    assert [Path(path).read_bytes() for path in continuation.media_urls] == [b"late-1"]
+    with archive._connect() as db:
+        event = db.execute("SELECT admission FROM archive_event WHERE message_id='late-native-1'").fetchone()
+        links = db.execute("SELECT COUNT(*) FROM archive_album_late_member").fetchone()[0]
+    assert event["admission"] == "operate" and links == 1
+
+
 @pytest.mark.asyncio
 async def test_multiplexed_ambient_archive_and_agent_copy_stay_with_adapter_profile(tmp_path, monkeypatch):
     """A receiving adapter never follows a different active profile's cache root."""
