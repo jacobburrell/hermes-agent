@@ -1,8 +1,10 @@
 """Private WhatsApp archive foundation: no model/provider projection."""
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import os
 import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -11,7 +13,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from plugins.platforms.whatsapp.inbound_archive import ArchiveRejected, MaterializationResult, WhatsAppInboundArchive
+from plugins.platforms.whatsapp.inbound_archive import (
+    ArchiveRejected, MaterializationResult, WhatsAppInboundArchive, bridge_event_digest,
+)
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from gateway.platforms.base import MessageType
 
@@ -44,6 +48,13 @@ def _lease(*, delivery="a" * 64, digest="b" * 64, consumer="test-consumer", toke
         "consumerId": consumer, "deliveryId": delivery, "eventDigest": digest,
         "token": token, "epoch": epoch, "expiresAt": int(time.time() * 1000) + 60_000,
     }
+
+
+def _leased_raw(*, lease_kwargs=None, **raw_kwargs):
+    raw = _raw(**raw_kwargs)
+    raw["_inboundLease"] = _lease(**(lease_kwargs or {}))
+    raw["_inboundLease"]["eventDigest"] = bridge_event_digest(raw)
+    return raw
 
 
 def test_observe_operate_duplicate_collision_and_restart(tmp_path):
@@ -94,12 +105,35 @@ def test_bridge_receipt_is_profile_scoped_fenced_and_restart_safe(tmp_path):
         restarted.bind_bridge_receipt(next_event, {**first, "eventDigest": "c" * 64})
 
 
+def test_bridge_receipt_rejects_delayed_epoch_and_same_epoch_binding_replays(tmp_path):
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    event_id, _ = archive.record(_raw(mid="epoch"), "operate")
+    original = {
+        "deliveryId": "a" * 64, "eventDigest": "b" * 64,
+        "consumerId": "consumer-a", "epoch": 1, "token": "token-a",
+    }
+    current = {**original, "consumerId": "consumer-b", "epoch": 2, "token": "token-b"}
+    archive.bind_bridge_receipt(event_id, original)
+    updated = archive.bind_bridge_receipt(event_id, current)
+    assert updated.request["consumerId"] == "consumer-b" and updated.request["epoch"] == 2
+
+    # A delayed poll from the former owner must not overwrite the new holder.
+    with pytest.raises(ArchiveRejected, match="stale.*epoch"):
+        archive.bind_bridge_receipt(event_id, original)
+    # Nor may a same-generation replay substitute a token or consumer.
+    with pytest.raises(ArchiveRejected, match="incompatible.*binding"):
+        archive.bind_bridge_receipt(event_id, {**current, "token": "different-token"})
+    with pytest.raises(ArchiveRejected, match="incompatible.*binding"):
+        archive.bind_bridge_receipt(event_id, {**current, "consumerId": "consumer-c"})
+
+
 @pytest.mark.asyncio
 async def test_acked_handoff_remains_recoverable_but_duplicate_poll_never_dispatches(tmp_path):
     """An ACKed bridge delivery is recoverable metadata, never a re-run turn."""
     home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
     archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
-    raw = _raw(mid="handoff", _inboundLease=_lease())
+    raw = _leased_raw(mid="handoff")
     event_id, accepted = archive.record(raw, "operate")
     assert accepted
     receipt = archive.bind_bridge_receipt(event_id, raw["_inboundLease"])
@@ -138,7 +172,8 @@ async def test_acked_handoff_remains_recoverable_but_duplicate_poll_never_dispat
     ids=("consumer-mismatch", "bad-digest", "expired"),
 )
 async def test_adapter_rejects_stale_or_mismatched_lease_before_archive_ack_or_dispatch(lease):
-    raw = _raw(mid="invalid-lease", _inboundLease=lease)
+    raw = _leased_raw(mid="invalid-lease")
+    raw["_inboundLease"].update(lease)
     adapter = object.__new__(WhatsAppAdapter)
     adapter._running = True; adapter._bridge_port = 1
     adapter.platform = SimpleNamespace(value="whatsapp")
@@ -163,9 +198,9 @@ async def test_leased_media_is_owned_and_handoff_is_durable_before_bridge_ack(tm
     home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
     source = cache / "photo.jpg"; source.write_bytes(b"owned-before-ack")
     archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
-    raw = _raw(
+    raw = _leased_raw(
         mid="leased-media", hasMedia=True, mediaType="image", mime="image/jpeg",
-        mediaUrls=[str(source)], _inboundLease=_lease(delivery="c" * 64, digest="d" * 64),
+        mediaUrls=[str(source)], lease_kwargs={"delivery": "c" * 64},
     )
     adapter = object.__new__(WhatsAppAdapter)
     adapter._running = True; adapter._bridge_port = 1
@@ -269,6 +304,59 @@ class _LeaseSession(_Session):
             attachment = db.execute("SELECT owned_path FROM archive_attachment").fetchone()
             assert attachment is not None and Path(attachment["owned_path"]).is_file()
         return _Response(self.adapter, {"status": "acknowledged"})
+
+
+def _actual_node_spool_digest(event):
+    bridge = Path(__file__).parents[2] / "scripts" / "whatsapp-bridge" / "inbound_spool.js"
+    script = (
+        f"import {{ inboundEventDigest }} from {json.dumps(str(bridge))};"
+        "let source='';process.stdin.setEncoding('utf8');"
+        "process.stdin.on('data', chunk => { source += chunk; });"
+        "process.stdin.on('end', () => process.stdout.write(inboundEventDigest(JSON.parse(source)).eventDigest));"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script], input=json.dumps(event),
+        text=True, capture_output=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("body", "quote", "media-descriptor"))
+async def test_actual_node_digest_contract_rejects_mutated_leased_event(mutation):
+    raw = _leased_raw(
+        mid="node-contract", body="original", quotedText="quoted original", hasMedia=True,
+        mediaType="image", mime="image/jpeg", fileName="photo.jpg", mediaUrls=["/bridge/photo.jpg"],
+        mediaMetadata=[{"mediaType": "image", "mime": "image/jpeg", "fileName": "photo.jpg", "size": 5}],
+    )
+    node_digest = _actual_node_spool_digest(raw)
+    assert node_digest == bridge_event_digest(raw)
+    raw["_inboundLease"]["eventDigest"] = node_digest
+    mutated = json.loads(json.dumps(raw))
+    if mutation == "body":
+        mutated["body"] = "changed"
+    elif mutation == "quote":
+        mutated["quotedText"] = "changed quote"
+    else:
+        mutated["mediaMetadata"][0]["mime"] = "image/png"
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [mutated])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._inbound_archive_instance = Mock()
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+    adapter._build_message_event = AsyncMock()
+    adapter.handle_message = AsyncMock()
+
+    await adapter._poll_messages()
+
+    adapter._inbound_archive_instance.assert_not_called()
+    adapter._ack_inbound_receipt.assert_not_awaited()
+    adapter._build_message_event.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import hmac
 import logging
 import mimetypes
 import os
@@ -977,6 +978,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             if lease_required and lease is None:
                                 logger.warning("[%s] WhatsApp bridge returned an invalid inbound lease", self.name)
                                 continue
+                            if lease_required:
+                                try:
+                                    from plugins.platforms.whatsapp.inbound_archive import bridge_event_digest
+                                    digest_matches = hmac.compare_digest(
+                                        bridge_event_digest(msg_data), str(lease["eventDigest"]).lower(),
+                                    )
+                                except Exception:
+                                    digest_matches = False
+                                if not digest_matches:
+                                    # Lease metadata is not proof of the flat event it
+                                    # accompanied.  A changed body, quote, or media
+                                    # descriptor must never reach archive, ACK, or model.
+                                    logger.warning("[%s] WhatsApp bridge event digest mismatch", self.name)
+                                    continue
                             # Archive before dispatch, but never let retention alter the
                             # established DM/group/mention admission decision.
                             admitted = self._should_process_message(msg_data)

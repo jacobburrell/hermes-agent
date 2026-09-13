@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -44,6 +45,101 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
+
+
+def _node_digest_json(value: Any) -> str:
+    """Canonical JSON compatible with the bridge's ``canonicalDigestJson``.
+
+    This is intentionally separate from the archive's historical payload
+    digest.  It authenticates exactly the leased bridge event, including the
+    bridge's stable media descriptor hash, before Python ever archives or ACKs
+    it.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        if abs(value) > 9_007_199_254_740_991:
+            raise ArchiveRejected("unsafe bridge integer")
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ArchiveRejected("non-finite bridge number")
+        if value.is_integer():
+            return _node_digest_json(int(value))
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_node_digest_json(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        fields = []
+        for key in sorted(value, key=str):
+            if not isinstance(key, str):
+                raise ArchiveRejected("non-string bridge object key")
+            fields.append(f"{json.dumps(key, ensure_ascii=False)}:{_node_digest_json(value[key])}")
+        return "{" + ",".join(fields) + "}"
+    raise ArchiveRejected("non-JSON bridge value")
+
+
+def _node_jid(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    local, marker, domain = raw.rpartition("@")
+    if not marker:
+        return raw.split(":", 1)[0]
+    return f"{local.split(':', 1)[0]}@{domain}"
+
+
+def _node_string(value: Any) -> str:
+    """Subset of JavaScript ``String`` used by the JSON bridge contract."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def bridge_event_digest(raw: Mapping[str, Any]) -> str:
+    """Return the Node spool digest for a flat leased event, fail closed."""
+    if not isinstance(raw, Mapping):
+        raise ArchiveRejected("invalid bridge event")
+    payload = dict(raw)
+    for key in ("mediaUrls", "mediaMetadata", "_inboundLease"):
+        payload.pop(key, None)
+    if "chatId" in payload:
+        payload["chatId"] = _node_jid(payload["chatId"])
+    if "senderId" in payload:
+        payload["senderId"] = _node_jid(payload["senderId"])
+    if isinstance(payload.get("readReceiptKey"), Mapping):
+        receipt_key = dict(payload["readReceiptKey"])
+        receipt_key["remoteJid"] = _node_jid(receipt_key.get("remoteJid"))
+        receipt_key["participant"] = _node_jid(receipt_key.get("participant"))
+        payload["readReceiptKey"] = receipt_key
+    sources = raw.get("mediaUrls") if isinstance(raw.get("mediaUrls"), list) else []
+    declared = raw.get("mediaMetadata") if isinstance(raw.get("mediaMetadata"), list) else []
+    entry_count = max(len(sources), len(declared), 1 if raw.get("hasMedia") else 0)
+    stable_entries = []
+    for index in range(entry_count):
+        metadata = declared[index] if index < len(declared) and isinstance(declared[index], Mapping) else {}
+        declared_sha = str(metadata.get("sha256") or "").lower()
+        if len(declared_sha) != 64 or any(char not in "0123456789abcdef" for char in declared_sha):
+            declared_sha = ""
+        stable_entries.append({
+            "index": index,
+            "mediaType": _node_string(metadata.get("mediaType") or raw.get("mediaType") or ""),
+            "mime": _node_string(metadata.get("mime") or raw.get("mime") or ""),
+            "fileName": _node_string(metadata.get("fileName") or raw.get("fileName") or ""),
+            "declaredSha256": declared_sha,
+            "declaredSize": _node_string(metadata.get("size")),
+        })
+    ordered_metadata_digest = hashlib.sha256(_node_digest_json(stable_entries).encode()).hexdigest()
+    return hashlib.sha256(_node_digest_json({
+        "event": payload,
+        "orderedUnownedMediaMetadataDigest": ordered_metadata_digest,
+    }).encode()).hexdigest()
 
 
 def _normal(value: Any) -> str:
@@ -216,6 +312,16 @@ class WhatsAppInboundArchive:
                     )
                     raise ArchiveRejected("inbound bridge delivery digest collision")
                 if not bool(row["acknowledged"]):
+                    previous_epoch = int(row["epoch"])
+                    previous_consumer = str(row["consumer_id"])
+                    previous_token = str(row["token"])
+                    if int(request["epoch"]) < previous_epoch:
+                        raise ArchiveRejected("stale inbound bridge lease epoch")
+                    if int(request["epoch"]) == previous_epoch and (
+                        str(request["consumerId"]) != previous_consumer
+                        or str(request["token"]) != previous_token
+                    ):
+                        raise ArchiveRejected("incompatible inbound bridge lease binding")
                     db.execute(
                         """UPDATE archive_bridge_receipt
                            SET consumer_id=?,epoch=?,token=?,ready=MAX(ready,?),updated_at=?
