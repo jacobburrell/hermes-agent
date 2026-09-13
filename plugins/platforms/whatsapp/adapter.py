@@ -422,6 +422,26 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             visible_paths.append(str(target))
         return _ArchiveOwnedManifest(manifest.capability, tuple(visible_paths), manifest.descriptors)
 
+    def _agent_visible_quoted_media_paths(self, data: Dict[str, Any]) -> tuple[str, ...] | None:
+        """Replace bridge quote-cache paths with copies of prior owned media.
+
+        ``None`` means the bridge did not supply quoted media and preserves
+        the outbound-media fallback in :meth:`_quoted_media`.  An empty tuple
+        means it did supply a path but the exact quoted inbound record is not
+        durably available, so it must not reach Jack as a transient reference.
+        """
+        raw_paths = data.get("quotedMediaUrls")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            return None
+        quote_id = data.get("quotedMessageId")
+        quote_chat = data.get("quotedRemoteJid") or data.get("chatId")
+        materialized = self._inbound_archive_instance().materialized_message_attachments(
+            quote_chat, quote_id,
+        )
+        if materialized is None:
+            return ()
+        return self._agent_visible_archive_manifest(materialized).paths
+
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
         """Keep authorized inbound evidence locally without changing admission."""
         chat_id = str(data.get("chatId") or "")
@@ -1104,6 +1124,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 except Exception:
                                     logger.warning("[%s] WhatsApp owned-media exposure failed; suppressing dispatch", self.name)
                                     continue
+                            if event_data.get("quotedMediaUrls"):
+                                try:
+                                    quoted_paths = await asyncio.to_thread(
+                                        self._agent_visible_quoted_media_paths, event_data,
+                                    )
+                                    if quoted_paths is not None:
+                                        event_data["quotedMediaUrls"] = list(quoted_paths)
+                                except Exception:
+                                    # A quoted attachment is optional context, unlike the
+                                    # message's own media. Never forward a transient bridge
+                                    # path if local recovery fails; the reply text still has
+                                    # its normal durable archive and admission path.
+                                    event_data["quotedMediaUrls"] = []
                             event = await self._build_message_event(
                                 event_data, already_admitted=True, archive_manifest=manifest,
                             )
@@ -1235,11 +1268,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def _quoted_media(self, data: Dict[str, Any], raw_reply_id: Any) -> list[tuple[str, str]]:
         """``(path, mime)`` for the quoted message's attachment, folded into this event's own media so the
-        vision/audio pipeline sees it like a direct send. ``contextInfo.quotedMessage`` carries only a
-        thumbnail stub, so the bridge resolves INBOUND quotes from its download cache (``quotedMediaUrls``,
-        guarded like direct media: a rogue bridge could hand back /etc/passwd); quotes of OUR media (cron
-        chart, generated image — any path we chose) resolve from the outbound index written by
-        ``_send_media_to_bridge``."""
+        vision/audio pipeline sees it like a direct send.  The poll path replaces INBOUND
+        ``quotedMediaUrls`` with fresh agent-visible copies of verified archive objects before
+        reaching here. Quotes of OUR media (cron chart, generated image — any path we chose)
+        still resolve from the outbound index written by ``_send_media_to_bridge`` when the
+        bridge supplied no quote media."""
         quoted_type = str(data.get("quotedMediaType") or "").strip()
         accepted: list[tuple[str, str]] = []
         for path in data.get("quotedMediaUrls") or []:

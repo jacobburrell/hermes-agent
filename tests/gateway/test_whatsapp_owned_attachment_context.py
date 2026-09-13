@@ -282,3 +282,175 @@ async def test_native_bridge_document_is_archived_then_exposed_to_model_with_cap
     assert "contract.pdf" in prompt
     assert 'Replying to your previous message: "Archive the signed contract."' in prompt
     assert str(bridge_path) not in prompt and str(owned) not in prompt
+
+
+@pytest.mark.asyncio
+async def test_native_reply_uses_prior_owned_attachment_not_bridge_quote_path(tmp_path, monkeypatch):
+    """A reply/forward quote reuses the durable original bytes, not a cache URL."""
+    home = tmp_path / "profile"
+    image_cache = home / "cache" / "images"
+    image_cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    bridge_original = image_cache / "bridge-original.png"
+    bridge_original.write_bytes(_PNG)
+    archive = WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, image_cache,
+    )
+    original = _raw(
+        "quoted-original", mediaType="image", mime="image/png", fileName="original.png",
+        nativeMetadata={"album": {"groupId": "album-a", "role": "child", "messageIndex": 1}},
+    )
+    original_id, _ = archive.record(original, "observe")
+    original_materialized = archive.materialize(original_id, original, [str(bridge_original)])
+    assert original_materialized.complete
+
+    reply = _raw(
+        "reply-to-original", hasMedia=False, mediaType="", mime="", fileName="",
+        body="Please review the image I replied to.",
+        hasQuotedMessage=True, quotedMessageId="quoted-original",
+        quotedRemoteJid="chat@g.us", quotedParticipant="1555000@s.whatsapp.net",
+        quotedText="Original photo caption", quotedForwarded=True,
+        quotedMediaUrls=[str(bridge_original)], quotedMediaType="image",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._running = True
+    adapter._bridge_port = 1
+    adapter._http_session = _OneMessageSession(adapter, reply)
+    adapter._bridge_req = lambda _method, _path, _timeout, **_kwargs: adapter._http_session.get()
+    adapter._inbound_archive = archive
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = lambda _data: True
+    adapter._should_process_message = lambda _data: True
+    adapter._message_is_reply_to_bot = lambda _data: True
+    adapter._send_read_receipt = AsyncMock()
+    adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    # The production text batching queue needs adapter configuration that this
+    # focused native transport fixture intentionally does not construct. Keep
+    # the poll/archive/event path and collect the just-built text event here.
+    adapter._enqueue_text_event = received.append
+    await asyncio.wait_for(adapter._poll_messages(), timeout=2)
+    await asyncio.sleep(0)
+
+    assert len(received) == 1
+    event = received[0]
+    exposed = Path(event.media_urls[0])
+    assert exposed.read_bytes() == _PNG
+    assert exposed.parent == home / "cache" / "images"
+    assert str(bridge_original) not in event.media_urls
+    assert str(original_materialized.owned_paths[0]) not in event.media_urls
+    assert event.raw_message["quotedMediaUrls"] == [str(exposed)]
+    assert event.reply_to_text == "Original photo caption"
+    assert event.raw_message["quotedForwarded"] is True
+
+    runner = _runner(); source = _source()
+    await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+    parts, skipped = build_native_content_parts(
+        event.text, runner._consume_pending_native_image_paths(build_session_key(source)),
+    )
+    assert not skipped
+    assert any(
+        part.get("type") == "image_url"
+        and part["image_url"]["url"].startswith("data:image/png;base64,")
+        for part in parts
+    )
+
+
+def test_unarchived_quoted_attachment_is_not_exposed_from_bridge_cache(tmp_path, monkeypatch):
+    """A quote without an owned original keeps its text but not a temporary path."""
+    home = tmp_path / "profile"
+    image_cache = home / "cache" / "images"
+    image_cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    bridge_path = image_cache / "bridge-only.png"
+    bridge_path.write_bytes(_PNG)
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_archive = WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, image_cache,
+    )
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+
+    assert adapter._agent_visible_quoted_media_paths({
+        "chatId": "chat@g.us",
+        "quotedRemoteJid": "chat@g.us",
+        "quotedMessageId": "missing-original",
+        "quotedMediaUrls": [str(bridge_path)],
+    }) == ()
+
+
+@pytest.mark.asyncio
+async def test_temporary_blob_reference_is_archived_as_missing_and_never_becomes_an_agent_attachment(tmp_path, monkeypatch):
+    """The real poll path fails closed instead of handing a browser-only URL to Jack.
+
+    Native bridge extraction normally downloads media to a profile-private
+    cache path before it is spooled.  A ``blob:`` value is neither durable nor
+    bridge-owned; it must leave a local download-status record and suppress
+    the operating turn rather than being treated as a usable attachment.
+    """
+    home = tmp_path / "profile"
+    cache = home / "cache" / "documents"
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    raw = _native_document_event(cache)
+    raw["mediaUrls"] = ["blob:browser-temporary-contract"]
+    # Exercise the initialized bridge path rather than the legacy no-lease
+    # embedding seam.  The digest is the exact Node-spool digest over the
+    # unleased event; a real bridge adds this delivery fence after staging.
+    raw["_inboundLease"] = {
+        "consumerId": "test-consumer",
+        "deliveryId": "a" * 64,
+        "eventDigest": bridge_event_digest(raw),
+        "token": "leased-token",
+        "epoch": 1,
+        "expiresAt": int(time.time() * 1000) + 30_000,
+    }
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._running = True
+    adapter._bridge_port = 1
+    adapter._http_session = _OneMessageSession(adapter, raw)
+    adapter._bridge_req = lambda _method, _path, _timeout, **_kwargs: adapter._http_session.get()
+    adapter._inbound_archive = None
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = lambda _data: True
+    adapter._should_process_message = lambda _data: True
+    adapter._send_read_receipt = AsyncMock()
+    adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    bridge_calls = []
+    adapter._bridge_req = lambda method, path, _timeout, **kwargs: (
+        bridge_calls.append((method, path, kwargs)) or adapter._http_session.get()
+    )
+    await asyncio.wait_for(adapter._poll_messages(), timeout=2)
+    await asyncio.sleep(0)
+
+    assert received == []
+    archive = adapter._inbound_archive_instance()
+    with archive._connect() as db:
+        row = db.execute(
+            "SELECT download_status, owned_path FROM archive_attachment"
+        ).fetchone()
+    assert row["download_status"] == "missing_or_rejected"
+    assert row["owned_path"] is None
+    with archive._connect() as db:
+        receipt = db.execute("SELECT acknowledged FROM archive_bridge_receipt").fetchone()
+    assert receipt["acknowledged"] == 0
+    assert [call[:2] for call in bridge_calls] == [("get", "messages")]

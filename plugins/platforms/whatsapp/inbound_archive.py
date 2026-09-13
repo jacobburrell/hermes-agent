@@ -874,3 +874,55 @@ class WhatsAppInboundArchive:
             owned_paths=tuple(str(path) for path in manifest_paths) if complete else (),
             owned_descriptors=tuple(dict(descriptor) for descriptor in descriptors) if complete else (),
         )
+
+    def materialized_message_attachments(
+        self, chat_id: Any, message_id: Any,
+    ) -> MaterializationResult | None:
+        """Return a verified, profile-scoped manifest for an earlier inbound message.
+
+        WhatsApp quote stubs do not contain original attachment bytes.  A
+        reply may reuse only the already-owned archive object for its exact
+        chat/message identity; bridge-cache paths are neither durable nor an
+        agent-visible authority.
+        """
+        chat, message = _normal(chat_id), str(message_id or "").strip()
+        if not chat or not message:
+            return None
+        with self._connect() as db:
+            event = db.execute(
+                """SELECT id FROM archive_event
+                   WHERE profile_scope=? AND chat_id=? AND message_id=?""",
+                (self.scope, chat, message),
+            ).fetchone()
+            if event is None:
+                return None
+            rows = db.execute(
+                """SELECT ordinal,descriptor_json,owned_path,sha256,size,download_status
+                   FROM archive_attachment WHERE event_id=? ORDER BY ordinal""",
+                (int(event["id"]),),
+            ).fetchall()
+        if not rows:
+            return None
+        descriptors: list[dict[str, str]] = []
+        paths: list[str] = []
+        for row in rows:
+            if str(row["download_status"]) != "owned":
+                return None
+            try:
+                descriptor = json.loads(str(row["descriptor_json"]))
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(descriptor, dict) or not self._verify_owned_object(
+                row["owned_path"], row["sha256"], row["size"],
+            ):
+                return None
+            paths.append(str(row["owned_path"]))
+            descriptors.append(dict(descriptor))
+        return MaterializationResult(
+            complete=True,
+            owned_count=len(paths),
+            attachment_count=len(paths),
+            statuses=("owned",) * len(paths),
+            owned_paths=tuple(paths),
+            owned_descriptors=tuple(descriptors),
+        )
