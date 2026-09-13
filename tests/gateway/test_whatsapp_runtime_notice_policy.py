@@ -208,6 +208,33 @@ async def test_status_transport_keeps_other_platforms_compatible() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("revoked", ("policy", "ownership"))
+async def test_status_transport_rechecks_policy_and_ownership_after_scheduling(revoked: str) -> None:
+    """The scheduled coroutine, rather than only its producer, owns the final send decision."""
+    source = _source()
+    state = {"policy": True, "ownership": True}
+    runner = _runner({})
+    runner._transient_notice_enabled_for_source = lambda _source: state["policy"]
+    scheduled: list[object] = []
+    adapter = SimpleNamespace(send=AsyncMock())
+    ctx = SimpleNamespace(
+        source=source,
+        _status_adapter=adapter,
+        _run_still_current=lambda: state["ownership"],
+        _status_chat_id="chat-a",
+    )
+    turn = TurnRunner(runner, ctx)
+    turn._schedule = lambda coro, *_args: scheduled.append(coro)
+
+    turn._send_status_text("Working", None, "status send")
+    assert len(scheduled) == 1
+    state[revoked] = False
+    await scheduled.pop()
+
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inactivity_warning_respects_whatsapp_transient_policy() -> None:
     source = _source()
     runner = _runner({})

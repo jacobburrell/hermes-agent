@@ -893,10 +893,17 @@ class TurnRunner:
         ctx = self._ctx
         # Callers often check these policies before preparing status text, but
         # configuration and turn ownership can change before this final send
-        # boundary.  Keep WhatsApp's final-answer-first policy authoritative.
+        # boundary.  Keep WhatsApp's final-answer-first policy authoritative
+        # both before scheduling and immediately before transport.
         if not self._status_live() or not self._runner._transient_notice_enabled_for_source(ctx.source):
             return
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+
+        async def _deliver_if_still_allowed() -> None:
+            if not self._status_live() or not self._runner._transient_notice_enabled_for_source(ctx.source):
+                return
+            await ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata)
+
+        self._schedule(_deliver_if_still_allowed(), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
