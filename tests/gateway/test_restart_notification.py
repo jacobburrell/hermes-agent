@@ -413,3 +413,24 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_muted_whatsapp_home_shutdown_broadcast_uses_owner_profile_and_stays_silent(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.config.platforms = {
+        Platform.WHATSAPP: PlatformConfig(
+            enabled=True,
+            home_channel=HomeChannel(Platform.WHATSAPP, "wa-home", "WhatsApp home"),
+        ),
+    }
+    adapter._owner_profile = "jackwhatsapp"
+    seen = []
+    runner._transient_notice_enabled_for_target = lambda *args, **kwargs: (seen.append((args, kwargs)) or False)
+    monkeypatch.setattr("gateway.drain_control.drain_notification_suppressed", lambda: False)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == []
+    assert seen[0][0][:2] == (Platform.WHATSAPP, "wa-home")
+    assert seen[0][1]["profile"] == "jackwhatsapp"
+

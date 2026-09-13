@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 import gateway.run as gateway_run
 import hermes_state
 import hermes_state_registry
+from gateway.config import Platform
 from gateway.run import _SESSION_DB_UNPINNED
 from gateway.session_db_recovery import RecoverableHandleCache
 
@@ -49,7 +51,10 @@ def _runner_with_startup_failure(monkeypatch, clock: _Clock, *, heals: bool):
         runner._open_session_db_for_active_scope(raise_on_error=True)
     clock.now = 5.0  # past the backoff: the pre-broadcast re-check is allowed to open
     sent: list[str] = []
-    monkeypatch.setattr(runner, "_home_channel_transports", lambda: [("telegram", {}, "home", object())])
+    home = SimpleNamespace(chat_id="home", thread_id=None)
+    transport = SimpleNamespace(adapter=object())
+    monkeypatch.setattr(runner, "_home_channel_transports", lambda: [(Platform.TELEGRAM, {}, home, transport)])
+    monkeypatch.setattr(runner, "_transient_notice_enabled_for_target", lambda *_args, **_kwargs: True)
 
     async def _capture(_platform, _home, _transport, message, _fmt):
         sent.append(message)
@@ -74,3 +79,22 @@ def test_still_unavailable_store_is_still_broadcast(monkeypatch):
     runner, sent = _runner_with_startup_failure(monkeypatch, clock, heals=False)
     asyncio.run(runner._send_session_db_warning_notifications())
     assert len(sent) == 1 and "Session database unavailable" in sent[0]
+
+
+def test_still_unavailable_store_does_not_broadcast_to_muted_whatsapp_like_target(monkeypatch):
+    clock = _Clock()
+    runner, sent = _runner_with_startup_failure(monkeypatch, clock, heals=False)
+    home = SimpleNamespace(chat_id="wa-home", thread_id=None)
+    transport = SimpleNamespace(adapter=SimpleNamespace(_owner_profile="jackwhatsapp"))
+    monkeypatch.setattr(runner, "_home_channel_transports", lambda: [(Platform.WHATSAPP, {}, home, transport)])
+    seen = []
+    monkeypatch.setattr(
+        runner, "_transient_notice_enabled_for_target",
+        lambda *args, **kwargs: (seen.append((args, kwargs)) or False),
+    )
+
+    asyncio.run(runner._send_session_db_warning_notifications())
+
+    assert sent == []
+    assert seen[0][0][:2] == (Platform.WHATSAPP, "wa-home")
+    assert seen[0][1]["profile"] == "jackwhatsapp"

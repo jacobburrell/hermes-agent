@@ -77,6 +77,9 @@ def make_restart_runner(
     runner._restart_via_service = False
     runner._detached_restart_helper_started = False
     runner._restart_command_source = None
+    # Lifecycle tests opt into the legacy visible behavior unless a case is
+    # specifically asserting WhatsApp's final-answer-first policy.
+    runner._transient_notice_enabled_for_target = lambda *_args, **_kwargs: True
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._restart_after_turn_timeout = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     runner._cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT

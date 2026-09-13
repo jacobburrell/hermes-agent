@@ -863,6 +863,17 @@ class GatewayShutdownMixin:
                     continue
                 chat_id = str(target.get("chat_id"))
                 thread_id = target.get("thread_id")
+                # The adapter selected above is the one that would actually
+                # deliver this lifecycle diagnostic.  Resolve the policy in
+                # that adapter's profile scope; cron target records do not
+                # carry enough provenance to safely substitute another one.
+                if not self._transient_notice_enabled_for_target(
+                    platform, chat_id, thread_id=thread_id,
+                    chat_type=str(target.get("chat_type") or "group"),
+                    profile=getattr(adapter, "_owner_profile", None),
+                ):
+                    logger.info("Cron interrupt notice suppressed by runtime notice policy for %s:%s", platform.value, chat_id)
+                    continue
                 dedup_key = (job_id, *_notice_target_key(platform.value, chat_id, thread_id))
                 if dedup_key in notified:
                     continue
@@ -1024,6 +1035,14 @@ class GatewayShutdownMixin:
             if not home or not home.chat_id:
                 continue
             if not self._notice_allowed(platform, "home channel"):
+                continue
+            if not self._transient_notice_enabled_for_target(
+                platform, str(home.chat_id), thread_id=home.thread_id,
+                # Home-channel config has no chat type; lifecycle broadcasts
+                # have always used group semantics here and startup matches it.
+                chat_type="group", profile=getattr(adapter, "_owner_profile", None),
+            ):
+                logger.info("Home-channel shutdown notification suppressed by runtime notice policy for %s:%s", platform.value, home.chat_id)
                 continue
             dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
             if dedup_key in notified:

@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from tests.gateway.restart_test_helpers import make_restart_runner
 from tools import browser_tool_lifecycle as bt_lifecycle
 
@@ -43,6 +43,10 @@ def _telegram_job(job_id="be62d36a9914", name="daily-digest", chat_id="123456"):
 
 def _telegram_target(chat_id="123456"):
     return {"platform": "telegram", "chat_id": chat_id, "thread_id": None}
+
+
+def _whatsapp_target(chat_id="wa-group"):
+    return {"platform": "whatsapp", "chat_id": chat_id, "thread_id": None}
 
 
 def _bind_notifier(runner):
@@ -140,6 +144,30 @@ class TestNotifyInterruptedCronJobs:
 
         assert sent == 0
         assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_muted_whatsapp_suppresses_interrupted_cron_diagnostic_in_adapter_profile(self):
+        """Lifecycle diagnostics use the profile of the selected transport, never a guessed source."""
+        runner, adapter = make_restart_runner()
+        _bind_notifier(runner)
+        runner.adapters = {Platform.WHATSAPP: adapter}
+        runner.config.platforms = {Platform.WHATSAPP: PlatformConfig(enabled=True)}
+        adapter._owner_profile = "jackwhatsapp"
+        seen = []
+
+        def _quiet(*args, **kwargs):
+            seen.append((args, kwargs))
+            return False
+
+        runner._transient_notice_enabled_for_target = _quiet
+        job = {"id": "wa-cron", "name": "digest", "deliver": "whatsapp:wa-group"}
+        with patch("cron.jobs.get_job", return_value=job), \
+             patch("cron.scheduler._resolve_delivery_targets", return_value=[_whatsapp_target()]):
+            assert await runner._notify_interrupted_cron_jobs([job["id"]]) == 0
+
+        assert adapter.sent == []
+        assert seen[0][0][:2] == (Platform.WHATSAPP, "wa-group")
+        assert seen[0][1]["profile"] == "jackwhatsapp"
 
     @pytest.mark.asyncio
     async def test_failure_deliver_local_suppresses_interrupt_notice(self):

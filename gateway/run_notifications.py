@@ -953,6 +953,12 @@ class GatewayNotificationsMixin:
         logger.warning("Broadcasting state.db failure warning to home channels: %s", error)
         from gateway.warning_notifications import present_notification
         for platform, _platform_cfg, home, transport in self._home_channel_transports():
+            if not self._transient_notice_enabled_for_target(
+                platform, str(home.chat_id), thread_id=getattr(home, "thread_id", None),
+                chat_type="group", profile=getattr(transport.adapter, "_owner_profile", None),
+            ):
+                logger.info("State-db home-channel warning suppressed by runtime notice policy for %s:%s", platform.value, home.chat_id)
+                continue
             await present_notification(
                 lambda: self._send_home_channel_message(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
