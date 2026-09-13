@@ -3935,8 +3935,22 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
-            obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+            # Startup recovery has already atomically claimed one concrete
+            # delivery row.  It must carry that row through finalization
+            # unchanged: recomputing from the synthetic recovery delivery id
+            # would create a second row and leave the archive receipt bound to
+            # the first one forever.  This is an internal archive-to-ledger
+            # fence, never platform metadata or model-visible input.
+            claimed_recovery_id = getattr(event, "_bridge_recovery_obligation_id", None)
+            if is_bridge_recovery and claimed_recovery_id is not None:
+                if not isinstance(claimed_recovery_id, str) or not re.fullmatch(
+                    r"[0-9a-f]{24}", claimed_recovery_id,
+                ):
+                    return None
+                obligation_id = claimed_recovery_id
+            else:
+                obligation_id = compute_obligation_id(
+                    session_key, str(_ledger_id or ""), text_content)
             before_record = getattr(event, "_bridge_recovery_before_ledger_record", None)
             if callable(before_record):
                 # The archive moves its direct restart handoff to

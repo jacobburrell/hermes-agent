@@ -13,6 +13,7 @@ import pytest
 
 from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive
 from tests.gateway.restart_test_helpers import make_restart_runner
@@ -210,6 +211,59 @@ async def test_pending_substantive_final_is_delivered_verbatim_not_replaced(tmp_
     await runner._recover_pending_whatsapp_bridge_handoffs()
 
     assert [item[1] for item in adapter.sent] == [substantive]
+    assert archive.pending_bridge_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_producer_message_obligation_id_is_finalized_without_recompute(tmp_path, monkeypatch):
+    """Startup must deliver the exact row an ordinary inbound producer made.
+
+    The producer keys finals by the real WhatsApp inbound id, not by the
+    bridge spool delivery id used by the later synthetic recovery event.
+    """
+    archive = _acked_archive(tmp_path, delivery_id="c" * 64)
+    runner, adapter = _runner(archive)
+    recovery = archive.reserve_bridge_recovery("c" * 64)
+    source = runner._bridge_recovery_source(adapter, recovery)
+    from gateway.session import build_session_key
+
+    content = "The verified filing is ready for your review."
+    key = build_session_key(source, profile=source.profile)
+    producer_message_id = "BAILEYS-PRODUCER-INBOUND-42"
+    producer_obligation_id = dl.compute_obligation_id(key, producer_message_id, content)
+    assert producer_obligation_id != dl.compute_obligation_id(
+        key, recovery.delivery_id, content,
+    )
+    # Drive Base's ordinary producer ledger path with the real inbound id.
+    # Simulate the narrow crash after its durable record/bind but before its
+    # mark-attempting step, leaving a pending row for a new startup worker.
+    event = MessageEvent(
+        text="original request", message_type=MessageType.TEXT, source=source,
+        message_id=producer_message_id,
+    )
+    event._bridge_recovery_delivery_id = recovery.delivery_id
+    event._bridge_recovery_generation = recovery.generation
+
+    async def before_record(oid):
+        return await asyncio.to_thread(
+            archive.register_bridge_recovery_delivery, recovery, oid,
+        )
+
+    event._bridge_recovery_before_ledger_record = before_record
+    monkeypatch.setattr(dl, "mark_attempting", lambda _oid: None)
+    assert await adapter._record_delivery_obligation(
+        event, key, content, adapter, False,
+    ) == producer_obligation_id
+    _orphan_obligation(producer_obligation_id)
+
+    await runner._recover_pending_whatsapp_bridge_handoffs()
+
+    assert [item[1] for item in adapter.sent] == [content]
+    with dl._connect() as db:
+        rows = db.execute(
+            "SELECT obligation_id,state FROM delivery_obligations ORDER BY obligation_id"
+        ).fetchall()
+    assert rows == [(producer_obligation_id, "delivered")]
     assert archive.pending_bridge_recoveries() == []
 
 

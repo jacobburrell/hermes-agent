@@ -403,6 +403,11 @@ class GatewayStartupMixin:
         )
         event._bridge_recovery_delivery_id = recovery.delivery_id
         event._bridge_recovery_generation = recovery.generation
+        # Preserve the exact durable row claimed above through Base's normal
+        # final-delivery bracket.  The synthetic event's message id is the
+        # bridge delivery id, while a producer's original final may have been
+        # ledgered against the actual inbound WhatsApp message id.
+        event._bridge_recovery_obligation_id = obligation_id
 
         async def _after_delivery(oid, *, _archive=archive, _recovery=recovery):
             await self._settle_bridge_recovery(_archive, _recovery, oid)
