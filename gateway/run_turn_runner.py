@@ -92,6 +92,26 @@ class TurnRunner:
         except Exception:
             return False
 
+    def _progress_delivery_allowed(self) -> bool:
+        """Whether this turn still owns, and may visibly deliver, progress.
+
+        Progress is a transient runtime notice.  Check the live, source-scoped
+        policy at the transport boundary rather than merely declining to queue
+        some callback messages: a config edit, a session replacement, or an
+        edit failure can otherwise leak a later progress bubble.
+        """
+        try:
+            return bool(
+                self._ctx._run_still_current()
+                and not self._agent_interrupted()
+                and self._runner._progress_notices_enabled_for_source(self._ctx.source)
+            )
+        except Exception:
+            # A failure to resolve a routed policy must never make a WhatsApp
+            # transient notice visible.  Non-WhatsApp resolution is expected
+            # to be available, so this conservative path only affects failure.
+            return False
+
     def _stream_consumer(self):
         holder = self._ctx.stream_consumer_holder
         return holder[0] if holder else None
@@ -537,6 +557,14 @@ class TurnRunner:
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
 
+    @dataclasses.dataclass
+    class _ProgressSendResult:
+        """Adapter-result shape used when policy suppresses a transport call."""
+        success: bool
+        message_id: Any = None
+        retryable: bool = False
+        error: str = ""
+
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
         len_fn = adapter.message_len_fn if isinstance(adapter, BasePlatformAdapter) else len
@@ -562,6 +590,8 @@ class TurnRunner:
         )
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
+        if not self._progress_delivery_allowed():
+            return self._ProgressSendResult(success=False, message_id=None, retryable=False, error="suppressed")
         ctx = self._ctx
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
@@ -587,6 +617,8 @@ class TurnRunner:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
+        if not self._progress_delivery_allowed():
+            return self._ProgressSendResult(success=False, message_id=None, retryable=False, error="suppressed")
         ctx = self._ctx
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
@@ -672,7 +704,7 @@ class TurnRunner:
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
         await asyncio.sleep(0.3)
-        if ctx._run_still_current():
+        if self._progress_delivery_allowed():
             await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
@@ -681,6 +713,8 @@ class TurnRunner:
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
         failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
         """
+        if not self._progress_delivery_allowed():
+            return True
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
             if result.success:
@@ -692,6 +726,8 @@ class TurnRunner:
                 logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
             else:
                 st.can_edit = False
+            # Recheck inside _send_progress_text: a source policy can change
+            # while the permanent edit failure is being handled.
             await self._send_progress_text(st, msg)
             return True
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
@@ -704,6 +740,9 @@ class TurnRunner:
         ctx = self._ctx
         adapter = self._runner._adapter_for_source(ctx.source) if ctx.progress_queue else None
         if not adapter:
+            return
+        if not self._progress_delivery_allowed():
+            self._drain_progress_queue()
             return
         if ctx._native_slack_task_cards and hasattr(adapter, "send_native_task_card_progress"):
             await self._send_native_task_card_progress(adapter)
@@ -721,6 +760,9 @@ class TurnRunner:
         while True:
             try:
                 if not ctx._run_still_current():
+                    self._drain_progress_queue()
+                    return
+                if not self._progress_delivery_allowed():
                     self._drain_progress_queue()
                     return
                 raw = ctx.progress_queue.get_nowait()
@@ -742,6 +784,9 @@ class TurnRunner:
                         await asyncio.sleep(remaining)
                         continue
                     if not ctx._run_still_current():
+                        return
+                    if not self._progress_delivery_allowed():
+                        self._drain_progress_queue()
                         return
                     if not await self._progress_send_or_edit(st, msg):
                         continue

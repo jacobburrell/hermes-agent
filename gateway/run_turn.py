@@ -4041,12 +4041,20 @@ class GatewayTurnMixin:
         _notify_adapter = self._adapter_for_source(source)
         if not _notify_adapter:
             return
+
+        def _heartbeat_delivery_allowed() -> bool:
+            """Check ownership and the live source policy at each transport edge."""
+            return bool(
+                self._should_emit_long_running_notification(
+                    session_key, agent_holder[0], _executor_task_holder[0]
+                )
+                and self._long_running_notifications_enabled_for_source(source)
+            )
+
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
-            if not self._should_emit_long_running_notification(
-                session_key, agent_holder[0], _executor_task_holder[0]
-            ):
+            if not _heartbeat_delivery_allowed():
                 break
             _elapsed_mins = int((time.time() - _notify_start) // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
@@ -4073,6 +4081,10 @@ class GatewayTurnMixin:
             try:
                 _notify_res = None
                 if _heartbeat_msg_id:
+                    # The turn may have finished, been replaced, or received a
+                    # live quiet-policy update while this heartbeat was built.
+                    if not _heartbeat_delivery_allowed():
+                        break
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
                     except Exception as _ee:
@@ -4081,10 +4093,10 @@ class GatewayTurnMixin:
                 if not (_notify_res and getattr(_notify_res, "success", False)):
                     # The edit above awaited; a drain/restart notice may have gone out meanwhile, and
                     # a fresh "Working" bubble after it reads as a contradiction (#10990).
-                    if not self._should_emit_long_running_notification(
-                        session_key, agent_holder[0], _executor_task_holder[0]
-                    ):
+                    if not _heartbeat_delivery_allowed():
                         break
+                    # This includes the first heartbeat: policy may change while
+                    # formatting the status text above, before its send starts.
                     _notify_res = await _notify_adapter.send(
                         source.chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),

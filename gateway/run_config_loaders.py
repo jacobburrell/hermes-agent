@@ -7,6 +7,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -68,17 +69,24 @@ class GatewayConfigLoadersMixin:
             cache_key = str(config_path.resolve(strict=False))
             if not config_path.exists():
                 return cache.get(cache_key, ({}, False))
-            from hermes_cli.config import _expand_env_vars, read_user_config_raw
-            config = read_user_config_raw(config_path)
-            try:
-                from hermes_cli import managed_scope
-                config = managed_scope.apply_managed_overlay(config)
-            except Exception:
-                logger.debug("Managed overlay unavailable for notice policy", exc_info=True)
-            config = _expand_env_vars(config)
+            # Keep this path on the same scoped, managed-overlay-aware resolver as
+            # an actual gateway turn.  Reading raw YAML here used to make a broken
+            # overlay look like an empty-but-valid config, which could reopen a
+            # WhatsApp notice rail during a partial config write.
+            from gateway.run import _profile_runtime_scope
+            from hermes_cli.config import get_active_config_parse_failure, load_config_readonly
+            with _profile_runtime_scope(profile_home):
+                config = load_config_readonly()
+                parse_failure = get_active_config_parse_failure()
+            # The supported resolver returns its own last-known-good config after
+            # a parse failure.  Accept it only if *this* source-policy cache has
+            # previously observed a valid mapping; otherwise WhatsApp must fail
+            # closed rather than mistaking resolver defaults for user policy.
+            if parse_failure:
+                return cache.get(cache_key, ({}, False))
             if not isinstance(config, dict):
                 raise ValueError("notice-policy config is not a mapping")
-            result = (config, True)
+            result = (copy.deepcopy(config), True)
             cache[cache_key] = result
             return result
         except Exception:
