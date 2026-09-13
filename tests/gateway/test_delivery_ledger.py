@@ -157,6 +157,7 @@ class TestStateMachine:
         assert dl.bridge_recovery_obligation(delivery_id, 3) == {
             "obligation_id": "ob-1", "state": "delivered", "attempts": 0,
             "platform": "slack", "chat_id": "C1", "profile": "default",
+            "session_key": "agent:main:slack:channel:C1", "content": "the final answer",
             "bridge_recovery_delivery_id": delivery_id,
             "bridge_recovery_generation": 3,
         }
