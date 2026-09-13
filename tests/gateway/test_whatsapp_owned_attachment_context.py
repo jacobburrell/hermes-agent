@@ -453,6 +453,58 @@ async def test_cross_chat_quoted_media_cannot_escape_its_archived_chat(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_malformed_quote_media_is_cleared_before_model_content(tmp_path, monkeypatch):
+    """A quote path cannot bypass archival by omitting its required identity."""
+    home = tmp_path / "profile"
+    image_cache = home / "cache" / "images"
+    image_cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    bridge_path = image_cache / "malformed-quote.png"
+    bridge_path.write_bytes(_PNG)
+    malformed = _raw(
+        "malformed-quote", hasMedia=False, mediaType="", mime="", fileName="",
+        body="Please inspect the quote.", hasQuotedMessage=True,
+        # A native reply must identify its quoted message. This malformed event
+        # previously skipped the poll guard yet reached `_quoted_media`.
+        quotedMessageId="", quotedMediaUrls=[str(bridge_path)], quotedMediaType="image",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._running = True
+    adapter._bridge_port = 1
+    adapter._http_session = _OneMessageSession(adapter, malformed)
+    adapter._bridge_req = lambda _method, _path, _timeout, **_kwargs: adapter._http_session.get()
+    adapter._inbound_archive = WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, image_cache,
+    )
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = lambda _data: True
+    adapter._should_process_message = lambda _data: True
+    adapter._message_is_reply_to_bot = lambda _data: True
+    adapter._send_read_receipt = AsyncMock()
+    adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+    received = []
+    adapter.handle_message = AsyncMock()
+    adapter._enqueue_text_event = received.append
+
+    await asyncio.wait_for(adapter._poll_messages(), timeout=2)
+
+    assert len(received) == 1
+    event = received[0]
+    assert event.media_urls == []
+    assert event.raw_message["quotedMediaUrls"] == []
+    runner = _runner(); source = _source()
+    await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+    parts, skipped = build_native_content_parts(
+        event.text, runner._consume_pending_native_image_paths(build_session_key(source)),
+    )
+    assert not skipped
+    assert not any(part.get("type") == "image_url" for part in parts)
+
+
+@pytest.mark.asyncio
 async def test_temporary_blob_reference_is_archived_as_missing_and_never_becomes_an_agent_attachment(tmp_path, monkeypatch):
     """The real poll path fails closed instead of handing a browser-only URL to Jack.
 

@@ -433,7 +433,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         inbound record.
         """
         raw_paths = data.get("quotedMediaUrls")
-        has_bridge_paths = isinstance(raw_paths, list) and bool(raw_paths)
+        # Treat every nonempty supplied shape as untrusted bridge media. A
+        # malformed scalar/dict must not evade the same fail-closed boundary
+        # just because ``_quoted_media`` happens to iterate lists normally.
+        has_bridge_paths = bool(raw_paths)
         quote_id = str(data.get("quotedMessageId") or "").strip()
         enclosing_chat = self._normalize_whatsapp_id(data.get("chatId"))
         quoted_chat = self._normalize_whatsapp_id(data.get("quotedRemoteJid"))
@@ -1133,18 +1136,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 except Exception:
                                     logger.warning("[%s] WhatsApp owned-media exposure failed; suppressing dispatch", self.name)
                                     continue
-                            if event_data.get("hasQuotedMessage") and event_data.get("quotedMessageId"):
-                                try:
-                                    quoted_paths = await asyncio.to_thread(
-                                        self._agent_visible_quoted_media_paths, event_data,
-                                    )
-                                    if quoted_paths is not None:
-                                        event_data["quotedMediaUrls"] = list(quoted_paths)
-                                except Exception:
-                                    # A quoted attachment is optional context, unlike the
-                                    # message's own media. Never forward a transient bridge
-                                    # path if local recovery fails; the reply text still has
-                                    # its normal durable archive and admission path.
+                            try:
+                                # Always sanitize a supplied quoted-media shape. Valid
+                                # quote identities may also recover archive-owned media
+                                # after the bridge cache has been evicted; no identity
+                                # leaves the outbound ownership fallback unchanged.
+                                quoted_paths = await asyncio.to_thread(
+                                    self._agent_visible_quoted_media_paths, event_data,
+                                )
+                                if quoted_paths is not None:
+                                    event_data["quotedMediaUrls"] = list(quoted_paths)
+                            except Exception:
+                                # A quoted attachment is optional context, unlike the
+                                # message's own media. Never forward a transient bridge
+                                # path if local recovery fails; the reply text still has
+                                # its normal durable archive and admission path.
+                                if event_data.get("quotedMediaUrls"):
                                     event_data["quotedMediaUrls"] = []
                             event = await self._build_message_event(
                                 event_data, already_admitted=True, archive_manifest=manifest,
