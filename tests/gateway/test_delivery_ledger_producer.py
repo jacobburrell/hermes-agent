@@ -63,7 +63,8 @@ def _event(text="hello agent"):
 def _rows():
     with dl._connect() as conn:
         return conn.execute(
-            """SELECT obligation_id, state, content, adapter_profile
+            """SELECT obligation_id, state, content, adapter_profile,
+                      bridge_recovery_delivery_id, bridge_recovery_generation
                FROM delivery_obligations"""
         ).fetchall()
 
@@ -111,6 +112,41 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+
+    @pytest.mark.asyncio
+    async def test_recovery_final_correlates_and_settles_only_after_transport_success(self):
+        adapter = _Adapter()
+        event = _event()
+        event._bridge_recovery_delivery_id = "c" * 64
+        event._bridge_recovery_generation = 2
+        settled = []
+
+        async def _after_delivery(obligation_id):
+            settled.append(obligation_id)
+
+        event._bridge_recovery_after_delivery = _after_delivery
+        await _run(adapter, event)
+
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][1] == "delivered"
+        assert rows[0][4:] == ("c" * 64, 2)
+        assert settled == [rows[0][0]]
+
+    @pytest.mark.asyncio
+    async def test_recovery_final_does_not_settle_when_transport_fails(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        event = _event()
+        event._bridge_recovery_delivery_id = "d" * 64
+        event._bridge_recovery_generation = 1
+        settled = []
+        event._bridge_recovery_after_delivery = lambda obligation_id: settled.append(obligation_id)
+
+        await _run(adapter, event)
+
+        assert _rows()[0][1] == "failed"
+        assert settled == []
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):

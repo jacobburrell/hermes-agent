@@ -3939,7 +3939,11 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                bridge_recovery_delivery_id=getattr(
+                    event, "_bridge_recovery_delivery_id", None),
+                bridge_recovery_generation=getattr(
+                    event, "_bridge_recovery_generation", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -3958,6 +3962,17 @@ class BasePlatformAdapter(ABC):
             from gateway.delivery_ledger import is_flood_error, mark_delivered, mark_failed
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id)
+                # The WhatsApp restart fence installs this private callback on
+                # its synthetic direct-message event.  Keeping the
+                # correlation at the normal final-delivery boundary means a
+                # crash after transport acceptance but before receipt
+                # settlement is reconciled from the delivered ledger row on
+                # next startup, rather than emitting a second clarification.
+                after_delivery = getattr(event, "_bridge_recovery_after_delivery", None)
+                if callable(after_delivery):
+                    callback_result = after_delivery(obligation_id)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)

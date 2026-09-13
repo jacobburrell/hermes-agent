@@ -39,13 +39,16 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        bridge_recovery_delivery_id=kw.get("bridge_recovery_delivery_id"),
+        bridge_recovery_generation=kw.get("bridge_recovery_generation"),
     )
 
 
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content, last_error
+            """SELECT state, attempts, owner_pid, content, last_error,
+                      bridge_recovery_delivery_id, bridge_recovery_generation
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
@@ -55,6 +58,8 @@ def _row(oid):
         "owner_pid": r[2],
         "content": r[3],
         "last_error": r[4],
+        "bridge_recovery_delivery_id": r[5],
+        "bridge_recovery_generation": r[6],
     }
 
 
@@ -123,13 +128,50 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
-        assert "adapter_profile" in columns
+        assert {"adapter_profile", "bridge_recovery_delivery_id", "bridge_recovery_generation"} <= columns
 
 
 class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+    def test_recovery_obligation_is_correlated_once_only(self):
+        delivery_id = "a" * 64
+        _record(
+            bridge_recovery_delivery_id=delivery_id,
+            bridge_recovery_generation=3,
+        )
+        dl.mark_attempting("ob-1")
+        dl.mark_delivered("ob-1")
+
+        # A restarted recovery path may prepare the same deterministic final
+        # again.  It must not reset the accepted final to pending.
+        _record(
+            bridge_recovery_delivery_id=delivery_id,
+            bridge_recovery_generation=3,
+            content="the final answer",
+        )
+
+        assert _row("ob-1")["state"] == "delivered"
+        assert dl.bridge_recovery_obligation(delivery_id, 3) == {
+            "obligation_id": "ob-1", "state": "delivered", "attempts": 0,
+            "platform": "slack", "chat_id": "C1", "profile": "default",
+            "bridge_recovery_delivery_id": delivery_id,
+            "bridge_recovery_generation": 3,
+        }
+
+    def test_recovery_correlation_requires_both_fenced_values(self):
+        with pytest.raises(ValueError):
+            _record(bridge_recovery_delivery_id="a" * 64)
+        with pytest.raises(ValueError):
+            _record(bridge_recovery_generation=1)
+        with pytest.raises(ValueError):
+            _record(bridge_recovery_delivery_id="not-a-digest", bridge_recovery_generation=1)
+        with pytest.raises(ValueError):
+            _record(bridge_recovery_delivery_id="a" * 64, bridge_recovery_generation=True)
+        with pytest.raises(ValueError):
+            _record(bridge_recovery_delivery_id="a" * 64, bridge_recovery_generation=2**63)
 
 
 class TestObligationId:
@@ -159,6 +201,19 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_claim_preserves_recovery_correlation_for_startup_settlement(self):
+        delivery_id = "b" * 64
+        _record(
+            bridge_recovery_delivery_id=delivery_id,
+            bridge_recovery_generation=4,
+        )
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable()
+
+        assert claimed[0]["bridge_recovery_delivery_id"] == delivery_id
+        assert claimed[0]["bridge_recovery_generation"] == 4
 
 
 class TestRuntimeFailedSweep:

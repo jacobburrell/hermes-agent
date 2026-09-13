@@ -167,11 +167,30 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            bridge_recovery_delivery_id TEXT,
+            bridge_recovery_generation INTEGER
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    # The bridge recovery fence is opt-in and its correlation fields are
+    # deliberately stored on the ordinary final-delivery ledger row.  That
+    # lets a later startup reconcile an acknowledged bridge handoff after a
+    # crash between a successful transport send and archive receipt settlement,
+    # without inventing a second outbound message.
+    for name, sql_type in (
+        ("bridge_recovery_delivery_id", "TEXT"),
+        ("bridge_recovery_generation", "INTEGER"),
+    ):
+        if name in columns:
+            continue
+        add_column_if_missing(conn, "delivery_obligations", name, f"{name} {sql_type}")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_delivery_obligations_bridge_recovery
+           ON delivery_obligations(bridge_recovery_delivery_id, bridge_recovery_generation)"""
+    )
 
 
 def _transaction():
@@ -232,20 +251,94 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def _bridge_recovery_correlation(delivery_id: Optional[str], generation: Optional[int]) -> tuple[Optional[str], Optional[int]]:
+    """Validate the archive-recovery correlation carried by an ordinary final.
+
+    This is not a user-supplied identifier: it is a private handoff from the
+    WhatsApp archive.  Requiring both halves prevents an unrelated final from
+    being accidentally treated as a receipt settlement during startup.
+    """
+    if delivery_id is None and generation is None:
+        return None, None
+    if not isinstance(delivery_id, str) or len(delivery_id) != 64:
+        raise ValueError("bridge recovery delivery id must be a SHA-256 hex digest")
+    if isinstance(generation, bool):
+        raise ValueError("bridge recovery generation must be a positive integer")
+    try:
+        int_generation = int(generation)  # rejects None and non-numeric values
+    except (TypeError, ValueError) as exc:
+        raise ValueError("bridge recovery generation must be a positive integer") from exc
+    if (int_generation < 1 or int_generation > 2**63 - 1
+            or any(char not in "0123456789abcdef" for char in delivery_id.lower())):
+        raise ValueError("invalid bridge recovery correlation")
+    return delivery_id.lower(), int_generation
+
+
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      bridge_recovery_delivery_id: Optional[str] = None,
+                      bridge_recovery_generation: Optional[int] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
+    recovery_delivery_id, recovery_generation = _bridge_recovery_correlation(
+        bridge_recovery_delivery_id, bridge_recovery_generation)
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
-               (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+        values = (
+            obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+            content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+            recovery_delivery_id, recovery_generation,
+        )
+        if recovery_delivery_id is None:
+            # Keep the legacy final-delivery behavior unchanged for every
+            # non-recovery response.
+            conn.execute(
+                """INSERT OR REPLACE INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id,
+                    content, state, attempts, created_at, updated_at,
+                    owner_pid, owner_started_at, adapter_profile,
+                    bridge_recovery_delivery_id, bridge_recovery_generation)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
+                values)
+        else:
+            # A recovery final is one exact once-only obligation.  In
+            # particular, a replay must never reset a delivered/attempting
+            # row back to pending or substitute a different archive record.
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id,
+                    content, state, attempts, created_at, updated_at,
+                    owner_pid, owner_started_at, adapter_profile,
+                    bridge_recovery_delivery_id, bridge_recovery_generation)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(obligation_id) DO NOTHING""",
+                values)
     _prune()
+
+
+def bridge_recovery_obligation(delivery_id: str, generation: int) -> Optional[Dict[str, Any]]:
+    """Return the one ordinary-delivery row correlated to a recovery handoff.
+
+    Startup recovery uses this to distinguish a pre-send crash (the existing
+    final may be redelivered) from a post-send/pre-settlement crash (settle the
+    archive receipt only).  The function deliberately exposes no archive
+    payload; provenance remains in the profile-scoped WhatsApp archive.
+    """
+    normalized_id, normalized_generation = _bridge_recovery_correlation(delivery_id, generation)
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT obligation_id, state, attempts, platform, chat_id, adapter_profile
+               FROM delivery_obligations
+               WHERE bridge_recovery_delivery_id=? AND bridge_recovery_generation=?""",
+            (normalized_id, normalized_generation),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "obligation_id": row[0], "state": row[1], "attempts": row[2],
+        "platform": row[3], "chat_id": row[4], "profile": row[5] or "default",
+        "bridge_recovery_delivery_id": normalized_id,
+        "bridge_recovery_generation": normalized_generation,
+    }
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -292,7 +385,9 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
-                 last_error: Optional[str] = None) -> Dict[str, Any]:
+                 last_error: Optional[str] = None,
+                 bridge_recovery_delivery_id: Optional[str] = None,
+                 bridge_recovery_generation: Optional[int] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
@@ -303,7 +398,12 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
-            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
+            **({"last_error": last_error} if last_error else {}),
+            **({"bridge_recovery_delivery_id": bridge_recovery_delivery_id}
+               if bridge_recovery_delivery_id else {}),
+            **({"bridge_recovery_generation": bridge_recovery_generation}
+               if bridge_recovery_delivery_id else {}),
+            "attempts": attempts + 1}
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
@@ -331,12 +431,14 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+                      bridge_recovery_delivery_id, bridge_recovery_generation
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+             bridge_recovery_delivery_id, bridge_recovery_generation) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -362,7 +464,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
-                        "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
+                        "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        **({"bridge_recovery_delivery_id": bridge_recovery_delivery_id}
+                           if bridge_recovery_delivery_id else {}),
+                        **({"bridge_recovery_generation": bridge_recovery_generation}
+                           if bridge_recovery_delivery_id else {}),
+                    })
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
             # resend is seen as 'attempting' with no error by the next boot and gets the marker.
@@ -378,9 +485,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
                 # the marker.
-                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
-                                            adapter_profile or "default", needs_marker=state != "pending",
-                                            flood=flood_row))
+                claimed.append(_claimed_row(
+                    oid, session_key, platform, chat_id, thread_id, content, attempts,
+                    adapter_profile or "default", needs_marker=state != "pending", flood=flood_row,
+                    bridge_recovery_delivery_id=bridge_recovery_delivery_id,
+                    bridge_recovery_generation=bridge_recovery_generation,
+                ))
     return claimed
 
 
@@ -405,11 +515,13 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile, updated_at
+                      owner_started_at, last_error, adapter_profile, updated_at,
+                      bridge_recovery_delivery_id, bridge_recovery_generation
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+             owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
+             bridge_recovery_delivery_id, bridge_recovery_generation) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
                     or not _runtime_retryable(last_error)):
@@ -435,9 +547,13 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
                 # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
                 # claim released unsent keeps its flood retry eligibility.
-                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
-                                            attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                claimed.append(_claimed_row(
+                    oid, session_key, row_platform, chat_id, thread_id, content,
+                    attempts, adapter_profile, needs_marker=True, runtime=True,
+                    flood=is_flood_error(last_error), last_error=last_error,
+                    bridge_recovery_delivery_id=bridge_recovery_delivery_id,
+                    bridge_recovery_generation=bridge_recovery_generation,
+                ))
     return claimed
 
 
