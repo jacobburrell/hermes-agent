@@ -854,6 +854,51 @@ async def test_album_flush_waits_for_member_pinned_during_receipt_commit():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("bridge-ack", "local-ack"))
+async def test_album_pin_releases_when_ack_handoff_raises_after_prior_member(failure):
+    """A failed second ACK cannot strand the already queued first member."""
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="test")
+    adapter._inbound_album_quiet_seconds = 0.01; adapter._inbound_album_hard_cap_seconds = 0.02
+    adapter._native_inbound_album_quiet_seconds = 0.01; adapter._native_inbound_album_hard_cap_seconds = 0.02
+    adapter._build_message_event = AsyncMock(side_effect=lambda data, **_: MessageEvent(
+        text=data["body"], message_type=MessageType.PHOTO, source=SimpleNamespace(),
+        message_id=data["messageId"], media_urls=[], media_types=[],
+    ))
+    adapter.handle_message = AsyncMock()
+    first = _raw(mid=f"failure-first-{failure}", body="first", hasMedia=True, mediaType="image")
+    second = _raw(mid=f"failure-second-{failure}", body="second", hasMedia=True, mediaType="image")
+    first_batch = adapter._pin_inbound_album_batch(first)
+    assert first_batch is not None
+    assert adapter._enqueue_inbound_album_member(first, None, admitted=True, batch_info=first_batch)
+    second_batch = adapter._pin_inbound_album_batch(second)
+    assert second_batch is not None and second_batch[1].committing == 1
+
+    receipt = object()
+    archive = SimpleNamespace(
+        mark_bridge_receipt_ready=Mock(return_value=receipt),
+        prepare_bridge_handoff=Mock(return_value=receipt),
+        mark_bridge_receipt_acked=Mock(
+            side_effect=RuntimeError("local receipt failure") if failure == "local-ack" else None,
+            return_value=True,
+        ),
+    )
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._ack_inbound_receipt = AsyncMock(
+        side_effect=RuntimeError("bridge ack failure") if failure == "bridge-ack" else None,
+        return_value=True,
+    )
+    result = await adapter._prepare_and_ack_pinned_album_handoff(
+        receipt, album_batch=second_batch, album_association_key=None,
+        album_recovery_key=second_batch[1].recovery_key,
+    )
+    assert result is None and second_batch[1].committing == 0
+    # The first queued member's timer is no longer held by the failed second.
+    await asyncio.sleep(0.04)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_late_native_sibling_is_one_linked_operational_continuation(tmp_path):
     """A post-flush native member is not silently dropped or reinterpreted ambiently."""
     home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)

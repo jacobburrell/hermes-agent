@@ -600,6 +600,40 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if batch_info is not None and batch_info[1].committing > 0:
             batch_info[1].committing -= 1
 
+    async def _prepare_and_ack_pinned_album_handoff(
+        self, receipt, *, album_batch: tuple[str, _PendingInboundAlbum] | None,
+        album_association_key: str | None, album_recovery_key: str | None,
+    ):
+        """Fence one inbound member and release its batch pin on every failure.
+
+        The caller transfers the successful pin to ``_enqueue_inbound_album_member``.
+        Until then, including any transport/local-ack exception, this finally
+        block is the only owner and must release exactly once.
+        """
+        handed_to_enqueue = False
+        try:
+            receipt = await asyncio.to_thread(
+                self._inbound_archive_instance().mark_bridge_receipt_ready, receipt,
+            )
+            receipt = await asyncio.to_thread(
+                self._inbound_archive_instance().prepare_bridge_handoff, receipt,
+                album_key=album_association_key, recovery_key=album_recovery_key,
+            )
+            if not await self._ack_inbound_receipt(receipt):
+                return None
+            if not await asyncio.to_thread(
+                self._inbound_archive_instance().mark_bridge_receipt_acked, receipt,
+            ):
+                return None
+            handed_to_enqueue = True
+            return receipt
+        except Exception:
+            logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
+            return None
+        finally:
+            if not handed_to_enqueue:
+                self._release_inbound_album_batch(album_batch)
+
     @staticmethod
     def _native_album_is_terminal(data: Dict[str, Any]) -> bool:
         """Honor an explicit bridge terminal marker, never infer one.
@@ -1471,32 +1505,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # addressed original batch, never ambient text.
                                 admitted = True
                             if lease_required:
-                                try:
-                                    receipt = await asyncio.to_thread(
-                                        self._inbound_archive_instance().mark_bridge_receipt_ready, receipt,
-                                    )
-                                    # This persistent fence is deliberately before bridge
-                                    # ACK: a crash after ACK cannot silently discard work.
-                                    # The later recovery slice consumes it without replaying
-                                    # the original model/tool execution.  Album membership
-                                    # is part of that fence, not an in-memory coalescer fact.
-                                    receipt = await asyncio.to_thread(
-                                        self._inbound_archive_instance().prepare_bridge_handoff, receipt,
-                                        album_key=album_association_key, recovery_key=album_recovery_key,
-                                    )
-                                except Exception:
-                                    self._release_inbound_album_batch(album_batch)
-                                    logger.warning("[%s] WhatsApp inbound receipt changed before ACK; suppressing dispatch", self.name)
-                                    continue
-                                if not await self._ack_inbound_receipt(receipt):
-                                    self._release_inbound_album_batch(album_batch)
-                                    continue
-                                if not await asyncio.to_thread(
-                                    self._inbound_archive_instance().mark_bridge_receipt_acked, receipt,
-                                ):
-                                    # A successful Node ACK without the exact local fence is
-                                    # never safe to dispatch as a new turn.
-                                    self._release_inbound_album_batch(album_batch)
+                                # This persistent fence is deliberately before bridge
+                                # ACK.  The helper keeps the selected batch pinned across
+                                # every async step and releases it on any failure.
+                                receipt = await self._prepare_and_ack_pinned_album_handoff(
+                                    receipt, album_batch=album_batch,
+                                    album_association_key=album_association_key,
+                                    album_recovery_key=album_recovery_key,
+                                )
+                                if receipt is None:
                                     continue
                             # A photo album is admitted collectively *after* every
                             # member has completed archive+receipt fencing.  Do this
