@@ -2,6 +2,7 @@
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,7 +15,7 @@ from gateway.platforms.base import MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
-from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive
+from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive, bridge_event_digest
 
 
 _PNG = (
