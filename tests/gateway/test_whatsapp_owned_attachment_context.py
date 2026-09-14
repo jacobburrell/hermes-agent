@@ -369,6 +369,82 @@ async def test_native_reply_uses_prior_owned_attachment_not_bridge_quote_path(
     )
 
 
+@pytest.mark.asyncio
+async def test_native_reply_to_owned_document_keeps_descriptor_quote_and_local_file(
+    tmp_path, monkeypatch,
+):
+    """A reply to a native document reaches the turn as a real owned file, not a URL.
+
+    The document's original native bridge write is intentionally used here: this
+    covers the boundary where a later reply must recover the prior attachment
+    from the archive even though its transient bridge-cache reference is no
+    longer an authority for the model-facing event.
+    """
+    home = tmp_path / "profile"
+    document_cache = home / "cache" / "documents"
+    document_cache.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original = _native_document_event(document_cache)
+    bridge_original = Path(original["mediaUrls"][0])
+    archive = WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, document_cache,
+    )
+    original_id, _ = archive.record(original, "observe")
+    original_materialized = archive.materialize(
+        original_id, original, [str(bridge_original)],
+    )
+    assert original_materialized.complete
+
+    reply = _raw(
+        "reply-to-native-document", hasMedia=False, mediaType="", mime="", fileName="",
+        body="Can you review the document I replied to?",
+        hasQuotedMessage=True, quotedMessageId="native-document",
+        quotedRemoteJid="chat@g.us", quotedParticipant="1555999@s.whatsapp.net",
+        quotedText="Please review this contract", quotedForwarded=False,
+        quotedMediaUrls=[str(bridge_original)], quotedMediaType="document",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._running = True
+    adapter._bridge_port = 1
+    adapter._http_session = _OneMessageSession(adapter, reply)
+    adapter._bridge_req = lambda _method, _path, _timeout, **_kwargs: adapter._http_session.get()
+    adapter._inbound_archive = archive
+    adapter._inbound_archive_home = home.resolve()
+    adapter._archive_manifest_capability = object()
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._is_archive_authorized = lambda _data: True
+    adapter._should_process_message = lambda _data: True
+    adapter._message_is_reply_to_bot = lambda _data: True
+    adapter._send_read_receipt = AsyncMock()
+    adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+    received = []
+    adapter.handle_message = AsyncMock()
+    adapter._enqueue_text_event = received.append
+
+    await asyncio.wait_for(adapter._poll_messages(), timeout=2)
+
+    assert len(received) == 1
+    event = received[0]
+    exposed = Path(event.media_urls[0])
+    assert event.media_types == ["application/pdf"]
+    assert exposed.read_bytes() == b"%PDF-1.7 native bridge bytes"
+    assert exposed.parent == home / "cache" / "documents"
+    assert str(bridge_original) not in event.media_urls
+    assert str(original_materialized.owned_paths[0]) not in event.media_urls
+    assert event.reply_to_text == "Please review this contract"
+
+    prompt = await _runner()._prepare_inbound_message_text(
+        event=event, source=_source(), history=[],
+    )
+    assert "[The user sent a document: 'contract.pdf'. It is saved at:" in prompt
+    assert str(exposed) in prompt
+    assert 'Replying to your previous message: "Please review this contract"' in prompt
+    assert str(bridge_original) not in prompt
+    assert str(original_materialized.owned_paths[0]) not in prompt
+    assert "blob:" not in prompt
+
+
 def test_unarchived_quoted_attachment_is_not_exposed_from_bridge_cache(tmp_path, monkeypatch):
     """A quote without an owned original keeps its text but not a temporary path."""
     home = tmp_path / "profile"

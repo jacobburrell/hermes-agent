@@ -452,7 +452,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         if materialized is None:
             return () if has_bridge_paths else None
-        return self._agent_visible_archive_manifest(materialized).paths
+        manifest = self._agent_visible_archive_manifest(materialized)
+        # Keep archive-proven descriptors beside the fresh visible paths until
+        # event construction. The bridge only reports the broad "document"
+        # kind, which otherwise degrades a recovered PDF/DOCX MIME to generic
+        # octet-stream. `_quoted_media` consumes and removes this private
+        # capability object before the raw bridge event is retained.
+        data["_whatsapp_owned_quoted_manifest"] = manifest
+        return manifest.paths
 
     def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
         """Keep authorized inbound evidence locally without changing admission."""
@@ -1291,11 +1298,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         bridge supplied no quote media."""
         quoted_type = str(data.get("quotedMediaType") or "").strip()
         accepted: list[tuple[str, str]] = []
-        for path in data.get("quotedMediaUrls") or []:
+        raw_paths = data.get("quotedMediaUrls") or []
+        # A bridge payload cannot mint this capability object. Match the
+        # exact local paths before using its MIME descriptors, otherwise keep
+        # the conservative bridge-kind fallback.
+        owned_manifest = data.pop("_whatsapp_owned_quoted_manifest", None)
+        trusted_descriptors: tuple[dict[str, str], ...] = ()
+        if (
+            isinstance(owned_manifest, _ArchiveOwnedManifest)
+            and owned_manifest.capability is getattr(self, "_archive_manifest_capability", None)
+            and isinstance(raw_paths, list)
+            and tuple(raw_paths) == owned_manifest.paths
+        ):
+            trusted_descriptors = owned_manifest.descriptors
+        for index, path in enumerate(raw_paths):
             if not (isinstance(path, str) and os.path.isabs(path) and self._is_allowed_profile_bridge_path(path)):
                 print(f"[{self.name}] Rejected quoted-media path outside cache dir: {path}", flush=True)
                 continue
-            accepted.append((path, _QUOTED_MIME_BY_BRIDGE_KIND.get(quoted_type, "application/octet-stream")))
+            mime = _QUOTED_MIME_BY_BRIDGE_KIND.get(quoted_type, "application/octet-stream")
+            if index < len(trusted_descriptors):
+                candidate = trusted_descriptors[index].get("mime")
+                if isinstance(candidate, str) and candidate.strip():
+                    mime = candidate.strip()
+            accepted.append((path, mime))
         if not accepted and raw_reply_id is not None:
             from gateway import rich_sent_store
             accepted = rich_sent_store.lookup_media(data.get("chatId", ""), str(raw_reply_id))
