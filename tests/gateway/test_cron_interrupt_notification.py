@@ -253,6 +253,9 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
 
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the interrupt path
+        # Current shutdown gives live cron work its own drain floor.  This
+        # ordering test needs the forced-interrupt path, not that grace wait.
+        runner._cron_drain_timeout = 0
         sched._running_job_ids.add("be62d36a9914")
 
         monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
