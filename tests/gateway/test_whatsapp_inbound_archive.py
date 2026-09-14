@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,25 @@ import pytest
 from plugins.platforms.whatsapp.inbound_archive import ArchiveRejected, MaterializationResult, WhatsAppInboundArchive
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from gateway.platforms.base import MessageType
+
+
+@pytest.fixture(autouse=True)
+def _aiohttp_timeout_for_injected_bridge_sessions(monkeypatch):
+    """Keep fake bridge transport tests independent of optional aiohttp.
+
+    The fixtures inject a context-manager-only session; ``_bridge_req`` still
+    imports aiohttp only to build its timeout object.  Without this tiny fake,
+    the poll loop retries an import failure instead of consuming the injected
+    response.  Real aiohttp connection behavior remains outside this fixture.
+    """
+    try:
+        import aiohttp  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(
+            sys.modules,
+            "aiohttp",
+            SimpleNamespace(ClientTimeout=lambda *, total: SimpleNamespace(total=total)),
+        )
 
 
 def _raw(mid="m1", **extra):
