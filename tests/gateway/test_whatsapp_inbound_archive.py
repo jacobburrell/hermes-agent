@@ -417,7 +417,16 @@ async def test_adapter_observe_operate_failure_collision_and_retry(monkeypatch, 
         adapter._http_session = _Session(adapter, [raw]); adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
         adapter._is_archive_authorized = Mock(return_value=retention)
         adapter._should_process_message = Mock(return_value=admitted)
-        archive = SimpleNamespace(record=Mock(side_effect=OSError("disk") if archive_error else lambda *_: archive_result), materialize=Mock())
+        # The production archive call deliberately carries follow-up anchor
+        # metadata as keyword arguments.  This fake models the record result,
+        # not a narrower historical signature, so the poll-boundary test can
+        # exercise the dispatch contract rather than fail before it.
+        archive = SimpleNamespace(
+            record=Mock(
+                side_effect=OSError("disk") if archive_error else lambda *_, **__: archive_result
+            ),
+            materialize=Mock(),
+        )
         adapter._inbound_archive_instance = Mock(return_value=archive)
         built = SimpleNamespace(message_type=MessageType.DOCUMENT, media_urls=[], media_types=[])
         adapter._build_message_event = AsyncMock(return_value=built)
