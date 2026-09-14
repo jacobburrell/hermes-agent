@@ -220,6 +220,18 @@ class TestSweep:
 class TestRuntimeFailedSweep:
     """A live gateway may reclaim only its own transient reconnect failures."""
 
+    @pytest.fixture(autouse=True)
+    def _stable_runtime_owner_stamp(self, monkeypatch):
+        """Model the readable process-start proof required by runtime reclaim.
+
+        Sandboxed test runners may not expose the host process start time.
+        Production correctly fails closed in that case; these happy-path tests
+        instead exercise the intended exact-owner contract.  Denial tests
+        below deliberately override this fixture with missing or mismatched
+        stamps.
+        """
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 424242))
+
     def test_claims_current_process_send_path_degraded_row(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
@@ -407,6 +419,10 @@ class TestLedgerEnabled:
 
 class TestGatewayRedeliverySweep:
     """Drive the real GatewayRunner._redeliver_pending_obligations."""
+
+    @pytest.fixture(autouse=True)
+    def _stable_runtime_owner_stamp(self, monkeypatch):
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 424242))
 
     @staticmethod
     def _runner(adapter=None):
