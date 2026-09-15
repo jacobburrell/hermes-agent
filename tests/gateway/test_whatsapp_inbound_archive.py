@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import subprocess
 import threading
@@ -18,7 +19,8 @@ from plugins.platforms.whatsapp.inbound_archive import (
     ArchiveRejected, MaterializationResult, WhatsAppInboundArchive, bridge_event_digest,
 )
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
-from gateway.platforms.base import MessageType
+from gateway.config import Platform
+from gateway.platforms.base import MessageType, SendResult
 from gateway.platforms.event import MessageEvent
 
 
@@ -45,10 +47,12 @@ def _raw(mid="m1", **extra):
     return {"messageId": mid, "chatId": "chat@g.us", "senderId": "1555000@s.whatsapp.net", "body": "ambient", "timestamp": 1, "hasMedia": False, **extra}
 
 
-def _lease(*, delivery="a" * 64, digest="b" * 64, consumer="test-consumer", token="test-token", epoch=1):
+def _lease(*, delivery="a" * 64, digest="b" * 64, consumer="test-consumer", token="test-token", epoch=1, profile_namespace="d" * 64, account_namespace="c" * 64):
     return {
         "consumerId": consumer, "deliveryId": delivery, "eventDigest": digest,
         "token": token, "epoch": epoch, "expiresAt": int(time.time() * 1000) + 60_000,
+        "profileNamespace": profile_namespace,
+        "accountNamespace": account_namespace,
     }
 
 
@@ -72,6 +76,231 @@ def test_observe_operate_duplicate_collision_and_restart(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM archive_collision").fetchone()[0] == 1
 
 
+def test_recent_context_metadata_is_profile_scoped_bounded_and_redacted(tmp_path):
+    """Metadata exposes opaque provenance, never content or external IDs."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    attachment = cache / "ambient.jpg"; attachment.write_bytes(b"private-media")
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    raw = _raw(
+        mid="observed-1", chatId="Chat-A@G.US", senderId="1555000:7@S.WHATSAPP.NET",
+        body="ambient secret must never leave the local archive", timestamp="123",
+        hasMedia=True, mediaType="image", mime="image/jpeg", fileName="ambient.jpg",
+        quotedMessageId="quoted-1", quotedParticipant="1555111:4@S.WHATSAPP.NET",
+        quotedRemoteJid="Chat-A@G.US", quotedText="quoted secret must never leave the archive",
+        quotedOutboundByJack=True,
+        nativeMetadata={"album": {"groupId": "album-1", "role": "child", "messageIndex": 2}},
+    )
+    event_id, accepted = archive.record(raw, "observe")
+    assert accepted
+    assert archive.materialize(event_id, raw, [str(attachment)]).complete
+    operated_id, accepted = archive.record(
+        _raw(mid="operated-2", chatId="chat-b@g.us", timestamp=456), "operate",
+    )
+    assert accepted
+    assert archive.record({**raw, "body": "conflicting body"}, "observe") == (event_id, False)
+
+    rows = archive.recent_context_metadata(limit=10)
+    assert [row["sequence"] for row in rows] == [event_id, operated_id]
+    first, second = rows
+    assert first["archive_ref"].startswith("event:")
+    assert first["chat_id"].startswith("chat:")
+    assert first["sender_id"].startswith("sender:")
+    assert first["message_id"].startswith("message:")
+    assert first["source_timestamp_ms"] == 123_000
+    assert first["collision_count"] == 1 and first["identity_conflict"] is True
+    assert first["quote"] and first["quote"]["message_id"].startswith("message:")
+    assert first["quote"]["participant_id"].startswith("participant:")
+    assert first["quote"]["remote_chat_id"].startswith("chat:")
+    assert first["quote"]["outbound_by_jack"] is True
+    assert first["album"] == {
+        "group_ref": first["album"]["group_ref"], "role": "child", "message_index": 2,
+    }
+    assert first["album"]["group_ref"].startswith("album:")
+    assert first["attachments"][0]["descriptor"] == {
+        "kind": "image", "mime": "image/jpeg",
+    }
+    assert first["attachments"][0]["attachment_ref"].startswith("attachment:")
+    assert first["media_coverage"] == "confirmed"
+    assert second["admission"] == "operate" and second["source_timestamp_ms"] == 456_000
+    encoded = json.dumps(rows)
+    for forbidden in (
+        "ambient secret", "quoted secret", str(attachment), "payload_json", "mediaUrls",
+        "observed-1", "chat-a@g.us", "1555000:7@s.whatsapp.net", "quoted-1",
+        "1555111:4@s.whatsapp.net", "album-1", "ambient.jpg", "private-media",
+        hashlib.sha256(b"private-media").hexdigest(),
+    ):
+        assert forbidden not in encoded
+    assert archive.recent_context_metadata(chat_id="CHAT-A@G.US", limit=1) == (first,)
+    assert archive.recent_context_metadata(limit=1) == (second,)
+    with pytest.raises(ValueError):
+        archive.recent_context_metadata(limit=0)
+    with pytest.raises(ValueError):
+        archive.recent_context_metadata(limit=1001)
+
+    other_home = tmp_path / "other"; other_cache = other_home / "cache"; other_cache.mkdir(parents=True)
+    other = WhatsAppInboundArchive(other_home / "whatsapp" / "inbound-archive-v1", other_home, other_cache)
+    other.record(_raw(mid="other-profile", chatId="chat-a@g.us"), "observe")
+    current = archive.recent_context_metadata(limit=10)
+    other_rows = other.recent_context_metadata(limit=10)
+    assert current[0]["message_id"] != other_rows[0]["message_id"]
+    assert current[0]["chat_id"] != other_rows[0]["chat_id"]
+    assert current == WhatsAppInboundArchive(
+        home / "whatsapp" / "inbound-archive-v1", home, cache,
+    ).recent_context_metadata(limit=10)
+
+
+def test_recent_context_metadata_migrates_old_archive_without_losing_receipt_columns(tmp_path):
+    """The provenance migration is additive to both old events and current receipts."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    root = home / "whatsapp" / "inbound-archive-v1"; root.mkdir(parents=True)
+    scope = hashlib.sha256(str(home.resolve()).encode()).hexdigest()
+    raw = _raw(mid="legacy", timestamp=9)
+    payload = {key: raw[key] for key in ("messageId", "chatId", "senderId", "body", "timestamp", "hasMedia")}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    with sqlite3.connect(root / "archive.sqlite3") as db:
+        db.executescript("""
+            CREATE TABLE archive_event (id INTEGER PRIMARY KEY, profile_scope TEXT NOT NULL, chat_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL, message_id TEXT NOT NULL, admission TEXT NOT NULL,
+                event_digest TEXT NOT NULL, payload_json TEXT NOT NULL, album_group TEXT,
+                album_role TEXT, album_index INTEGER, created_at REAL NOT NULL,
+                UNIQUE(profile_scope,chat_id,message_id));
+            CREATE TABLE archive_attachment (event_id INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+                descriptor_json TEXT NOT NULL, owned_path TEXT, sha256 TEXT, size INTEGER,
+                download_status TEXT NOT NULL, album_ordinal INTEGER, PRIMARY KEY(event_id,ordinal));
+            CREATE TABLE archive_collision (id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL,
+                candidate_digest TEXT NOT NULL, created_at REAL NOT NULL);
+        """)
+        db.execute(
+            "INSERT INTO archive_event VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, scope, "chat@g.us", "1555000@s.whatsapp.net", "legacy", "observe",
+             hashlib.sha256(encoded.encode()).hexdigest(), encoded, None, None, None, 1.0),
+        )
+    archive = WhatsAppInboundArchive(root, home, cache)
+    assert archive.record(raw, "observe") == (1, True)
+    with archive._connect() as db:
+        event_columns = {row["name"] for row in db.execute("PRAGMA table_info(archive_event)")}
+        assert "source_timestamp_ms" in event_columns
+        assert db.execute("SELECT source_timestamp_ms FROM archive_event WHERE id=1").fetchone()[0] is None
+        receipt_columns = {row["name"] for row in db.execute("PRAGMA table_info(archive_bridge_receipt)")}
+        assert {"recovery_pending", "album_key", "recovery_key"} <= receipt_columns
+    legacy_row, = archive.recent_context_metadata(limit=1)
+    assert legacy_row["media_coverage"] == "confirmed"
+    assert legacy_row["message_id"].startswith("message:")
+
+
+def test_pairing_disposition_migration_marks_legacy_delivery_uncertain(tmp_path):
+    """Pre-outcome pairing rows must never be upgraded into a confirmed send."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    root = home / "whatsapp" / "inbound-archive-v1"; root.mkdir(parents=True)
+    scope = hashlib.sha256(str(home.resolve()).encode()).hexdigest()
+    with sqlite3.connect(root / "archive.sqlite3") as db:
+        db.executescript("""
+            CREATE TABLE archive_unarchived_disposition (
+                profile_scope TEXT NOT NULL, delivery_id TEXT NOT NULL,
+                bridge_event_digest TEXT NOT NULL, consumer_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL, token TEXT NOT NULL, handoff_epoch INTEGER NOT NULL,
+                handoff_owner_id TEXT NOT NULL, handoff_owner_generation INTEGER NOT NULL,
+                consumer_role TEXT NOT NULL, legacy_commit_id TEXT NOT NULL,
+                account_id TEXT NOT NULL, chat_id TEXT NOT NULL, sender_id TEXT NOT NULL,
+                message_id TEXT NOT NULL, disposition TEXT NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, delivery_id)
+            );
+        """)
+        db.execute(
+            "INSERT INTO archive_unarchived_disposition VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (scope, "d" * 64, "e" * 64, "legacy", 1, "token", 1, "candidate", 1,
+             "candidate", "", "a" * 64, "chat@lid", "sender@lid", "legacy-message",
+             "pairing_intake", 0, 0, 1.0, 1.0),
+        )
+    archive = WhatsAppInboundArchive(root, home, cache)
+    with archive._connect() as db:
+        assert db.execute(
+            "SELECT effect_state FROM archive_unarchived_disposition"
+        ).fetchone()[0] == "uncertain"
+
+
+def test_recent_context_metadata_hostile_rows_are_opaque_and_never_leak(tmp_path):
+    """Persisted URL/path-shaped identities are opaque in the local projection."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    attachment = cache / "owned"; attachment.write_bytes(b"owned")
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    raw = _raw(mid="hostile", hasMedia=True, mediaType="image", mime="image/jpeg", fileName="safe.jpg")
+    event_id, _ = archive.record(raw, "observe")
+    assert archive.materialize(event_id, raw, [str(attachment)]).complete
+    raw_url, raw_path = "https://private.example/path/secret", "/private/profile/secret"
+    with archive._connect() as db:
+        db.execute(
+            """UPDATE archive_event SET chat_id=?, sender_id=?, message_id=?, admission=?,
+                   source_timestamp_ms=?, created_at=?, payload_json=? WHERE id=?""",
+            (raw_url, raw_path, "file:private", "unexpected", raw_url, "not-a-time", "[]", event_id),
+        )
+        db.execute(
+            "UPDATE archive_attachment SET descriptor_json=?, download_status=? WHERE event_id=?",
+            (json.dumps({"kind": "image/../../private", "mime": raw_url, "file_name": raw_path}),
+             "unexpected", event_id),
+        )
+
+    row, = archive.recent_context_metadata(limit=1)
+    assert row["chat_id"].startswith("chat:")
+    assert row["sender_id"].startswith("sender:")
+    assert row["message_id"].startswith("message:")
+    assert row["admission"] == "unknown"
+    assert row["source_timestamp_ms"] is None and row["archived_at_ms"] is None
+    assert row["quote"] is None and row["album"] is None and row["has_media"] is False
+    assert row["media_coverage"] == "unknown_historical"
+    assert row["attachments"][0]["descriptor"] == {}
+    assert row["attachments"][0]["status"] == "unknown"
+    encoded = json.dumps(row)
+    assert raw_url not in encoded and raw_path not in encoded and "file:private" not in encoded
+
+
+def test_recent_context_metadata_coverage_and_conflict_need_durable_evidence(tmp_path):
+    """Coverage never turns absent/corrupt history into a claim about media."""
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    owned = cache / "owned.jpg"; owned.write_bytes(b"owned")
+    missing = cache / "missing.jpg"
+
+    no_media, _ = archive.record(_raw(mid="no-media", hasMedia=False), "observe")
+    confirmed, _ = archive.record(_raw(mid="owned", hasMedia=True), "observe")
+    assert archive.materialize(confirmed, _raw(mid="owned", hasMedia=True), [str(owned)]).complete
+    missing_id, _ = archive.record(_raw(mid="missing", hasMedia=True), "observe")
+    assert not archive.materialize(missing_id, _raw(mid="missing", hasMedia=True), [str(missing)]).complete
+    historical, _ = archive.record(_raw(mid="historical", hasMedia=True), "observe")
+    assert archive.record(_raw(mid="owned", hasMedia=True, body="real collision"), "observe") == (confirmed, False)
+    with archive._connect() as db:
+        # A bogus/same-digest row must not manufacture a conflict signal.
+        digest = db.execute("SELECT event_digest FROM archive_event WHERE id=?", (no_media,)).fetchone()[0]
+        db.execute("INSERT INTO archive_collision(event_id,candidate_digest,created_at) VALUES(?,?,?)", (no_media, digest, 1.0))
+        db.execute("UPDATE archive_event SET payload_json=? WHERE id=?", ("[]", historical))
+
+    rows = {row["sequence"]: row for row in archive.recent_context_metadata(limit=10)}
+    assert rows[no_media]["media_coverage"] == "confirmed"
+    assert rows[confirmed]["media_coverage"] == "confirmed"
+    assert rows[missing_id]["media_coverage"] == "missing"
+    assert rows[historical]["media_coverage"] == "unknown_historical"
+    assert rows[confirmed]["identity_conflict"] is True
+    assert rows[no_media]["identity_conflict"] is False and rows[no_media]["collision_count"] == 0
+    assert [row["sequence"] for row in archive.recent_context_metadata(limit=2)] == [missing_id, historical]
+
+
+@pytest.mark.parametrize("nested_role", ([], {}))
+def test_recent_context_metadata_rejects_nested_album_role_without_aborting(tmp_path, nested_role):
+    home = tmp_path / "profile"; cache = home / "cache"; cache.mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, cache)
+    event_id, _ = archive.record(_raw(mid="nested-album"), "observe")
+    with archive._connect() as db:
+        db.execute(
+            "UPDATE archive_event SET payload_json=? WHERE id=?",
+            (json.dumps({"album": {"groupId": "album-1", "role": nested_role, "messageIndex": []}}), event_id),
+        )
+
+    row, = archive.recent_context_metadata(limit=1)
+    assert row["album"] and row["album"]["group_ref"].startswith("album:")
+
+
 def test_bridge_receipt_is_profile_scoped_fenced_and_restart_safe(tmp_path):
     home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
     archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
@@ -84,6 +313,7 @@ def test_bridge_receipt_is_profile_scoped_fenced_and_restart_safe(tmp_path):
     receipt = archive.bind_bridge_receipt(event_id, first)
     assert not receipt.ready and not receipt.acknowledged and not receipt.recovery_pending
     receipt = archive.mark_bridge_receipt_ready(receipt)
+    receipt = archive.prepare_bridge_handoff(receipt)
     assert receipt.ready and archive.pending_bridge_receipts() == [receipt]
 
     renewed = {**first, "token": "renewed-token"}
@@ -128,6 +358,61 @@ def test_bridge_receipt_rejects_delayed_epoch_and_same_epoch_binding_replays(tmp
         archive.bind_bridge_receipt(event_id, {**current, "token": "different-token"})
     with pytest.raises(ArchiveRejected, match="incompatible.*binding"):
         archive.bind_bridge_receipt(event_id, {**current, "consumerId": "consumer-c"})
+
+
+def test_bridge_receipt_persists_exact_handoff_fence_before_any_typed_settlement(tmp_path):
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    event_id, _ = archive.record(_raw(mid="handoff-fence"), "operate")
+    lease = {
+        "deliveryId": "a" * 64, "eventDigest": "b" * 64,
+        "consumerId": "legacy-python", "epoch": 3, "token": "exact-token",
+        "handoffEpoch": 7, "ownerId": "legacy-owner", "ownerGeneration": 4,
+        "consumerRole": "legacy", "commitId": "c" * 64,
+    }
+    receipt = archive.bind_bridge_receipt(event_id, lease)
+    assert receipt.request == {key: value for key, value in lease.items() if key != "eventDigest"}
+    receipt = archive.mark_bridge_receipt_ready(receipt)
+    receipt = archive.prepare_bridge_handoff(receipt)
+    # A stale owner cannot turn its old durable receipt into a settlement.
+    stale = type(receipt)(
+        delivery_id=receipt.delivery_id, event_digest=receipt.event_digest,
+        request={**receipt.request, "ownerGeneration": 3}, ready=receipt.ready,
+        acknowledged=receipt.acknowledged, recovery_pending=receipt.recovery_pending,
+        album_key=receipt.album_key, recovery_key=receipt.recovery_key,
+    )
+    assert not archive.mark_bridge_receipt_acked(stale)
+
+
+@pytest.mark.asyncio
+async def test_initialized_adapter_binds_only_verified_handoff_generation_and_never_auto_adopts_change():
+    class _Response:
+        status = 200
+        def __init__(self, payload): self.payload = payload
+        async def json(self): return self.payload
+
+    class _Request:
+        def __init__(self, payload): self.response = _Response(payload)
+        async def __aenter__(self): return self.response
+        async def __aexit__(self, *args): return False
+
+    states = iter((
+        {"state": "CANDIDATE_ACTIVE", "ownerId": "verified-owner", "handoffEpoch": 9, "ownerGeneration": 3},
+        {"state": "CANDIDATE_ACTIVE", "ownerId": "new-owner", "handoffEpoch": 10, "ownerGeneration": 4},
+    ))
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._inbound_handoff_owner_id = None
+    adapter._inbound_handoff_epoch = None
+    adapter._inbound_handoff_generation = None
+    adapter._inbound_handoff_binding_verified = False
+    adapter._bridge_req = lambda *_args, **_kwargs: _Request(next(states))
+
+    assert await adapter._ensure_inbound_handoff_binding()
+    assert (adapter._inbound_handoff_owner_id, adapter._inbound_handoff_epoch, adapter._inbound_handoff_generation) == (
+        "verified-owner", 9, 3,
+    )
+    assert not await adapter._ensure_inbound_handoff_binding()
+    assert adapter._inbound_handoff_owner_id == "verified-owner"
 
 
 @pytest.mark.asyncio
@@ -257,6 +542,8 @@ async def test_leased_media_is_owned_and_handoff_is_durable_before_bridge_ack(tm
     assert session.posts[0][1] == {
         "consumerId": "test-consumer", "deliveryId": "c" * 64,
         "epoch": 1, "token": "test-token",
+        "handoffEpoch": 1, "ownerId": "candidate", "ownerGeneration": 1,
+        "consumerRole": "candidate", "commitId": "",
     }
     [recovery] = archive.pending_bridge_recoveries()
     assert recovery.acknowledged and recovery.recovery_pending
@@ -450,6 +737,465 @@ async def test_adapter_observe_operate_failure_collision_and_retry(monkeypatch, 
     pairing.handle_message.assert_awaited_once(); archive.record.assert_not_called()
     await __import__("asyncio").sleep(0)
     pairing._send_read_receipt.assert_awaited_once_with(raw)
+
+
+def test_pairing_archive_authorization_uses_profile_bound_gateway_verdict():
+    """Pairing intake is not retained, but a profile grant is retained.
+
+    The WhatsApp adapter intentionally keeps its local ``pairing`` policy
+    strict.  The runner callback is the only component which can distinguish
+    a profile's approved pairing/allowlist grant from an unknown intake, so it
+    must decide archive eligibility before the old local fallback.
+    """
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._is_broadcast_chat = Mock(return_value=False)
+    adapter._is_group_allowed = Mock(return_value=False)
+    adapter._is_dm_allowed = Mock(return_value=False)
+    raw = _raw(chatId="209066827718687@lid", senderId="209066827718687@lid", isGroup=False)
+
+    # This is the profile-bound callback installed by GatewayRunner; ``True``
+    # represents either its approved PairingStore record or a live profile
+    # allowlist entry.  Neither needs the adapter to weaken pairing locally.
+    adapter.set_authorization_check(lambda user, kind, chat: True)
+    assert adapter._is_archive_authorized(raw)
+    adapter._is_dm_allowed.assert_not_called()
+
+    # Revocation/unknown pairing remains unarchived even though it is allowed
+    # to reach the one-time pairing handshake.
+    adapter.set_authorization_check(lambda user, kind, chat: False)
+    assert not adapter._is_archive_authorized(raw)
+    adapter._is_dm_allowed.assert_not_called()
+
+
+def test_pairing_archive_authorization_reads_real_profile_pairing_store(tmp_path, monkeypatch):
+    """A secondary WhatsApp owner retains only its own approved pairing user."""
+    from agent import secret_scope
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.pairing import PairingStore
+    from gateway.run import GatewayRunner
+
+    home = tmp_path / "hermes"; (home / "profiles" / "jackwhatsapp").mkdir(parents=True)
+    (home / ".env").write_text("")
+    (home / "profiles" / "jackwhatsapp" / ".env").write_text("")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        config = PlatformConfig(enabled=True, extra={"dm_policy": "pairing"})
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.platforms = {Platform.WHATSAPP: config}
+        runner.config.profile_routes = []
+        runner.pairing_store = PairingStore(profile="default")
+        runner.pairing_stores = {
+            "default": runner.pairing_store,
+            "jackwhatsapp": PairingStore(profile="jackwhatsapp"),
+        }
+        runner._primary_profile_name = "default"
+        adapter = object.__new__(WhatsAppAdapter)
+        adapter.platform = Platform.WHATSAPP; adapter.config = config
+        adapter._owner_profile = "jackwhatsapp"; adapter._dm_policy = "pairing"
+        adapter._allow_from = set(); adapter._dm_allowlist_source = "config"
+        runner.adapters = {}
+        runner._profile_adapters = {"jackwhatsapp": {Platform.WHATSAPP: adapter}}
+        adapter.gateway_runner = runner
+        adapter.set_authorization_check(
+            runner._make_adapter_auth_check(Platform.WHATSAPP, profile_name="jackwhatsapp")
+        )
+        raw = _raw(chatId="209066827718687@lid", senderId="209066827718687@lid", isGroup=False)
+        assert not adapter._is_archive_authorized(raw)
+        store = runner.pairing_stores["jackwhatsapp"]
+        store._save_json(store._approved_path("whatsapp"), {"209066827718687@lid": {}})
+        assert adapter._is_archive_authorized(raw)
+    finally:
+        secret_scope.set_multiplex_active(was_multiplex)
+
+
+@pytest.mark.asyncio
+async def test_leased_unpaired_pairing_dm_reaches_pairing_edge_then_acks_without_archive(tmp_path):
+    """A valid pairing intake cannot remain leased just because it is unarchived."""
+    raw = _leased_raw(
+        mid="pairing-intake", chatId="209066827718687@lid",
+        senderId="209066827718687@lid", accountId="1555000@s.whatsapp.net",
+        isGroup=False, body="ACK-DM",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"
+    adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True)
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    event = SimpleNamespace()
+    adapter._build_unarchived_pairing_event = Mock(return_value=event)
+    # This substitutes only the narrow runner pairing edge.  Calling the
+    # normal adapter ``handle_message`` would be a regression: it can queue
+    # work and create a model turn for an unknown sender.
+    adapter._pairing_intake_handler = AsyncMock(return_value="pairing_handshake")
+    adapter.handle_message = AsyncMock()
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+
+    await adapter._poll_messages()
+
+    adapter._pairing_intake_handler.assert_awaited_once_with(event)
+    adapter.handle_message.assert_not_awaited()
+    adapter._ack_inbound_receipt.assert_awaited_once()
+    request = adapter._ack_inbound_receipt.await_args.args[0].request
+    assert request == {
+        "consumerId": "test-consumer", "deliveryId": "a" * 64,
+        "epoch": 1, "token": "test-token", "handoffEpoch": 1,
+        "ownerId": "candidate", "ownerGeneration": 1,
+        "consumerRole": "candidate", "commitId": "",
+    }
+    with archive._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM archive_event").fetchone()[0] == 0
+        disposition = db.execute(
+            "SELECT account_id,chat_id,sender_id,message_id,disposition,ready,acknowledged "
+            "FROM archive_unarchived_disposition"
+        ).fetchone()
+    assert tuple(disposition) == (
+        "c" * 64, "209066827718687@lid", "209066827718687@lid",
+        "pairing-intake", "pairing_intake", 1, 1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_leased_unarchived_policy_drop_acks_without_gateway_or_archive(tmp_path):
+    """Revoked/unknown non-pairing traffic settles safely without content retention."""
+    raw = _leased_raw(
+        mid="policy-drop", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "allowlist"
+    adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=False)
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter.handle_message = AsyncMock()
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+
+    await adapter._poll_messages()
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._ack_inbound_receipt.assert_awaited_once()
+    with archive._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM archive_event").fetchone()[0] == 0
+        assert tuple(db.execute(
+            "SELECT disposition,ready,acknowledged FROM archive_unarchived_disposition"
+        ).fetchone()) == ("discard", 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_pairing_disposition_survives_ack_crash_and_redelivery_without_second_handshake(tmp_path):
+    """A send-before-ACK crash retries the lease but not the pairing-code egress."""
+    raw = _leased_raw(
+        mid="pairing-redelivery", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+    )
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"
+    adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True)
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._build_unarchived_pairing_event = Mock(return_value=SimpleNamespace())
+    sent_codes = []
+
+    async def pairing_store_edge(_event):
+        # Models PairingStore.generate_code: it durably rate-limits before
+        # outbound send, so a redelivery after send/before-ACK is silent.
+        if not sent_codes:
+            sent_codes.append("one-code")
+        return "pairing_handshake"
+
+    adapter._pairing_intake_handler = AsyncMock(side_effect=pairing_store_edge)
+    adapter._ack_inbound_receipt = AsyncMock(side_effect=(False, True))
+
+    await adapter._poll_messages()  # disposition staged, pairing edge ran, bridge ACK failed
+    adapter._running = True
+    adapter._http_session = _Session(adapter, [raw])
+    await adapter._poll_messages()  # same exact lease redelivers and finally ACKs
+
+    assert sent_codes == ["one-code"]
+    assert adapter._pairing_intake_handler.await_count == 1
+    with archive._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM archive_event").fetchone()[0] == 0
+        assert tuple(db.execute(
+            "SELECT disposition,ready,acknowledged FROM archive_unarchived_disposition"
+        ).fetchone()) == ("pairing_intake", 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_completed_pairing_disposition_rebinds_new_lease_and_reacks_without_resend(tmp_path):
+    """Lease expiry/new consumer preserves a completed pairing edge and only re-ACKs."""
+    raw = _leased_raw(
+        mid="pairing-rebind", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+    )
+    renewed = json.loads(json.dumps(raw))
+    renewed["_inboundLease"].update({
+        "consumerId": "fresh-consumer", "epoch": 2, "token": "fresh-token",
+        "ownerId": "fresh-candidate", "ownerGeneration": 2,
+    })
+    renewed["_inboundLease"]["eventDigest"] = bridge_event_digest(renewed)
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"; adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True)
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._build_unarchived_pairing_event = Mock(return_value=SimpleNamespace())
+    adapter._pairing_intake_handler = AsyncMock(return_value="pairing_handshake")
+    adapter._ack_inbound_receipt = AsyncMock(return_value=False)
+
+    await adapter._poll_messages()  # completed effect, lost bridge ACK
+    adapter._inbound_consumer_id = "fresh-consumer"
+    adapter._running = True; adapter._http_session = _Session(adapter, [renewed])
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+    await adapter._poll_messages()
+
+    adapter._pairing_intake_handler.assert_awaited_once()
+    adapter._ack_inbound_receipt.assert_awaited_once()
+    with archive._connect() as db:
+        assert tuple(db.execute(
+            "SELECT consumer_id,epoch,token,handoff_owner_id,handoff_owner_generation,effect_state,acknowledged "
+            "FROM archive_unarchived_disposition"
+        ).fetchone()) == ("fresh-consumer", 2, "fresh-token", "fresh-candidate", 2, "completed", 1)
+
+
+@pytest.mark.asyncio
+async def test_uncertain_pairing_disposition_holds_redelivery_without_repeat_handshake(tmp_path):
+    """An unknown post-attempt outcome is held for reconciliation, never blind resent."""
+    raw = _leased_raw(
+        mid="pairing-uncertain", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+    )
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"
+    adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"; adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True)
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._build_unarchived_pairing_event = Mock(return_value=SimpleNamespace())
+    adapter._pairing_intake_handler = AsyncMock(side_effect=RuntimeError("send outcome unknown"))
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+
+    await adapter._poll_messages()
+    # The bridge only redelivers this still-pending receipt under a new lease
+    # generation after expiry/reclaim; that generation must be able to
+    # re-evaluate authorisation rather than inheriting the old attempted state.
+    renewed = _leased_raw(
+        mid="pairing-grant-race", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+        lease_kwargs={"epoch": 2, "token": "renewed-token", "consumer": "renewed-consumer"},
+    )
+    adapter._inbound_consumer_id = "renewed-consumer"
+    adapter._running = True; adapter._http_session = _Session(adapter, [renewed])
+    await adapter._poll_messages()
+
+    adapter._pairing_intake_handler.assert_awaited_once()
+    adapter._ack_inbound_receipt.assert_not_awaited()
+    with archive._connect() as db:
+        assert tuple(db.execute(
+            "SELECT effect_state,ready,acknowledged FROM archive_unarchived_disposition"
+        ).fetchone()) == ("uncertain", 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_pairing_grant_race_resets_attempt_and_keeps_lease_for_reauthorization(tmp_path):
+    """An approval racing the intake never ACKs or wedges the next auth evaluation."""
+    raw = _leased_raw(
+        mid="pairing-grant-race", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+    )
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._inbound_consumer_id = "test-consumer"; adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"; adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True)
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._build_unarchived_pairing_event = Mock(return_value=SimpleNamespace())
+    adapter._pairing_intake_handler = AsyncMock(return_value="retry")
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+
+    await adapter._poll_messages()
+    # A still-pending bridge item is reclaimed under a newer lease generation.
+    # That generation must re-evaluate auth rather than retaining an attempted
+    # state from the lease that observed the concurrent grant.
+    renewed = _leased_raw(
+        mid="pairing-grant-race", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False,
+        lease_kwargs={"epoch": 2, "token": "renewed-token", "consumer": "renewed-consumer"},
+    )
+    adapter._inbound_consumer_id = "renewed-consumer"
+    adapter._running = True; adapter._http_session = _Session(adapter, [renewed])
+    await adapter._poll_messages()
+
+    assert adapter._is_archive_authorized.call_count == 2
+    assert adapter._pairing_intake_handler.await_count == 2
+    adapter._ack_inbound_receipt.assert_not_awaited()
+    with archive._connect() as db:
+        assert tuple(db.execute(
+            "SELECT effect_state,ready,acknowledged FROM archive_unarchived_disposition"
+        ).fetchone()) == ("pending", 0, 0)
+
+
+def test_archive_auth_unresolved_callback_is_per_event_and_never_uses_local_fallback():
+    """One resolver failure cannot leak a concurrent/adjacent event into fallback auth."""
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = SimpleNamespace(value="whatsapp")
+    adapter._is_broadcast_chat = Mock(return_value=False)
+    adapter._is_group_allowed = Mock(return_value=False)
+    adapter._is_dm_allowed = Mock(return_value=True)
+    raw = _raw(chatId="209066827718687@lid", senderId="209066827718687@lid", isGroup=False)
+    adapter.set_authorization_check(Mock(side_effect=(RuntimeError("resolver down"), True)))
+
+    assert adapter._is_archive_authorized(raw) is None
+    assert adapter._is_archive_authorized({**raw, "messageId": "next"}) is True
+    adapter._is_dm_allowed.assert_not_called()
+
+
+def test_unarchived_disposition_rejects_cross_account_or_handoff_collision(tmp_path):
+    """A delivery id cannot cross account/chat scope or an exact handoff fence."""
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    raw = _leased_raw(
+        mid="scope", chatId="chat-one@lid", senderId="sender-one@lid", accountId="account-one@s.whatsapp.net",
+    )
+    receipt = archive.stage_unarchived_disposition(
+        raw["_inboundLease"], raw, "discard", account_id=raw["accountId"],
+    )
+    assert receipt.disposition == "discard"
+    with pytest.raises(ArchiveRejected, match="collision"):
+        archive.stage_unarchived_disposition(
+            raw["_inboundLease"], {**raw, "accountId": "account-two@s.whatsapp.net"},
+            "discard", account_id="account-two@s.whatsapp.net",
+        )
+    with pytest.raises(ArchiveRejected, match="incompatible"):
+        archive.stage_unarchived_disposition(
+            {**raw["_inboundLease"], "token": "rotated"}, raw,
+            "discard", account_id=raw["accountId"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_pairing_edge_never_enters_general_message_or_agent_path():
+    """The dedicated pairing handler offers a code without sessions/tools/model work."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized_for_source = Mock(return_value=False)
+    runner._get_unauthorized_dm_behavior = Mock(return_value="pair")
+    runner._hm_offer_pairing_code = AsyncMock(return_value="confirmed")
+    # Deliberately provide a tripwire: the new edge must not delegate to this
+    # general message pipeline, which starts sessions and can queue work.
+    runner._handle_message = AsyncMock(side_effect=AssertionError("must not run"))
+    source = SimpleNamespace(
+        platform=Platform.WHATSAPP, chat_id="209066827718687@lid", chat_type="dm",
+        user_id="209066827718687@lid", user_name="unknown", profile="jackwhatsapp", is_bot=False,
+    )
+    event = MessageEvent(text="ACK-DM", message_type=MessageType.TEXT, source=source, message_id="pairing-edge")
+
+    assert await runner._handle_pairing_intake(event) == "pairing_handshake"
+    runner._hm_offer_pairing_code.assert_awaited_once_with(source)
+    runner._handle_message.assert_not_awaited()
+
+    runner._is_user_authorized_for_source.return_value = True
+    assert await runner._handle_pairing_intake(event) == "retry"
+    assert runner._hm_offer_pairing_code.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pairing_offer_outcomes_only_ack_confirmed_or_deliberately_rate_limited():
+    """Missing transport and failed sends cannot masquerade as a pairing handshake."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(
+        platform=Platform.WHATSAPP, chat_id="209066827718687@lid", chat_type="dm",
+        user_id="209066827718687@lid", user_name="unknown", profile="jackwhatsapp", is_bot=False,
+    )
+    runner._pairing_store_for = Mock(return_value=None)
+    runner._adapter_for_source = Mock()
+    assert await runner._hm_offer_pairing_code(source) == "unavailable"
+    runner._adapter_for_source.assert_not_called()
+
+    store = SimpleNamespace(
+        profile="jackwhatsapp", _is_rate_limited=Mock(return_value=False),
+        generate_code=Mock(return_value="ABCD2345"), _record_rate_limit=Mock(),
+    )
+    runner._pairing_store_for = Mock(return_value=store)
+    runner._adapter_for_source = Mock(return_value=None)
+    assert await runner._hm_offer_pairing_code(source) == "unavailable"
+    store.generate_code.assert_not_called()
+
+    failed_adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=False, error="offline")))
+    runner._adapter_for_source = Mock(return_value=failed_adapter)
+    assert await runner._hm_offer_pairing_code(source) == "uncertain"
+    failed_adapter.send.assert_awaited_once()
+
+    store._is_rate_limited.return_value = True
+    failed_adapter.send.reset_mock()
+    assert await runner._hm_offer_pairing_code(source) == "rate_limited"
+    failed_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pairing_edge_maps_typed_offer_outcomes_without_general_message_path():
+    """Only confirmed code delivery produces a terminal pairing handshake."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized_for_source = Mock(return_value=False)
+    runner._get_unauthorized_dm_behavior = Mock(return_value="pair")
+    runner._handle_message = AsyncMock(side_effect=AssertionError("must not run"))
+    source = SimpleNamespace(
+        platform=Platform.WHATSAPP, chat_id="209066827718687@lid", chat_type="dm",
+        user_id="209066827718687@lid", user_name="unknown", profile="jackwhatsapp", is_bot=False,
+    )
+    event = MessageEvent(text="ACK-DM", message_type=MessageType.TEXT, source=source, message_id="pairing-outcome")
+    for outcome, expected in (
+        ("confirmed", "pairing_handshake"),
+        ("rate_limited", "pairing_rate_limited"),
+        ("unavailable", "pending"),
+        ("uncertain", None),
+    ):
+        runner._hm_offer_pairing_code = AsyncMock(return_value=outcome)
+        assert await runner._handle_pairing_intake(event) == expected
+    runner._handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

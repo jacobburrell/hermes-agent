@@ -379,19 +379,24 @@ class WhatsAppInboundArchive:
             return ""
         return value
 
-    @staticmethod
-    def _opaque_metadata_reference(value: Any, *, maximum: int = 512) -> str:
-        """Return a stable non-content reference for an unsafe persisted ID."""
+    def _opaque_context_reference(self, kind: str, value: Any) -> str:
+        """Return a profile-private stable reference without exposing an ID.
+
+        ``recent_context_metadata`` is a local coverage/provenance projection,
+        not an identity-export API.  Even otherwise harmless WhatsApp IDs can
+        disclose a participant or chat when copied outside the profile, so all
+        identities are opaque and salted by the archive's profile scope.
+        """
         if not isinstance(value, str):
             return ""
         value = value.strip()
-        if not value or len(value) > maximum:
+        if not value or len(value) > 512 or not re.fullmatch(r"[a-z_]{1,32}", kind):
             return ""
-        return "opaque:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{self.scope}\0{kind}\0{value}".encode("utf-8")).hexdigest()
+        return f"{kind}:{digest}"
 
-    @classmethod
-    def _safe_event_identity(cls, value: Any) -> str:
-        return cls._safe_metadata_identifier(value) or cls._opaque_metadata_reference(value)
+    def _opaque_archive_reference(self, event_id: int) -> str:
+        return self._opaque_context_reference("event", str(event_id))
 
     @staticmethod
     def _safe_archived_at_ms(value: Any) -> int | None:
@@ -425,9 +430,6 @@ class WhatsAppInboundArchive:
             r"[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}", mime.lower()
         ):
             result["mime"] = mime.lower()
-        file_name = value.get("file_name")
-        if isinstance(file_name, str) and file_name and len(file_name) <= 512:
-            result["file_name_sha256"] = hashlib.sha256(file_name.encode("utf-8")).hexdigest()
         return result
 
     @staticmethod
@@ -437,7 +439,10 @@ class WhatsAppInboundArchive:
         result: dict[str, Any] = {}
         group_id = value.get("groupId")
         if isinstance(group_id, str) and group_id and len(group_id) <= 512:
-            result["group_ref"] = hashlib.sha256(group_id.encode("utf-8")).hexdigest()
+            # This remains private until _metadata_album makes it profile
+            # scoped.  Do not hash globally: that would still correlate an
+            # album between profile projections.
+            result["group_id"] = group_id
         role = value.get("role")
         if isinstance(role, str) and role in {"parent", "child"}:
             result["role"] = role
@@ -449,7 +454,7 @@ class WhatsAppInboundArchive:
     @staticmethod
     def _metadata_payload(payload_json: str) -> dict[str, Any]:
         """Project only local provenance metadata, never message or quote text."""
-        empty = {"quote": None, "album": None, "has_media": False, "media_type": ""}
+        empty = {"quote": None, "album": None, "has_media": None, "media_type": ""}
         try:
             payload = json.loads(payload_json)
         except (TypeError, ValueError):
@@ -465,9 +470,56 @@ class WhatsAppInboundArchive:
         return {
             "quote": quote if any(quote.values()) else None,
             "album": WhatsAppInboundArchive._safe_album_metadata(payload.get("album")),
-            "has_media": bool(payload.get("hasMedia")),
+            # ``None`` has an important distinct meaning: old/corrupt records
+            # do not establish whether attachment coverage was ever complete.
+            "has_media": payload.get("hasMedia") if isinstance(payload.get("hasMedia"), bool) else None,
             "media_type": WhatsAppInboundArchive._safe_media_type(payload.get("mediaType")),
         }
+
+    @staticmethod
+    def _metadata_media_coverage(has_media: bool | None, attachments: list[dict[str, Any]]) -> str:
+        """Describe archive evidence without treating missing history as absent media."""
+        if has_media is None:
+            return "unknown_historical"
+        if not has_media:
+            # Attachment rows alongside a declared no-media event are corrupt
+            # historical evidence, not a confirmation that no attachment was
+            # present.
+            return "confirmed" if not attachments else "unknown_historical"
+        statuses = {attachment.get("status") for attachment in attachments}
+        if not statuses or "unknown" in statuses:
+            return "unknown_historical"
+        if statuses <= {"owned"}:
+            return "confirmed"
+        if statuses <= {"owned", "missing_or_rejected", "deleted_or_replaced"}:
+            return "missing"
+        return "unknown_historical"
+
+    def _metadata_quote(self, quote: Any) -> dict[str, Any] | None:
+        if not isinstance(quote, dict):
+            return None
+        projected = {
+            "message_id": self._opaque_context_reference("message", quote.get("message_id")),
+            "participant_id": self._opaque_context_reference("participant", quote.get("participant_id")),
+            "remote_chat_id": self._opaque_context_reference("chat", quote.get("remote_chat_id")),
+            "outbound_by_jack": bool(quote.get("outbound_by_jack")),
+        }
+        return projected if any(projected.values()) else None
+
+    def _metadata_album(self, album: Any) -> dict[str, Any] | None:
+        if not isinstance(album, dict):
+            return None
+        projected: dict[str, Any] = {}
+        group_ref = self._opaque_context_reference("album", album.get("group_id"))
+        if group_ref:
+            projected["group_ref"] = group_ref
+        role = album.get("role")
+        if isinstance(role, str) and role in {"parent", "child"}:
+            projected["role"] = role
+        index = self._bounded_int(album.get("message_index"), maximum=1_000_000)
+        if index is not None:
+            projected["message_index"] = index
+        return projected or None
 
     def record(
         self, raw: Mapping[str, Any], admission: str, *,
@@ -583,10 +635,8 @@ class WhatsAppInboundArchive:
         with self._connect() as db:
             rows = db.execute(
                 f"""SELECT event.id, event.chat_id, event.sender_id, event.message_id,
-                           event.admission, event.payload_json, event.source_timestamp_ms,
-                           event.created_at,
-                           (SELECT COUNT(*) FROM archive_collision collision
-                              WHERE collision.event_id = event.id) AS collision_count
+                           event.admission, event.payload_json,
+                           event.source_timestamp_ms, event.created_at
                       FROM archive_event event WHERE {where}
                   ORDER BY event.id DESC LIMIT ?""", params,
             ).fetchall()
@@ -607,37 +657,56 @@ class WhatsAppInboundArchive:
                 attachments[int(attachment["event_id"])].append({
                     "ordinal": int(attachment["ordinal"]),
                     "descriptor": self._safe_attachment_descriptor(descriptor),
-                    "content_sha256": (
-                        str(attachment["sha256"])
-                        if isinstance(attachment["sha256"], str)
-                        and re.fullmatch(r"[a-f0-9]{64}", attachment["sha256"])
-                        else ""
-                    ),
+                    # Do not surface a content-addressed digest either: an
+                    # unsalted hash can correlate private files across
+                    # projections.  The ordinal is made opaque below.
                     "size": self._bounded_int(attachment["size"]),
                     "status": str(attachment["download_status"])
                     if attachment["download_status"] in {"owned", "missing_or_rejected", "deleted_or_replaced"}
                     else "unknown",
                     "album_ordinal": self._bounded_int(attachment["album_ordinal"], maximum=1_000_000),
                 })
+            collisions: dict[int, int] = {event_id: 0 for event_id in event_ids}
+            for collision in db.execute(
+                f"""SELECT collision.event_id, collision.candidate_digest, event.event_digest
+                       FROM archive_collision AS collision
+                       JOIN archive_event AS event ON event.id = collision.event_id
+                      WHERE collision.event_id IN ({placeholders})""", event_ids,
+            ):
+                candidate = collision["candidate_digest"]
+                stored = collision["event_digest"]
+                if (isinstance(candidate, str) and isinstance(stored, str)
+                        and re.fullmatch(r"[a-f0-9]{64}", candidate)
+                        and re.fullmatch(r"[a-f0-9]{64}", stored)
+                        and candidate != stored):
+                    collisions[int(collision["event_id"])] += 1
         result = []
         for row in reversed(rows):
             metadata = self._metadata_payload(row["payload_json"])
+            event_id = int(row["id"])
+            event_attachments = attachments[event_id]
+            for attachment in event_attachments:
+                attachment["attachment_ref"] = self._opaque_context_reference(
+                    "attachment", f"{event_id}:{attachment['ordinal']}"
+                )
             result.append({
-                "archive_ref": f"archive_event:{int(row['id'])}",
-                "sequence": int(row["id"]),
-                "chat_id": self._safe_event_identity(row["chat_id"]),
-                "sender_id": self._safe_event_identity(row["sender_id"]),
-                "message_id": self._safe_event_identity(row["message_id"]),
+                "archive_ref": self._opaque_archive_reference(event_id),
+                "sequence": event_id,
+                "chat_id": self._opaque_context_reference("chat", row["chat_id"]),
+                "sender_id": self._opaque_context_reference("sender", row["sender_id"]),
+                "message_id": self._opaque_context_reference("message", row["message_id"]),
                 "admission": str(row["admission"])
                 if row["admission"] in {"drop", "observe", "operate"} else "unknown",
                 "source_timestamp_ms": self._bounded_int(row["source_timestamp_ms"]),
                 "archived_at_ms": self._safe_archived_at_ms(row["created_at"]),
-                "collision_count": int(row["collision_count"]),
-                "quote": metadata["quote"],
-                "album": metadata["album"],
-                "has_media": metadata["has_media"],
+                "collision_count": collisions[event_id],
+                "identity_conflict": bool(collisions[event_id]),
+                "quote": self._metadata_quote(metadata["quote"]),
+                "album": self._metadata_album(metadata["album"]),
+                "has_media": bool(metadata["has_media"]),
+                "media_coverage": self._metadata_media_coverage(metadata["has_media"], event_attachments),
                 "media_type": metadata["media_type"],
-                "attachments": tuple(attachments[int(row["id"])]),
+                "attachments": tuple(event_attachments),
             })
         return tuple(result)
 
