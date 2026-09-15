@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ from plugins.platforms.whatsapp.inbound_archive import WhatsAppInboundArchive
 _ITEM_KINDS = frozenset({"fact", "commitment", "open_task"})
 _DELETIONS = frozenset({"tombstone", "delete"})
 _PROCESSOR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wa-context-projection")
+# A processor may be an injected edge dependency with arbitrary runtime.  Do
+# not let inputs pile up in ThreadPoolExecutor's unbounded internal queue.
+# The slot is released by the future completion callback, not a caller timeout.
+_PROCESSOR_SLOT = threading.BoundedSemaphore(1)
 _MAX_RENDERED_PROVENANCE = 128
 
 
@@ -165,7 +170,7 @@ def _safe_render_item(kind: Any, text: Any) -> ProjectionItem | None:
 
 
 def _bounded_processor_items(
-    processor: SemanticProcessor, request: ProjectionInput, examined_limit: int,
+    processor: SemanticProcessor, request: ProjectionInput, examined_limit: int, deadline: float,
 ) -> tuple[ProjectionItem, ...]:
     """Run the processor and consume at most ``examined_limit`` values.
 
@@ -173,9 +178,13 @@ def _bounded_processor_items(
     infinite iterator of invalid items cannot keep the inbound worker alive
     after its deadline.
     """
+    if time.monotonic() >= deadline:
+        return ()
     accepted: list[ProjectionItem] = []
     iterator = iter(processor(request))
     for _ in range(examined_limit):
+        if time.monotonic() >= deadline:
+            break
         try:
             candidate = next(iterator)
         except StopIteration:
@@ -297,11 +306,21 @@ class WhatsAppContextProjection:
             sender_ref=str(metadata["sender_id"]), text=body,
             attachments=tuple(metadata["attachments"]),
         )
+        if not _PROCESSOR_SLOT.acquire(blocking=False):
+            # Projection is opt-in enrichment, never an inbound backpressure
+            # queue.  A saturated worker leaves this event durably uncertain.
+            self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=now)
+            return None
         future = None
         try:
+            deadline = time.monotonic() + self.settings.processor_timeout_seconds
             future = _PROCESSOR_EXECUTOR.submit(
-                _bounded_processor_items, processor, request, self.settings.processor_item_limit,
+                _bounded_processor_items, processor, request, self.settings.processor_item_limit, deadline,
             )
+            # Keep the admission slot through a timeout while a running
+            # Python thread unwinds.  ``Future.cancel`` only affects work that
+            # has not started; running injected code cannot be killed safely.
+            future.add_done_callback(lambda _done: _PROCESSOR_SLOT.release())
             items = future.result(timeout=self.settings.processor_timeout_seconds)
         except (Exception, TimeoutError):
             # ``cancel`` stops only work that has not started.  Python cannot
@@ -309,6 +328,8 @@ class WhatsAppContextProjection:
             # attempt fence below is the sole DB commit path.
             if future is not None:
                 future.cancel()
+            else:
+                _PROCESSOR_SLOT.release()
             self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=now)
             return None
         timestamp = float(time.time() if now is None else now)
@@ -425,7 +446,7 @@ class WhatsAppContextProjection:
                     kind = item.get("kind")
                     kind = kind if isinstance(kind, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", kind) else "media"
                     status = item.get("status")
-                    status = status if status in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown", "unknown_historical"} else "unknown_historical"
+                    status = status if isinstance(status, str) and status in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown", "unknown_historical"} else "unknown_historical"
                     attachment_ref = self._safe_opaque_ref(item.get("attachment_ref"), "attachment")
                     suffix = f" [untrusted; {attachment_ref}]" if attachment_ref else ""
                     attachment_lines.append(f"- {kind}: {status}{suffix}")
@@ -557,7 +578,8 @@ class WhatsAppContextProjection:
                 descriptor = item.get("descriptor") if isinstance(item.get("descriptor"), Mapping) else {}
                 kind = descriptor.get("kind")
                 kind = kind if isinstance(kind, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", kind) else "media"
-                status = item.get("status") if item.get("status") in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown"} else "unknown_historical"
+                status = item.get("status")
+                status = status if isinstance(status, str) and status in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown"} else "unknown_historical"
                 attachment_ref = self._safe_opaque_ref(item.get("attachment_ref"), "attachment")
                 attachments.append({
                     "kind": kind, "status": status,

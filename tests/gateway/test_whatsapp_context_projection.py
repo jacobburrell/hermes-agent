@@ -6,6 +6,7 @@ import json
 import asyncio
 import re
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -275,7 +276,10 @@ def test_processor_failure_is_durably_uncertain_and_not_retried(tmp_path):
         ).fetchone()["state"] == "uncertain"
 
 
-def test_processor_deadline_marks_uncertain_without_a_projection_row(tmp_path):
+def test_processor_deadline_marks_uncertain_without_a_projection_row(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import plugins.platforms.whatsapp.context_projection as projection_module
+
     archive, _cache = _archive(tmp_path)
     settings = ProjectionSettings.from_extra(_extra(processor_timeout_seconds=1))
     projection = WhatsAppContextProjection(archive, settings)
@@ -283,10 +287,17 @@ def test_processor_deadline_marks_uncertain_without_a_projection_row(tmp_path):
     event_id, accepted = archive.record(_raw("m"), "operate")
     assert accepted
     def slow(_request):
-        import time
         time.sleep(1.05)
         return [ProjectionItem("fact", "too late")]
-    assert projection.capture_and_render(event_id=event_id, raw=_raw("m"), processor=slow) is None
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_SLOT", threading.BoundedSemaphore(1))
+    try:
+        assert projection.capture_and_render(event_id=event_id, raw=_raw("m"), processor=slow) is None
+    finally:
+        # A running thread cannot be killed; waiting here prevents it from
+        # occupying a later test's bounded admission slot.
+        executor.shutdown(wait=True)
     with archive._connect() as db:
         claim = db.execute(
             "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
@@ -324,8 +335,8 @@ def test_processor_consumes_only_bounded_items_inside_worker(tmp_path):
         ).fetchone()["state"] == "completed"
 
 
-def test_timeout_cancels_queued_processor_before_late_dispatch(tmp_path, monkeypatch):
-    """A timed-out queued callback is cancelled and never processes archived text later."""
+def test_saturated_processor_admission_never_queues_and_releases_after_worker_exit(tmp_path, monkeypatch):
+    """A timed-out running worker holds the only slot until it has actually exited."""
     from concurrent.futures import ThreadPoolExecutor
     import plugins.platforms.whatsapp.context_projection as projection_module
 
@@ -336,10 +347,12 @@ def test_timeout_cancels_queued_processor_before_late_dispatch(tmp_path, monkeyp
     projection.activate(now=1000)
     slow_id, accepted = archive.record(_raw("slow"), "operate"); assert accepted
     queued_id, accepted = archive.record(_raw("queued"), "operate"); assert accepted
+    recovered_id, accepted = archive.record(_raw("recovered"), "operate"); assert accepted
     started, release = threading.Event(), threading.Event()
     queued_calls = []
     executor = ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_SLOT", threading.BoundedSemaphore(1))
 
     def slow(_request):
         started.set()
@@ -353,7 +366,18 @@ def test_timeout_cancels_queued_processor_before_late_dispatch(tmp_path, monkeyp
     try:
         assert projection.capture_and_render(event_id=slow_id, raw=_raw("slow"), processor=slow) is None
         assert started.is_set()
+        began = time.monotonic()
         assert projection.capture_and_render(event_id=queued_id, raw=_raw("queued"), processor=queued) is None
+        assert time.monotonic() - began < 0.25  # no internal executor queue wait
+        assert queued_calls == []
+        release.set()
+        # A barrier proves the timed-out worker has returned and its future
+        # completion callback released the slot before another admission.
+        executor.submit(lambda: None).result(timeout=2)
+        assert projection.capture_and_render(
+            event_id=recovered_id, raw=_raw("recovered"),
+            processor=lambda _request: (ProjectionItem("fact", "after exit"),),
+        )
     finally:
         release.set()
         executor.shutdown(wait=True)
@@ -362,7 +386,56 @@ def test_timeout_cancels_queued_processor_before_late_dispatch(tmp_path, monkeyp
         states = [row["state"] for row in db.execute(
             "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? ORDER BY event_id", (archive.scope,),
         )]
-    assert states == ["uncertain", "uncertain"]
+    assert states == ["uncertain", "uncertain", "completed"]
+
+
+def test_timeout_before_worker_start_cancels_without_invocation(tmp_path, monkeypatch):
+    """An executor-start race receives an absolute deadline and no late callback runs."""
+    from concurrent.futures import ThreadPoolExecutor
+    import plugins.platforms.whatsapp.context_projection as projection_module
+
+    archive, _cache = _archive(tmp_path)
+    projection = WhatsAppContextProjection(
+        archive, ProjectionSettings.from_extra(_extra(processor_timeout_seconds=1)),
+    )
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("start-race"), "operate"); assert accepted
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_SLOT", threading.BoundedSemaphore(1))
+
+    def occupy():
+        started.set()
+        assert release.wait(timeout=5)
+    blocker = executor.submit(occupy)
+    assert started.wait(timeout=2)
+    try:
+        assert projection.capture_and_render(
+            event_id=event_id, raw=_raw("start-race"),
+            processor=lambda _request: calls.append(True) or (),
+        ) is None
+    finally:
+        release.set()
+        blocker.result(timeout=2)
+        executor.shutdown(wait=True)
+    assert calls == []
+
+
+def test_worker_refuses_invocation_when_started_after_absolute_deadline():
+    """The worker itself checks the deadline, closing submit/start races."""
+    from plugins.platforms.whatsapp.context_projection import (
+        ProjectionInput, _bounded_processor_items,
+    )
+
+    calls = []
+    request = ProjectionInput("scope", "event:0", "chat:0", "sender:0", "body", ())
+    assert _bounded_processor_items(
+        lambda _request: calls.append(True) or (ProjectionItem("fact", "late"),),
+        request, 1, time.monotonic() - 0.001,
+    ) == ()
+    assert calls == []
 
 
 def test_late_attempt_cannot_publish_after_concurrent_uncertain_claim(tmp_path, monkeypatch):
@@ -378,6 +451,7 @@ def test_late_attempt_cannot_publish_after_concurrent_uncertain_claim(tmp_path, 
     started, release = threading.Event(), threading.Event()
     executor = ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_SLOT", threading.BoundedSemaphore(1))
 
     def blocked(_request):
         started.set()
@@ -426,7 +500,10 @@ def test_render_resanitizes_hostile_persisted_projection_rows(tmp_path):
         )
         db.execute(
             "UPDATE archive_context_projection_event SET metadata_json=? WHERE profile_scope=? AND event_id=?",
-            (json.dumps({"attachments": [{"kind": "../../file", "status": "leak", "attachment_ref": "file:/tmp/private"}]}), archive.scope, event_id),
+            (json.dumps({"attachments": [
+                {"kind": "../../file", "status": {"leak": True}, "attachment_ref": "file:/tmp/private"},
+                {"kind": ["image"], "status": ["owned"], "attachment_ref": ["attachment:bad"]},
+            ]}), archive.scope, event_id),
         )
     note = projection.render(event_id=event_id, chat_id="chat-a@g.us")
     assert note and "The approved local fact." in note and "media: unknown_historical" in note
