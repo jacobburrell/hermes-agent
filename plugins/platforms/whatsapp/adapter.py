@@ -428,7 +428,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
         return self._inbound_archive
 
-    def _capture_context_projection_note(self, archive_id: int, data: Dict[str, Any]) -> str | None:
+    def _context_projection_for_activation(self):
+        """Return an opted-in projection after durably writing its watermark."""
+        processor = getattr(self, "_context_projection_processor", None)
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        from plugins.platforms.whatsapp.context_projection import ProjectionSettings, WhatsAppContextProjection
+        settings = ProjectionSettings.from_extra(extra)
+        if settings is None or processor is None:
+            return None
+        projection = WhatsAppContextProjection(self._inbound_archive_instance(), settings)
+        projection.activate()
+        return projection
+
+    def _capture_context_projection_note(self, archive_id: int, data: Dict[str, Any], projection=None) -> str | None:
         """Capture an opt-in local projection for this newly archived event.
 
         The callback is deliberately an injected edge dependency.  The
@@ -437,19 +449,33 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         settings parser.
         """
         processor = getattr(self, "_context_projection_processor", None)
-        extra = getattr(getattr(self, "config", None), "extra", None)
         try:
-            from plugins.platforms.whatsapp.context_projection import (
-                ProjectionSettings, WhatsAppContextProjection,
-            )
-            settings = ProjectionSettings.from_extra(extra)
-            if settings is None or processor is None:
+            if projection is None:
+                projection = self._context_projection_for_activation()
+            if projection is None or processor is None:
                 return None
-            return WhatsAppContextProjection(
-                self._inbound_archive_instance(), settings,
-            ).capture_and_render(event_id=archive_id, raw=data, processor=processor)
+            return projection.capture_and_render(event_id=archive_id, raw=data, processor=processor)
         except Exception:
             logger.warning("[%s] WhatsApp context projection capture failed", self.name)
+            return None
+
+    def _render_context_projection_notes(self, event: MessageEvent) -> str | None:
+        """Revalidate live YAML destination scope at the actual turn boundary."""
+        event_ids = getattr(event, "_whatsapp_context_projection_event_ids", ())
+        if not isinstance(event_ids, tuple) or not event_ids:
+            return None
+        try:
+            from plugins.platforms.whatsapp.context_projection import ProjectionSettings, WhatsAppContextProjection
+            settings = ProjectionSettings.from_extra(getattr(getattr(self, "config", None), "extra", None))
+            if settings is None:
+                return None
+            chat = getattr(getattr(event, "source", None), "chat_id", None)
+            projection = WhatsAppContextProjection(self._inbound_archive_instance(), settings)
+            notes = [projection.render(event_id=value, chat_id=chat) for value in event_ids]
+            notes = [note for note in notes if isinstance(note, str) and note]
+            return "\n\n".join(dict.fromkeys(notes)) or None
+        except Exception:
+            logger.warning("[%s] WhatsApp context projection render failed", self.name)
             return None
 
     def set_context_projection_processor(self, processor) -> None:
@@ -466,14 +492,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Keep distinct opt-in sidecars when normal WhatsApp text batching merges chunks."""
         existing = self._pending_text_batches.get(self._text_batch_key(event))
-        note = getattr(event, "_whatsapp_context_projection_note", None)
+        event_ids = getattr(event, "_whatsapp_context_projection_event_ids", ())
         super()._enqueue_text_event(event)
-        if existing is not None and isinstance(note, str) and note:
-            prior = getattr(existing, "_whatsapp_context_projection_note", "")
-            if not isinstance(prior, str) or not prior:
-                existing._whatsapp_context_projection_note = note
-            elif note not in prior:
-                existing._whatsapp_context_projection_note = f"{prior}\n\n{note}"
+        if existing is not None and isinstance(event_ids, tuple):
+            prior = getattr(existing, "_whatsapp_context_projection_event_ids", ())
+            if isinstance(prior, tuple):
+                existing._whatsapp_context_projection_event_ids = tuple(dict.fromkeys((*prior, *event_ids)))
 
     def _trusted_archive_manifest(self, materialized) -> _ArchiveOwnedManifest:
         if not hasattr(self, "_archive_manifest_capability"):
@@ -1513,7 +1537,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 and not followup_anchor
                                 and isinstance(followup_context, dict)
                             )
-                            if self._is_archive_authorized(msg_data):
+                            archive_authorized = self._is_archive_authorized(msg_data)
+                            if archive_authorized is None:
+                                # A wired profile resolver failed or returned an
+                                # invalid result.  Local fallback would broaden
+                                # access; keep this exact bridge lease pending.
+                                continue
+                            context_projection = None
+                            if archive_authorized:
+                                try:
+                                    # This happens before ``record`` so its
+                                    # durable watermark excludes every older
+                                    # archive event from newly enabled semantic
+                                    # processing.
+                                    context_projection = self._context_projection_for_activation()
+                                except Exception:
+                                    logger.warning("[%s] WhatsApp context projection activation failed", self.name)
+                            if archive_authorized:
                                 try:
                                     archive_id, accepted = await asyncio.to_thread(
                                         self._inbound_archive_instance().record,
@@ -1685,15 +1725,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 event_data, already_admitted=True, archive_manifest=manifest,
                             )
                             if event:
-                                if admitted and archive_id is not None:
+                                if admitted and archive_id is not None and context_projection is not None:
                                     # Capture only after durable archive/media fencing and
                                     # only for the new admitted turn.  The note is an
                                     # in-process sidecar, never bridge metadata.
-                                    note = await asyncio.to_thread(
-                                        self._capture_context_projection_note, archive_id, msg_data,
+                                    await asyncio.to_thread(
+                                        self._capture_context_projection_note, archive_id, msg_data, context_projection,
                                     )
-                                    if note:
-                                        event._whatsapp_context_projection_note = note
+                                    if context_projection.is_completed(archive_id):
+                                        event._whatsapp_context_projection_event_ids = (archive_id,)
                                 if archive_recovery is not None:
                                     # These are private in-process fences, not
                                     # bridge metadata or model-visible fields.

@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from agent.turn_context import build_turn_context
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from plugins.platforms.whatsapp.context_projection import (
     ProjectionItem,
@@ -38,6 +44,7 @@ def _extra(**overrides):
         "enabled": True, "cross_chat": False, "authorized_chats": [],
         "retention_days": 30, "deletion": "tombstone", "per_chat_limit": 8,
         "profile_limit": 16, "attachment_limit": 4,
+        "processor_timeout_seconds": 5, "processor_item_limit": 8,
     }
     value.update(overrides)
     return {"context_projection": value}
@@ -74,20 +81,29 @@ def test_disabled_or_malformed_config_never_calls_processor(tmp_path):
 
 def test_projection_is_rollout_forward_profile_scoped_and_attachment_redacted(tmp_path):
     archive, cache = _archive(tmp_path)
+    settings = ProjectionSettings.from_extra(_extra())
+    projection = WhatsAppContextProjection(archive, settings)
+    assert projection.activate(now=999) == 0
     media = cache / "private.jpg"
     media.write_bytes(b"private-media")
     first, accepted = archive.record(_raw("m1", media=True), "operate")
     assert accepted and archive.materialize(first, _raw("m1", media=True), [str(media)]).complete
-    settings = ProjectionSettings.from_extra(_extra())
-    projection = WhatsAppContextProjection(archive, settings)
     calls = []
     def processor(request):
         calls.append(request)
         return _processor(request)
     note = projection.capture_and_render(event_id=first, raw=_raw("m1", media=True), processor=processor, now=1000)
     assert note and "The approved local fact." in note and "image: owned" in note
+    # Provenance is sufficient to audit the projection without disclosing raw
+    # WhatsApp identities, message IDs, file names, or archive paths.
+    assert re.search(r"event:[a-f0-9]{64}", note)
+    assert re.search(r"chat:[a-f0-9]{64}", note)
+    assert re.search(r"sender:[a-f0-9]{64}", note)
+    assert re.search(r"message:[a-f0-9]{64}", note)
+    assert re.search(r"attachment:[a-f0-9]{64}", note)
+    assert "source_ms:1000" in note
     encoded = note.lower()
-    for forbidden in ("ordinary text", "private.jpg", str(media).lower(), "private-media", hashlib.sha256(b"private-media").hexdigest()):
+    for forbidden in ("ordinary text", "private.jpg", str(media).lower(), "private-media", "chat-a@g.us", "1555000@s.whatsapp.net", hashlib.sha256(b"private-media").hexdigest()):
         assert forbidden not in encoded
 
     # Reopening keeps only rollout-forward data and profile-private scope.
@@ -107,14 +123,15 @@ def test_projection_is_rollout_forward_profile_scoped_and_attachment_redacted(tm
 
 def test_cross_chat_requires_explicit_allowlist_and_retention_preserves_tombstone(tmp_path):
     archive, _cache = _archive(tmp_path)
-    a, accepted = archive.record(_raw("a", chat="chat-a@g.us"), "operate")
-    assert accepted
-    b, accepted = archive.record(_raw("b", chat="chat-b@g.us"), "operate")
-    assert accepted
     settings = ProjectionSettings.from_extra(_extra(
         cross_chat=True, authorized_chats=["chat-a@g.us", "chat-b@g.us"], retention_days=1,
     ))
     projection = WhatsAppContextProjection(archive, settings)
+    assert projection.activate(now=999) == 0
+    a, accepted = archive.record(_raw("a", chat="chat-a@g.us"), "operate")
+    assert accepted
+    b, accepted = archive.record(_raw("b", chat="chat-b@g.us"), "operate")
+    assert accepted
     assert projection.capture_and_render(event_id=a, raw=_raw("a", chat="chat-a@g.us"), processor=_processor, now=1000)
     note = projection.capture_and_render(event_id=b, raw=_raw("b", chat="chat-b@g.us"), processor=_processor, now=1001)
     assert note and note.count("The approved local fact.") == 2
@@ -128,11 +145,13 @@ def test_cross_chat_requires_explicit_allowlist_and_retention_preserves_tombston
 
 def test_conflict_evidence_is_proven_and_sidecar_keeps_transcript_content_stable(tmp_path):
     archive, _cache = _archive(tmp_path)
+    settings = ProjectionSettings.from_extra(_extra())
+    projection = WhatsAppContextProjection(archive, settings)
+    assert projection.activate(now=999) == 0
     event_id, accepted = archive.record(_raw("same"), "operate")
     assert accepted
     assert archive.record(_raw("same", body="different body"), "operate") == (event_id, False)
-    settings = ProjectionSettings.from_extra(_extra())
-    note = WhatsAppContextProjection(archive, settings).capture_and_render(
+    note = projection.capture_and_render(
         event_id=event_id, raw=_raw("same"), processor=_processor,
     )
     assert note and "identity conflict retained" in note.lower()
@@ -175,3 +194,183 @@ def test_conflict_evidence_is_proven_and_sidecar_keeps_transcript_content_stable
     message = ctx.messages[ctx.current_turn_user_idx]
     assert message["content"] == "current message"
     assert message["api_content"] == "current message\n\n" + note
+
+
+def test_activation_watermark_excludes_preexisting_rows_and_bounds_processor_output(tmp_path):
+    archive, _cache = _archive(tmp_path)
+    old_id, accepted = archive.record(_raw("old"), "operate")
+    assert accepted
+    settings = ProjectionSettings.from_extra(_extra(processor_item_limit=2))
+    projection = WhatsAppContextProjection(archive, settings)
+    assert projection.activate(now=1000) == old_id
+    fresh_id, accepted = archive.record(_raw("fresh"), "operate")
+    assert accepted
+    calls = []
+    def processor(_request):
+        calls.append(True)
+        return [ProjectionItem("fact", f"safe fact {index}") for index in range(10)]
+    assert projection.capture_and_render(event_id=old_id, raw=_raw("old"), processor=processor) is None
+    note = projection.capture_and_render(event_id=fresh_id, raw=_raw("fresh"), processor=processor)
+    assert note and note.count("safe fact") == 2 and len(calls) == 1
+    with archive._connect() as db:
+        assert db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+            (archive.scope, fresh_id),
+        ).fetchone()["state"] == "completed"
+
+
+def test_render_revalidates_destination_scope_and_stale_provenance(tmp_path):
+    archive, _cache = _archive(tmp_path)
+    settings = ProjectionSettings.from_extra(_extra(cross_chat=True, authorized_chats=["chat-a@g.us"]))
+    projection = WhatsAppContextProjection(archive, settings)
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("m", chat="chat-a@g.us"), "operate")
+    assert accepted
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("m", chat="chat-a@g.us"), processor=_processor)
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = Platform.WHATSAPP
+    adapter._inbound_archive = archive
+    adapter.config = SimpleNamespace(extra=_extra(cross_chat=True, authorized_chats=["chat-a@g.us"]))
+    event = SimpleNamespace(
+        _whatsapp_context_projection_event_ids=(event_id,),
+        source=SimpleNamespace(chat_id="chat-a@g.us"),
+    )
+    assert "untrusted" in adapter._render_context_projection_notes(event)
+    # A live scope/config revocation is checked at render time, even for an
+    # event that was already accepted and batched.
+    adapter.config.extra = _extra(cross_chat=True, authorized_chats=["other@g.us"])
+    assert adapter._render_context_projection_notes(event) is None
+    adapter.config.extra = _extra(cross_chat=True, authorized_chats=["chat-a@g.us"])
+    with archive._connect() as db:
+        db.execute("UPDATE archive_event SET event_digest='0' WHERE id=?", (event_id,))
+    assert adapter._render_context_projection_notes(event) is None
+    with archive._connect() as db:
+        row = db.execute(
+            "SELECT text,tombstoned_at FROM archive_context_projection_item WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()
+    assert row["text"] == "" and row["tombstoned_at"] is not None
+
+
+def test_processor_failure_is_durably_uncertain_and_not_retried(tmp_path):
+    archive, _cache = _archive(tmp_path)
+    settings = ProjectionSettings.from_extra(_extra())
+    projection = WhatsAppContextProjection(archive, settings)
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("m"), "operate")
+    assert accepted
+    calls = []
+    def fail(_request):
+        calls.append(True)
+        raise RuntimeError("processor unavailable")
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("m"), processor=fail) is None
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("m"), processor=fail) is None
+    assert calls == [True]
+    with archive._connect() as db:
+        assert db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()["state"] == "uncertain"
+
+
+def test_processor_deadline_marks_uncertain_without_a_projection_row(tmp_path):
+    archive, _cache = _archive(tmp_path)
+    settings = ProjectionSettings.from_extra(_extra(processor_timeout_seconds=1))
+    projection = WhatsAppContextProjection(archive, settings)
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("m"), "operate")
+    assert accepted
+    def slow(_request):
+        import time
+        time.sleep(1.05)
+        return [ProjectionItem("fact", "too late")]
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("m"), processor=slow) is None
+    with archive._connect() as db:
+        claim = db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()
+        event = db.execute(
+            "SELECT 1 FROM archive_context_projection_event WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()
+    assert claim["state"] == "uncertain" and event is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_batch_to_runner_preserves_history_and_cached_prefix(tmp_path, monkeypatch):
+    """Real adapter batching reaches the real runner before the mocked model edge."""
+    from gateway.run import GatewayRunner
+
+    home = (tmp_path / "profile").resolve(); (home / "cache").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    extra = _extra()
+    extra.update({"dm_policy": "open", "text_batch_delay_seconds": 0.0, "text_batch_split_delay_seconds": 0.0})
+    config = PlatformConfig(enabled=True, extra=extra)
+    adapter = WhatsAppAdapter(config)
+    adapter._inbound_archive_home = home
+    adapter._inbound_archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter.set_context_projection_processor(
+        lambda _request: (ProjectionItem("fact", "The bounded test fact."),)
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="final"))
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.WHATSAPP: config}))
+    runner.adapters = {Platform.WHATSAPP: adapter}; runner._profile_adapters = {}
+    runner._authorization_home_for_source = lambda _source: None
+    runner._is_user_authorized = lambda _source, **_kwargs: True
+    runner._admit_bot_message = lambda _source: True
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(runner._handle_message)
+    calls = []
+
+    async def provider(**kwargs):
+        calls.append({
+            "message": kwargs["message"], "context_prompt": kwargs["context_prompt"],
+            "history": list(kwargs["history"]),
+            "sidecars": list(runner._peek_session_state(kwargs["session_key"]).conversation.sidecar_notes),
+        })
+        final = f"final-{len(calls)}"
+        return {"final_response": final, "messages": [
+            {"role": "user", "content": kwargs["message"]}, {"role": "assistant", "content": final},
+        ], "tools": [], "history_offset": 0, "last_prompt_tokens": 0, "api_calls": 1,
+            "agent_persisted": False, "failed": False}
+
+    runner._run_agent = provider
+    source = adapter.build_source(chat_id="1555000@s.whatsapp.net", chat_type="dm", user_id="1555000@s.whatsapp.net", message_id="prior")
+    await adapter.handle_message(MessageEvent(text="prior history", message_type=MessageType.TEXT, source=source, message_id="prior"))
+    for _ in range(100):
+        if len(calls) == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert len(calls) == 1
+    projection = adapter._context_projection_for_activation()
+    raw_one = _raw("one", chat="1555000@s.whatsapp.net", body="first merged")
+    raw_two = _raw("two", chat="1555000@s.whatsapp.net", body="second merged")
+    one_id, accepted = adapter._inbound_archive.record(raw_one, "operate"); assert accepted
+    two_id, accepted = adapter._inbound_archive.record(raw_two, "operate"); assert accepted
+    await asyncio.to_thread(adapter._capture_context_projection_note, one_id, raw_one, projection)
+    await asyncio.to_thread(adapter._capture_context_projection_note, two_id, raw_two, projection)
+    first = MessageEvent(text="first merged", message_type=MessageType.TEXT, source=source, message_id="one")
+    second = MessageEvent(text="second merged", message_type=MessageType.TEXT, source=source, message_id="two")
+    first._whatsapp_context_projection_event_ids = (one_id,)
+    second._whatsapp_context_projection_event_ids = (two_id,)
+    adapter._enqueue_text_event(first); adapter._enqueue_text_event(second)
+    await asyncio.gather(*tuple(adapter._pending_text_batch_tasks.values()))
+    for _ in range(100):
+        if len(calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    for _ in range(100):
+        if adapter.send.await_count == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(calls) == 2
+    merged = calls[1]
+    assert merged["message"] == "first merged\nsecond merged"
+    assert merged["context_prompt"] == calls[0]["context_prompt"]
+    assert any(item.get("content") == "prior history" for item in merged["history"])
+    assert "Local WhatsApp context projection" in "\n".join(merged["sidecars"])
+    assert all("Local WhatsApp context projection" not in str(item.get("content")) for item in merged["history"])
+    assert adapter.send.await_count == 2

@@ -1400,6 +1400,8 @@ platform_toolsets:
 #         per_chat_limit: 8
 #         profile_limit: 16
 #         attachment_limit: 4
+#         processor_timeout_seconds: 5
+#         processor_item_limit: 8
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under

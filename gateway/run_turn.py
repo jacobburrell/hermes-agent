@@ -2026,14 +2026,20 @@ class GatewayTurnMixin:
         if _vc_note:
             turn_sidecar_notes.append(_vc_note)
 
-        # The optional WhatsApp projection is captured by the adapter only
-        # after a durable admitted archive record.  It is deliberately staged
-        # here, at this new user-message boundary, through the existing
-        # api_content sidecar rather than changing the pinned system prompt or
-        # rewriting transcript history.
-        _wa_projection_note = getattr(event, "_whatsapp_context_projection_note", None)
-        if source.platform == Platform.WHATSAPP and isinstance(_wa_projection_note, str) and _wa_projection_note:
-            turn_sidecar_notes.append(_wa_projection_note)
+        # Re-render the optional WhatsApp projection at this new user-message
+        # boundary.  This asks the current adapter to re-read its strict YAML
+        # scope, so a revoked destination cannot receive an already queued
+        # sidecar.  It never changes the pinned system prompt or old history.
+        if source.platform == Platform.WHATSAPP:
+            _wa_adapter = self._adapter_for_source(source)
+            _render_projection = getattr(_wa_adapter, "_render_context_projection_notes", None)
+            if callable(_render_projection):
+                try:
+                    _wa_projection_note = _render_projection(event)
+                except Exception:
+                    _wa_projection_note = None
+                if isinstance(_wa_projection_note, str) and _wa_projection_note:
+                    turn_sidecar_notes.append(_wa_projection_note)
 
         # Auto-analyze user images so the model gets a description plus the local path.
         message_text = await self._prepare_profile_scoped_inbound_message_text(
