@@ -1385,6 +1385,21 @@ platform_toolsets:
 #       # Omit either key to preserve Slack's default for that preview type.
 #       unfurl_links: false
 #       unfurl_media: false
+#   whatsapp:
+#     extra:
+#       # Optional local, profile-scoped context projection. Disabled unless
+#       # enabled: true *and* a trusted embedding registers a processor; Hermes
+#       # never selects a provider from this setting. Cross-chat reads require
+#       # an explicit allowlist and never backfill older archive rows.
+#       context_projection:
+#         enabled: false
+#         cross_chat: false
+#         authorized_chats: []
+#         retention_days: 30
+#         deletion: tombstone  # tombstone | delete
+#         per_chat_limit: 8
+#         profile_limit: 16
+#         attachment_limit: 4
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under

@@ -324,6 +324,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._group_allow_from = self._coerce_allow_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         rr = extra.get("send_read_receipts", False)
         self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
+        # No semantic processor is selected here.  The optional local context
+        # projection is inert until an embedding explicitly injects one *and*
+        # the profile's strict YAML configuration opts in.
+        self._context_projection_processor = None
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
@@ -423,6 +427,53 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 home / "whatsapp" / "inbound-archive-v1", home, self._profile_cache_dirs(),
             )
         return self._inbound_archive
+
+    def _capture_context_projection_note(self, archive_id: int, data: Dict[str, Any]) -> str | None:
+        """Capture an opt-in local projection for this newly archived event.
+
+        The callback is deliberately an injected edge dependency.  The
+        WhatsApp adapter never imports, chooses, or calls a model/provider by
+        itself, and malformed/missing YAML fails closed in the projection
+        settings parser.
+        """
+        processor = getattr(self, "_context_projection_processor", None)
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        try:
+            from plugins.platforms.whatsapp.context_projection import (
+                ProjectionSettings, WhatsAppContextProjection,
+            )
+            settings = ProjectionSettings.from_extra(extra)
+            if settings is None or processor is None:
+                return None
+            return WhatsAppContextProjection(
+                self._inbound_archive_instance(), settings,
+            ).capture_and_render(event_id=archive_id, raw=data, processor=processor)
+        except Exception:
+            logger.warning("[%s] WhatsApp context projection capture failed", self.name)
+            return None
+
+    def set_context_projection_processor(self, processor) -> None:
+        """Inject the already-authorized local semantic processor, if any.
+
+        This intentionally performs no discovery or provider construction.  It
+        is an embedding seam for a future explicitly consented integration;
+        callers may also clear it with ``None``.
+        """
+        if processor is not None and not callable(processor):
+            raise TypeError("WhatsApp context projection processor must be callable or None")
+        self._context_projection_processor = processor
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        """Keep distinct opt-in sidecars when normal WhatsApp text batching merges chunks."""
+        existing = self._pending_text_batches.get(self._text_batch_key(event))
+        note = getattr(event, "_whatsapp_context_projection_note", None)
+        super()._enqueue_text_event(event)
+        if existing is not None and isinstance(note, str) and note:
+            prior = getattr(existing, "_whatsapp_context_projection_note", "")
+            if not isinstance(prior, str) or not prior:
+                existing._whatsapp_context_projection_note = note
+            elif note not in prior:
+                existing._whatsapp_context_projection_note = f"{prior}\n\n{note}"
 
     def _trusted_archive_manifest(self, materialized) -> _ArchiveOwnedManifest:
         if not hasattr(self, "_archive_manifest_capability"):
@@ -1634,6 +1685,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 event_data, already_admitted=True, archive_manifest=manifest,
                             )
                             if event:
+                                if admitted and archive_id is not None:
+                                    # Capture only after durable archive/media fencing and
+                                    # only for the new admitted turn.  The note is an
+                                    # in-process sidecar, never bridge metadata.
+                                    note = await asyncio.to_thread(
+                                        self._capture_context_projection_note, archive_id, msg_data,
+                                    )
+                                    if note:
+                                        event._whatsapp_context_projection_note = note
                                 if archive_recovery is not None:
                                     # These are private in-process fences, not
                                     # bridge metadata or model-visible fields.
