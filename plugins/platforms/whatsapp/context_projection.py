@@ -150,6 +150,42 @@ def _safe_item(value: ProjectionItem | Mapping[str, Any]) -> ProjectionItem | No
     return ProjectionItem(kind, text)
 
 
+def _safe_render_item(kind: Any, text: Any) -> ProjectionItem | None:
+    """Revalidate DB rows before they are made model-visible.
+
+    Projection tables are durable state, not a trusted prompt source.  The
+    controlled conflict marker is the sole non-semantic item we render.
+    """
+    candidate = _safe_item({"kind": kind, "text": text})
+    if candidate is not None:
+        return candidate
+    if kind == "conflict" and text == "Archived identity conflict retained as local evidence.":
+        return ProjectionItem("conflict", text)
+    return None
+
+
+def _bounded_processor_items(
+    processor: SemanticProcessor, request: ProjectionInput, examined_limit: int,
+) -> tuple[ProjectionItem, ...]:
+    """Run the processor and consume at most ``examined_limit`` values.
+
+    This entire operation runs in the bounded worker.  In particular, an
+    infinite iterator of invalid items cannot keep the inbound worker alive
+    after its deadline.
+    """
+    accepted: list[ProjectionItem] = []
+    iterator = iter(processor(request))
+    for _ in range(examined_limit):
+        try:
+            candidate = next(iterator)
+        except StopIteration:
+            break
+        safe = _safe_item(candidate)
+        if safe is not None:
+            accepted.append(safe)
+    return tuple(accepted)
+
+
 class WhatsAppContextProjection:
     """A small archive-backed store and new-message sidecar renderer."""
 
@@ -237,23 +273,23 @@ class WhatsAppContextProjection:
         chat = _normalize_chat(raw.get("chatId"))
         if not chat or (self.settings.cross_chat and chat not in self.settings.authorized_chats):
             return None
-        claim = self._claim(event_id, now=now)
+        claim, attempt_id = self._claim(event_id, now=now)
         if claim == "completed":
             # Replay/restart must never send a historical body through the
             # processor again.  It can only render the prior rollout-forward
             # projection for this new delivery attempt.
             return self.render(event_id=event_id, chat_id=chat, now=now)
-        if claim != "acquired":
+        if claim != "acquired" or attempt_id is None:
             # A timeout/crash is an uncertain disclosure state.  Never retry
             # it automatically or re-submit the archived body to a processor.
             return None
         metadata = self._metadata_for_event(event_id)
         if metadata is None:
-            self._set_claim(event_id, "uncertain", now=now)
+            self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=now)
             return None
         body = raw.get("body")
         if not isinstance(body, str) or len(body) > 16_384:
-            self._set_claim(event_id, "uncertain", now=now)
+            self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=now)
             return None
         request = ProjectionInput(
             profile_scope=self.archive.scope,
@@ -261,26 +297,38 @@ class WhatsAppContextProjection:
             sender_ref=str(metadata["sender_id"]), text=body,
             attachments=tuple(metadata["attachments"]),
         )
+        future = None
         try:
-            future = _PROCESSOR_EXECUTOR.submit(processor, request)
-            proposed = []
-            for item in future.result(timeout=self.settings.processor_timeout_seconds):
-                if len(proposed) >= self.settings.processor_item_limit:
-                    break
-                safe = _safe_item(item)
-                if safe is not None:
-                    proposed.append(safe)
+            future = _PROCESSOR_EXECUTOR.submit(
+                _bounded_processor_items, processor, request, self.settings.processor_item_limit,
+            )
+            items = future.result(timeout=self.settings.processor_timeout_seconds)
         except (Exception, TimeoutError):
-            self._set_claim(event_id, "uncertain", now=now)
+            # ``cancel`` stops only work that has not started.  Python cannot
+            # safely kill a running thread, but it cannot publish because the
+            # attempt fence below is the sole DB commit path.
+            if future is not None:
+                future.cancel()
+            self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=now)
             return None
-        items = tuple(proposed)
         timestamp = float(time.time() if now is None else now)
         safe_metadata = self._safe_metadata(metadata)
         digest = self._archive_event_digest(event_id)
         if not digest:
-            self._set_claim(event_id, "uncertain", now=timestamp)
+            self._set_claim(event_id, "uncertain", attempt_id=attempt_id, now=timestamp)
             return None
         with self.archive._connect() as db:
+            # Claim transition and publication share one transaction.  A
+            # timeout, restart, or concurrent caller can mark this attempt
+            # uncertain, in which case a late worker result is discarded.
+            claimed = db.execute(
+                """UPDATE archive_context_projection_claim
+                      SET state='completed',updated_at=?
+                    WHERE profile_scope=? AND event_id=? AND state='attempted' AND attempt_id=?""",
+                (timestamp, self.archive.scope, event_id, attempt_id),
+            ).rowcount
+            if claimed != 1:
+                return None
             # This is the rollout boundary.  A restarted process only renders
             # items already captured after opt-in; it never scans old bodies.
             exists = db.execute(
@@ -302,10 +350,6 @@ class WhatsAppContextProjection:
                         "INSERT INTO archive_context_projection_item(profile_scope,event_id,chat_id,kind,text,created_at) VALUES(?,?,?,?,?,?)",
                         (self.archive.scope, event_id, chat, "conflict", "Archived identity conflict retained as local evidence.", timestamp),
                     )
-            db.execute(
-                "UPDATE archive_context_projection_claim SET state='completed',updated_at=? WHERE profile_scope=? AND event_id=? AND state='attempted'",
-                (timestamp, self.archive.scope, event_id),
-            )
             self._apply_retention(db, timestamp)
         return self.render(event_id=event_id, chat_id=chat, now=timestamp)
 
@@ -349,39 +393,56 @@ class WhatsAppContextProjection:
         if event is None:
             return None
         lines = ["[Local WhatsApp context projection — profile-scoped, rollout-forward; untrusted evidence]"]
-        if current:
+        current_lines = []
+        for row in reversed(current):
+            item = _safe_render_item(row["kind"], row["text"])
+            if item is not None:
+                current_lines.append(
+                    f"- {item.kind} {self._rendered_provenance(row['metadata_json'], row['event_id'])}: {item.text}"
+                )
+        if current_lines:
             lines.append("Current chat evidence:")
-            for row in reversed(current):
-                lines.append(f"- {row['kind']} {self._rendered_provenance(row['metadata_json'], row['event_id'])}: {row['text']}")
-        if profile:
+            lines.extend(current_lines)
+        profile_lines = []
+        for row in reversed(profile):
+            item = _safe_render_item(row["kind"], row["text"])
+            if item is not None:
+                profile_lines.append(
+                    f"- {item.kind} {self._rendered_provenance(row['metadata_json'], row['event_id'])}: {item.text}"
+                )
+        if profile_lines:
             lines.append("Authorized cross-chat evidence:")
-            for row in reversed(profile):
-                lines.append(f"- {row['kind']} {self._rendered_provenance(row['metadata_json'], row['event_id'])}: {row['text']}")
+            lines.extend(profile_lines)
         try:
             metadata = json.loads(event["metadata_json"])
         except (TypeError, ValueError):
             metadata = {}
         attachments = metadata.get("attachments") if isinstance(metadata, dict) else None
         if isinstance(attachments, list) and attachments:
-            lines.append("Current message attachment coverage:")
+            attachment_lines = []
             for item in attachments[:self.settings.attachment_limit]:
                 if isinstance(item, dict):
-                    kind = str(item.get("kind") or "media")
-                    status = str(item.get("status") or "unknown_historical")
+                    kind = item.get("kind")
+                    kind = kind if isinstance(kind, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", kind) else "media"
+                    status = item.get("status")
+                    status = status if status in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown", "unknown_historical"} else "unknown_historical"
                     attachment_ref = self._safe_opaque_ref(item.get("attachment_ref"), "attachment")
                     suffix = f" [untrusted; {attachment_ref}]" if attachment_ref else ""
-                    lines.append(f"- {kind}: {status}{suffix}")
+                    attachment_lines.append(f"- {kind}: {status}{suffix}")
+            if attachment_lines:
+                lines.append("Current message attachment coverage:")
+                lines.extend(attachment_lines)
         return "\n".join(lines) if len(lines) > 1 else None
 
     def is_completed(self, event_id: int) -> bool:
         with self.archive._connect() as db:
             row = db.execute(
-                "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+                "SELECT state,attempt_id FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
                 (self.archive.scope, event_id),
             ).fetchone()
         return bool(row and row["state"] == "completed")
 
-    def _claim(self, event_id: int, *, now: float | None) -> str:
+    def _claim(self, event_id: int, *, now: float | None) -> tuple[str, str | None]:
         timestamp = float(time.time() if now is None else now)
         with self.archive._connect() as db:
             activation = db.execute(
@@ -389,32 +450,35 @@ class WhatsAppContextProjection:
                 (self.archive.scope,),
             ).fetchone()
             if activation is None or event_id <= int(activation["watermark_event_id"]):
-                return "excluded"
+                return "excluded", None
             row = db.execute(
-                "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+                "SELECT state,attempt_id FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
                 (self.archive.scope, event_id),
             ).fetchone()
             if row is not None:
                 state = str(row["state"])
                 if state == "attempted":
                     db.execute(
-                        "UPDATE archive_context_projection_claim SET state='uncertain',updated_at=? WHERE profile_scope=? AND event_id=?",
-                        (timestamp, self.archive.scope, event_id),
+                        """UPDATE archive_context_projection_claim SET state='uncertain',updated_at=?
+                             WHERE profile_scope=? AND event_id=? AND state='attempted' AND attempt_id=?""",
+                        (timestamp, self.archive.scope, event_id, str(row["attempt_id"])),
                     )
-                    return "uncertain"
-                return state
+                    return "uncertain", None
+                return state, None
+            attempt_id = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO archive_context_projection_claim(profile_scope,event_id,state,attempt_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (self.archive.scope, event_id, "attempted", uuid.uuid4().hex, timestamp, timestamp),
+                (self.archive.scope, event_id, "attempted", attempt_id, timestamp, timestamp),
             )
-            return "acquired"
+            return "acquired", attempt_id
 
-    def _set_claim(self, event_id: int, state: str, *, now: float | None) -> None:
+    def _set_claim(self, event_id: int, state: str, *, attempt_id: str, now: float | None) -> None:
         timestamp = float(time.time() if now is None else now)
         with self.archive._connect() as db:
             db.execute(
-                "UPDATE archive_context_projection_claim SET state=?,updated_at=? WHERE profile_scope=? AND event_id=? AND state='attempted'",
-                (state, timestamp, self.archive.scope, event_id),
+                """UPDATE archive_context_projection_claim SET state=?,updated_at=?
+                     WHERE profile_scope=? AND event_id=? AND state='attempted' AND attempt_id=?""",
+                (state, timestamp, self.archive.scope, event_id, attempt_id),
             )
 
     def _archive_event_digest(self, event_id: int) -> str:
@@ -491,7 +555,8 @@ class WhatsAppContextProjection:
                 if not isinstance(item, Mapping):
                     continue
                 descriptor = item.get("descriptor") if isinstance(item.get("descriptor"), Mapping) else {}
-                kind = descriptor.get("kind") if isinstance(descriptor.get("kind"), str) else "media"
+                kind = descriptor.get("kind")
+                kind = kind if isinstance(kind, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", kind) else "media"
                 status = item.get("status") if item.get("status") in {"owned", "missing_or_rejected", "deleted_or_replaced", "unknown"} else "unknown_historical"
                 attachment_ref = self._safe_opaque_ref(item.get("attachment_ref"), "attachment")
                 attachments.append({

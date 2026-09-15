@@ -5,6 +5,7 @@ import hashlib
 import json
 import asyncio
 import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -296,6 +297,140 @@ def test_processor_deadline_marks_uncertain_without_a_projection_row(tmp_path):
             (archive.scope, event_id),
         ).fetchone()
     assert claim["state"] == "uncertain" and event is None
+
+
+def test_processor_consumes_only_bounded_items_inside_worker(tmp_path):
+    """An endless invalid iterator cannot outlive the configured examination cap."""
+    archive, _cache = _archive(tmp_path)
+    projection = WhatsAppContextProjection(
+        archive, ProjectionSettings.from_extra(_extra(processor_item_limit=3)),
+    )
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("bounded"), "operate")
+    assert accepted
+    examined = []
+
+    def endless_invalid(_request):
+        while True:
+            examined.append(True)
+            yield {"kind": "not-an-item", "text": "discard"}
+
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("bounded"), processor=endless_invalid) is None
+    assert len(examined) == 3
+    with archive._connect() as db:
+        assert db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()["state"] == "completed"
+
+
+def test_timeout_cancels_queued_processor_before_late_dispatch(tmp_path, monkeypatch):
+    """A timed-out queued callback is cancelled and never processes archived text later."""
+    from concurrent.futures import ThreadPoolExecutor
+    import plugins.platforms.whatsapp.context_projection as projection_module
+
+    archive, _cache = _archive(tmp_path)
+    projection = WhatsAppContextProjection(
+        archive, ProjectionSettings.from_extra(_extra(processor_timeout_seconds=1)),
+    )
+    projection.activate(now=1000)
+    slow_id, accepted = archive.record(_raw("slow"), "operate"); assert accepted
+    queued_id, accepted = archive.record(_raw("queued"), "operate"); assert accepted
+    started, release = threading.Event(), threading.Event()
+    queued_calls = []
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+
+    def slow(_request):
+        started.set()
+        assert release.wait(timeout=5)
+        return (ProjectionItem("fact", "too late"),)
+
+    def queued(_request):
+        queued_calls.append(True)
+        return (ProjectionItem("fact", "must not run"),)
+
+    try:
+        assert projection.capture_and_render(event_id=slow_id, raw=_raw("slow"), processor=slow) is None
+        assert started.is_set()
+        assert projection.capture_and_render(event_id=queued_id, raw=_raw("queued"), processor=queued) is None
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+    assert queued_calls == []
+    with archive._connect() as db:
+        states = [row["state"] for row in db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? ORDER BY event_id", (archive.scope,),
+        )]
+    assert states == ["uncertain", "uncertain"]
+
+
+def test_late_attempt_cannot_publish_after_concurrent_uncertain_claim(tmp_path, monkeypatch):
+    """A late worker result is fenced by its attempt ID after a concurrent recovery sees it."""
+    from concurrent.futures import ThreadPoolExecutor
+    import plugins.platforms.whatsapp.context_projection as projection_module
+
+    archive, _cache = _archive(tmp_path)
+    projection = WhatsAppContextProjection(archive, ProjectionSettings.from_extra(_extra()))
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("race"), "operate")
+    assert accepted
+    started, release = threading.Event(), threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(projection_module, "_PROCESSOR_EXECUTOR", executor)
+
+    def blocked(_request):
+        started.set()
+        assert release.wait(timeout=5)
+        return (ProjectionItem("fact", "late result"),)
+
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            projection.capture_and_render(event_id=event_id, raw=_raw("race"), processor=blocked)
+        ),
+    )
+    worker.start()
+    assert started.wait(timeout=2)
+    try:
+        assert projection.capture_and_render(event_id=event_id, raw=_raw("race"), processor=blocked) is None
+    finally:
+        release.set()
+        worker.join(timeout=5)
+        executor.shutdown(wait=True)
+    assert not worker.is_alive() and result == [None]
+    with archive._connect() as db:
+        claim = db.execute(
+            "SELECT state FROM archive_context_projection_claim WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()
+        event = db.execute(
+            "SELECT 1 FROM archive_context_projection_event WHERE profile_scope=? AND event_id=?",
+            (archive.scope, event_id),
+        ).fetchone()
+    assert claim["state"] == "uncertain" and event is None
+
+
+def test_render_resanitizes_hostile_persisted_projection_rows(tmp_path):
+    archive, _cache = _archive(tmp_path)
+    projection = WhatsAppContextProjection(archive, ProjectionSettings.from_extra(_extra()))
+    projection.activate(now=1000)
+    event_id, accepted = archive.record(_raw("hostile", media=True), "operate")
+    assert accepted
+    assert projection.capture_and_render(event_id=event_id, raw=_raw("hostile", media=True), processor=_processor)
+    hostile = "https://attacker.invalid/private /tmp/private.jpg"
+    with archive._connect() as db:
+        db.execute(
+            "INSERT INTO archive_context_projection_item(profile_scope,event_id,chat_id,kind,text,created_at) VALUES(?,?,?,?,?,?)",
+            (archive.scope, event_id, "chat-a@g.us", "attacker", hostile, 1001),
+        )
+        db.execute(
+            "UPDATE archive_context_projection_event SET metadata_json=? WHERE profile_scope=? AND event_id=?",
+            (json.dumps({"attachments": [{"kind": "../../file", "status": "leak", "attachment_ref": "file:/tmp/private"}]}), archive.scope, event_id),
+        )
+    note = projection.render(event_id=event_id, chat_id="chat-a@g.us")
+    assert note and "The approved local fact." in note and "media: unknown_historical" in note
+    assert hostile not in note and "attacker" not in note and "file:/tmp" not in note
 
 
 @pytest.mark.asyncio
