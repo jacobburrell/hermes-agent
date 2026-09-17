@@ -2969,9 +2969,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
-        messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page)
-        messages = await asyncio.to_thread(self._project_commitment_presentation, db, resolved_id, messages)
+        messages, pending_fences = await asyncio.to_thread(
+            db.get_api_presentation_snapshot, resolved_id, limit=limit, offset=offset, latest=latest_page)
+        messages = self._project_commitment_presentation(messages, pending_fences)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
@@ -3735,10 +3735,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         guarded["final_response"] = fallback
         return guarded
 
-    @staticmethod
-    def _commitment_presentation_fence_key(session_id: str) -> str:
-        return "api_commitment_presentation:" + hashlib.sha256(session_id.encode()).hexdigest()
-
     def _begin_commitment_presentation_fence(self, db: Any, session_id: str, turn_id: str) -> Optional[dict]:
         """Durably fence API presentation before the model can append an assistant row.
 
@@ -3749,11 +3745,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not session_id:
             return None
         try:
+            # The fence is intentionally before agent construction; a new API
+            # session may not have its first model-created row yet.
+            db.ensure_session(session_id, source="api_server")
             rows = db.get_messages(session_id, latest=True, limit=1)
             watermark = int(rows[-1].get("id") or 0) if rows else 0
-            fence = {"turn_id": turn_id, "after_id": watermark, "state": "pending", "fallback": ""}
-            db.set_meta(self._commitment_presentation_fence_key(session_id), json.dumps(fence, sort_keys=True))
-            return fence
+            if db.begin_api_presentation_fence(
+                session_id, turn_id=turn_id, source="commitment_admission", after_row_id=watermark):
+                return {"turn_id": turn_id, "after_id": watermark}
+            return None
         except Exception:
             logger.warning("could not create stateless commitment presentation fence", exc_info=True)
             return None
@@ -3764,36 +3764,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not fence:
             return
         try:
-            finished = dict(fence)
-            finished["state"] = "resolved" if fallback else "cleared"
-            finished["fallback"] = fallback
-            db.set_meta(self._commitment_presentation_fence_key(session_id), json.dumps(finished, sort_keys=True))
+            db.resolve_api_presentation_fence(session_id, turn_id=str(fence["turn_id"]), fallback=fallback)
         except Exception:
             # Leave the earlier pending value visible rather than exposing raw
             # text if the display-only completion record cannot be written.
             logger.warning("could not resolve stateless commitment presentation fence", exc_info=True)
 
-    def _project_commitment_presentation(self, db: Any, session_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _project_commitment_presentation(self, messages: List[Dict[str, Any]], pending_fences: List[int]) -> List[Dict[str, Any]]:
         """Project, never mutate, assistant rows protected by one session fence."""
         try:
-            raw = db.get_meta(self._commitment_presentation_fence_key(session_id))
-            fence = json.loads(raw) if raw else None
-            if not isinstance(fence, dict) or fence.get("state") not in {"pending", "resolved"}:
-                return messages
-            after_id = int(fence.get("after_id") or 0)
-            fallback = str(fence.get("fallback") or "") if fence.get("state") == "resolved" else ""
-            out: List[Dict[str, Any]] = []
-            replaced = False
-            for message in messages:
-                if message.get("role") != "assistant" or int(message.get("id") or 0) <= after_id:
-                    out.append(message)
-                elif fallback and not replaced:
-                    safe = dict(message)
-                    safe["content"] = fallback
-                    out.append(safe)
-                    replaced = True
-                # Pending and later raw assistant rows are intentionally hidden.
-            return out
+            return [message for message in messages if not (
+                message.get("role") == "assistant" and any(int(message.get("id") or 0) > mark for mark in pending_fences))]
         except Exception:
             # Read failures cannot prove the raw assistant output was classified.
             return [m for m in messages if m.get("role") != "assistant"]
