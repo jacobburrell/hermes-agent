@@ -1768,6 +1768,8 @@ class GatewayTurnMixin:
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        fence = agent_result.get("_gateway_commitment_presentation_fence") if isinstance(agent_result, dict) else None
+        fence_turn_id = fence.get("turn_id") if isinstance(fence, dict) and fence.get("session_id") == sid else None
 
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
@@ -1806,7 +1808,9 @@ class GatewayTurnMixin:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
+                            sid, {"role": "assistant", "content": response, "timestamp": ts,
+                                  "display_metadata": ({"_gateway_commitment_fence": fence_turn_id}
+                                                       if fence_turn_id else None)},
                             skip_db=agent_persisted,
                         )
                 else:
@@ -1825,6 +1829,10 @@ class GatewayTurnMixin:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
+                        if msg.get("role") == "assistant" and fence_turn_id:
+                            metadata = entry.get("display_metadata")
+                            entry["display_metadata"] = dict(metadata) if isinstance(metadata, dict) else {}
+                            entry["display_metadata"]["_gateway_commitment_fence"] = fence_turn_id
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # A guarded gateway turn may have let the agent persist raw assistant
@@ -1833,13 +1841,15 @@ class GatewayTurnMixin:
         # a failed resolve intentionally leaves the pending fence in place so
         # presentation stays fail closed while the raw model history remains
         # untouched for cache/replay.
-        fence = agent_result.get("_gateway_commitment_presentation_fence") if isinstance(agent_result, dict) else None
         if isinstance(fence, dict) and fence.get("turn_id") and fence.get("session_id") == sid:
             try:
                 db = getattr(self._session_db, "_db", self._session_db)
+                row_ids = await asyncio.to_thread(
+                    db.find_api_presentation_fence_rows, sid, turn_id=str(fence["turn_id"]))
                 await asyncio.to_thread(
                     db.resolve_api_presentation_fence, sid,
                     turn_id=str(fence["turn_id"]), fallback=str(fence.get("fallback") or ""),
+                    assistant_row_ids=row_ids, require_exact_rows=True,
                 )
             except Exception:
                 logger.debug("Could not resolve gateway commitment presentation fence", exc_info=True)
