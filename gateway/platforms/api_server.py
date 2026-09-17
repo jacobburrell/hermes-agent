@@ -3768,7 +3768,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             db.resolve_api_presentation_fence(
                 session_id, turn_id=str(fence["turn_id"]), fallback=fallback,
                 assistant_row_ids=row_ids, require_exact_rows=True,
-                presented_assistant_row_id=(row_ids[-1] if row_ids else None))
+                presented_assistant_row_id=(row_ids[-1] if row_ids else None), turn_completed=True)
         except Exception:
             # Leave the earlier pending value visible rather than exposing raw
             # text if the display-only completion record cannot be written.
@@ -3948,6 +3948,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # background work this turn deliberately left running.
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
+                    if presentation_fence is not None:
+                        with suppress(Exception):
+                            self._finish_commitment_presentation_fence(
+                                presentation_db, session_id or "", presentation_fence,
+                                fallback="I can't safely confirm a continued task from this interface right now.")
                     if agent is not None:
                         with suppress(Exception):
                             delattr(agent, "_gateway_commitment_turn_id")

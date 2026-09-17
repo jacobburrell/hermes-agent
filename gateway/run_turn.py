@@ -1851,6 +1851,7 @@ class GatewayTurnMixin:
                     turn_id=str(fence["turn_id"]), fallback=str(fence.get("fallback") or ""),
                     assistant_row_ids=row_ids, require_exact_rows=True,
                     presented_assistant_row_id=(row_ids[-1] if row_ids else None),
+                    turn_completed=True,
                 )
             except Exception:
                 logger.debug("Could not resolve gateway commitment presentation fence", exc_info=True)

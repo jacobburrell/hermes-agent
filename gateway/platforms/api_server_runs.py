@@ -731,6 +731,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
+        if presentation_fence is not None:
+            with suppress(Exception):
+                with self._profile_scope(run.request_profile):
+                    self._finish_commitment_presentation_fence(
+                        presentation_db, run.session_id or "", presentation_fence,
+                        fallback="I can't safely confirm a continued task from this interface right now.")
         _unregister_approval_notify(run.approval_session_key)
         if agent is not None:
             with suppress(Exception):

@@ -2031,7 +2031,7 @@ class TurnRunner:
                         ctx.session_id, turn_id=presentation_fence["turn_id"],
                         fallback="I can't safely confirm a continued task from this turn yet.",
                         assistant_row_ids=row_ids, require_exact_rows=True,
-                        presented_assistant_row_id=(row_ids[-1] if row_ids else None))
+                        presented_assistant_row_id=(row_ids[-1] if row_ids else None), turn_completed=True)
             raise
         finally:
             # Cached agents survive turns.  Never let a later ordinary turn
