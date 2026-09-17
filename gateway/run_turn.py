@@ -4137,6 +4137,25 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            # Proxy streaming has its own transport lifecycle and cannot yet
+            # attest a local durable task/subscription before remote chunks
+            # arrive.  Refuse rather than claim interface-neutral commitment
+            # support on this bypass path; disabled admission keeps legacy
+            # proxy behavior unchanged.
+            try:
+                from gateway.commitment_admission_boundary import admission_state
+                from hermes_cli.config import load_config
+                if not scheduled_heartbeat and admission_state(load_config()) is not False:
+                    return {
+                        "final_response": (
+                            "I can't safely confirm a continued task through this connection right now."),
+                        "messages": [], "api_calls": 0, "tools": [], "response_transformed": True,
+                    }
+            except Exception:
+                return {
+                    "final_response": "I can't safely confirm a continued task through this connection right now.",
+                    "messages": [], "api_calls": 0, "tools": [], "response_transformed": True,
+                }
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
