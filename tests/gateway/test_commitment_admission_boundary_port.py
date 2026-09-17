@@ -150,21 +150,76 @@ def test_gateway_presentation_fence_keeps_raw_history_but_projects_guarded_turn(
         turn = TurnRunner(SimpleNamespace(_session_db=SimpleNamespace(_db=db)), context)
         fence, ready = turn._begin_gateway_commitment_presentation_fence()
         assert ready and fence
-        db.append_message("origin-session", "assistant", "I will update you later.")
+        db.append_message("origin-session", "assistant", "I will update you later.",
+                          display_metadata={"_gateway_commitment_fence": fence["turn_id"]})
         assert db.resolve_api_presentation_fence(
-            "origin-session", turn_id=fence["turn_id"], fallback=_SAFE_REFUSAL)
+            "origin-session", turn_id=fence["turn_id"], fallback=_SAFE_REFUSAL,
+            assistant_row_ids=db.find_api_presentation_fence_rows("origin-session", turn_id=fence["turn_id"]),
+            require_exact_rows=True)
         # A later normal turn clears only its own fence; it never overwrites
         # the earlier refused projection.
         later, later_ready = turn._begin_gateway_commitment_presentation_fence()
         assert later_ready and later
-        db.append_message("origin-session", "assistant", "It is done.")
-        assert db.resolve_api_presentation_fence("origin-session", turn_id=later["turn_id"])
+        db.append_message("origin-session", "assistant", "It is done.",
+                          display_metadata={"_gateway_commitment_fence": later["turn_id"]})
+        assert db.resolve_api_presentation_fence(
+            "origin-session", turn_id=later["turn_id"],
+            assistant_row_ids=db.find_api_presentation_fence_rows("origin-session", turn_id=later["turn_id"]),
+            require_exact_rows=True)
         shown, pending = db.get_api_presentation_snapshot(
             "origin-session", limit=None, offset=0, latest=False)
         assert pending == []
         assert [m["content"] for m in shown] == [_SAFE_REFUSAL, "It is done."]
         assert [m["content"] for m in db.get_messages("origin-session")] == [
             "I will update you later.", "It is done."]
+    finally:
+        db.close()
+
+
+def test_exact_gateway_fence_hides_every_owned_intermediate_not_later_turn(temp_home):
+    db = SessionDB()
+    try:
+        db.ensure_session("origin-session", source="gateway")
+        assert db.begin_api_presentation_fence(
+            "origin-session", turn_id="guarded", source="gateway_commitment", after_row_id=0)
+        for text in ("I will keep working", "I will update you later"):
+            db.append_message("origin-session", "assistant", text,
+                              display_metadata={"_gateway_commitment_fence": "guarded"})
+        db.append_message("origin-session", "assistant", "A later independent answer")
+        owned = db.find_api_presentation_fence_rows("origin-session", turn_id="guarded")
+        assert len(owned) == 2
+        assert db.resolve_api_presentation_fence(
+            "origin-session", turn_id="guarded", fallback=_SAFE_REFUSAL,
+            assistant_row_ids=owned, require_exact_rows=True)
+        shown, pending = db.get_api_presentation_snapshot(
+            "origin-session", limit=None, offset=0, latest=False)
+        assert pending == []
+        assert [row["content"] for row in shown] == [_SAFE_REFUSAL, "A later independent answer"]
+        assert [row["content"] for row in db.get_messages("origin-session")] == [
+            "I will keep working", "I will update you later", "A later independent answer"]
+    finally:
+        db.close()
+
+
+def test_interrupted_gateway_fence_hides_only_its_marked_rows(temp_home):
+    """A crashed guarded turn must not suppress a later independent assistant row."""
+    from gateway.platforms.api_server import APIServerAdapter
+    db = SessionDB()
+    try:
+        db.ensure_session("origin-session", source="gateway")
+        assert db.begin_api_presentation_fence(
+            "origin-session", turn_id="interrupted", source="gateway_commitment", after_row_id=0)
+        db.append_message("origin-session", "assistant", "I will finish this later.",
+                          display_metadata={"_gateway_commitment_fence": "interrupted"})
+        db.append_message("origin-session", "assistant", "Independent later answer.")
+        shown, pending = db.get_api_presentation_snapshot(
+            "origin-session", limit=None, offset=0, latest=False)
+        assert pending and pending[0]["row_ids"]
+        projected = APIServerAdapter._project_commitment_presentation(SimpleNamespace(), shown, pending)
+        assert [row["content"] for row in projected] == ["Independent later answer."]
+        # Canonical transcript has not been rewritten by the projection.
+        assert [row["content"] for row in db.get_messages("origin-session")] == [
+            "I will finish this later.", "Independent later answer."]
     finally:
         db.close()
 

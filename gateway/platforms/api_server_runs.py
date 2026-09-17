@@ -646,6 +646,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     buffered_deltas: list[Any] = []
     presentation_db = None
     presentation_fence = None
+    agent = None
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -691,6 +692,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
+            if presentation_fence is not None:
+                agent._gateway_commitment_turn_id = str(presentation_fence["turn_id"])
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
@@ -729,6 +732,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
+        if agent is not None:
+            with suppress(Exception):
+                delattr(agent, "_gateway_commitment_turn_id")
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)

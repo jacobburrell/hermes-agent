@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.context_compressor import _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, split_user_originated_turn
 from agent.memory_manager import sanitize_context
@@ -31,7 +31,11 @@ _BUMP_GENERATION_SQL = """
             VALUES (?, ?, 1)
             ON CONFLICT(source, session_key) DO UPDATE
                 SET generation = conversation_generations.generation + 1
-            """
+"""
+
+# A sidecar-only value meaning "this owned intermediate assistant row is not
+# client-presentable".  It is never written to canonical message content.
+_PRESENTATION_HIDDEN = "\u2063hermes:commitment-presentation-hidden"
 
 _TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?"
 _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?"
@@ -397,23 +401,81 @@ class SessionMessagesMixin:
                 (session_id, turn_id)).fetchone()["state"] == "pending"
         return bool(self._execute_write(_do))
 
-    def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "") -> bool:
-        """Resolve a fence; fallback lives in a sidecar, never message metadata."""
+    def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "",
+                                       assistant_row_ids: Optional[Sequence[int]] = None,
+                                       require_exact_rows: bool = False) -> bool:
+        """Resolve a fence against its exact owned assistant rows.
+
+        ``assistant_row_ids`` is deliberately caller-owned turn evidence, not
+        a broad "all rows after watermark" query: a concurrent turn must never
+        be hidden or cleared by somebody else's admission decision.  Callers
+        that opt into ``require_exact_rows`` fail closed unless every supplied
+        id is an active assistant row newer than this fence's watermark.
+        """
+        supplied = []
+        for row_id in assistant_row_ids or ():
+            if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
+                supplied.append(row_id)
+        supplied = sorted(set(supplied))
         def _do(conn):
             fence = conn.execute("SELECT after_row_id FROM api_presentation_fences "
                 "WHERE session_id=? AND turn_id=? AND state='pending'", (session_id, turn_id)).fetchone()
             if fence is None: return False
+            if require_exact_rows and not supplied:
+                # A provider failure may produce no assistant rows at all. It
+                # is then safe to clear; any unowned assistant row means we
+                # cannot prove this fence owns it, so keep presentation held.
+                unowned = conn.execute("SELECT 1 FROM messages WHERE session_id=? AND role='assistant' "
+                    "AND active=1 AND id>? LIMIT 1", (session_id, int(fence["after_row_id"]))).fetchone()
+                if unowned is not None:
+                    return False
+            verified = []
+            if supplied:
+                placeholders = ",".join("?" for _ in supplied)
+                rows = conn.execute(
+                    f"SELECT id FROM messages WHERE session_id=? AND role='assistant' AND active=1 "
+                    f"AND id>? AND id IN ({placeholders})", (session_id, int(fence["after_row_id"]), *supplied),
+                ).fetchall()
+                verified = sorted(int(row["id"]) for row in rows)
+                if verified != supplied:
+                    return False
             if fallback:
-                row = conn.execute("SELECT id FROM messages WHERE session_id=? AND role='assistant' "
-                    "AND active=1 AND id>? ORDER BY id DESC LIMIT 1", (session_id, int(fence["after_row_id"]))).fetchone()
-                if row is not None:
+                if not verified and not require_exact_rows:
+                    # Compatibility for callers not yet capable of durable
+                    # per-row ownership. New gateway/API paths always opt
+                    # into exact rows above.
+                    row = conn.execute("SELECT id FROM messages WHERE session_id=? AND role='assistant' "
+                        "AND active=1 AND id>? ORDER BY id DESC LIMIT 1",
+                        (session_id, int(fence["after_row_id"]))).fetchone()
+                    verified = [int(row["id"])] if row is not None else []
+                for index, row_id in enumerate(verified):
                     conn.execute("INSERT OR REPLACE INTO api_presentation_overrides "
                         "(session_id,turn_id,message_id,content) VALUES (?,?,?,?)",
-                        (session_id, turn_id, int(row["id"]), fallback))
+                        (session_id, turn_id, row_id,
+                         fallback if index == 0 else _PRESENTATION_HIDDEN))
             return bool(conn.execute("UPDATE api_presentation_fences SET state=?,resolved_at=? "
                 "WHERE session_id=? AND turn_id=? AND state='pending'",
                 ("resolved" if fallback else "cleared", time.time(), session_id, turn_id)).rowcount)
         return bool(self._execute_write(_do))
+
+    def find_api_presentation_fence_rows(self, session_id: str, *, turn_id: str) -> List[int]:
+        """Return exact assistant rows privately stamped for one gateway turn.
+
+        The marker is display metadata only.  It never enters provider history
+        and lets the non-persisting gateway transcript path bind SQLite-assigned
+        row ids without guessing from text or a shared watermark.
+        """
+        if not session_id or not turn_id:
+            return []
+        with self._read_ctx() as conn:
+            fence = conn.execute("SELECT after_row_id FROM api_presentation_fences "
+                "WHERE session_id=? AND turn_id=?", (session_id, turn_id)).fetchone()
+            if fence is None:
+                return []
+            rows = conn.execute("SELECT id,display_metadata FROM messages WHERE session_id=? "
+                "AND role='assistant' AND active=1 AND id>? ORDER BY id", (session_id, int(fence["after_row_id"]))).fetchall()
+        return [int(row["id"]) for row in rows if (
+            self._decode_display_metadata(row["display_metadata"]) or {}).get("_gateway_commitment_fence") == turn_id]
 
     def get_api_presentation_snapshot(self, session_id: str, *, limit: Optional[int], offset: int,
                                       latest: bool) -> Tuple[List[Dict[str, Any]], List[int]]:
@@ -427,14 +489,27 @@ class SessionMessagesMixin:
                 rows = conn.execute(sql, params).fetchall()
                 overrides = {int(r["message_id"]): r["content"] for r in conn.execute(
                     "SELECT message_id,content FROM api_presentation_overrides WHERE session_id=?", (session_id,))}
-                fences = [int(r["after_row_id"]) for r in conn.execute(
-                    "SELECT after_row_id FROM api_presentation_fences WHERE session_id=? AND state='pending'", (session_id,))]
+                fences = []
+                for fence in conn.execute("SELECT turn_id,source,after_row_id FROM api_presentation_fences "
+                                         "WHERE session_id=? AND state='pending'", (session_id,)):
+                    marker_rows = conn.execute("SELECT id,display_metadata FROM messages WHERE session_id=? "
+                        "AND role='assistant' AND active=1 AND id>?", (session_id, int(fence["after_row_id"]))).fetchall()
+                    owned = [int(row["id"]) for row in marker_rows if (
+                        self._decode_display_metadata(row["display_metadata"]) or {}).get("_gateway_commitment_fence") == fence["turn_id"]]
+                    fences.append({"after_row_id": int(fence["after_row_id"]), "row_ids": owned,
+                                   "source": fence["source"]})
             finally: conn.execute("ROLLBACK")
         if latest: rows.reverse()
         messages = [self._row_to_message_dict(row, warn_context="api_presentation_snapshot", summary_flag=True) for row in rows]
+        projected = []
         for msg in messages:
-            if int(msg.get("id") or 0) in overrides: msg["content"] = overrides[int(msg["id"])]
-        return messages, fences
+            override = overrides.get(int(msg.get("id") or 0))
+            if override == _PRESENTATION_HIDDEN:
+                continue
+            if override is not None:
+                msg["content"] = override
+            projected.append(msg)
+        return projected, fences
 
     def _reaction_list(self, meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""
@@ -882,6 +957,10 @@ class SessionMessagesMixin:
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
             msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if isinstance(msg["display_metadata"], dict):
+                # Private fence ownership is an internal persistence detail,
+                # never presentation or provider-history data.
+                msg["display_metadata"].pop("_gateway_commitment_fence", None)
         return msg
 
     @staticmethod

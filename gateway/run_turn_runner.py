@@ -1030,10 +1030,27 @@ class TurnRunner:
                 ctx.session_id, turn_id=turn_id, source="gateway_commitment", after_row_id=watermark,
             ):
                 return None, False
-            return {"turn_id": turn_id, "session_id": ctx.session_id}, True
+            return {"turn_id": turn_id, "session_id": ctx.session_id, "after_row_id": watermark}, True
         except Exception:
             logger.debug("Could not create gateway commitment presentation fence", exc_info=True)
             return None, False
+
+    @staticmethod
+    def _owned_assistant_row_ids(result: Any, *, after_row_id: int) -> list[int]:
+        """Extract durable ids written by this agent turn, never infer by text."""
+        if not isinstance(result, dict):
+            return []
+        rows = result.get("messages")
+        if not isinstance(rows, list):
+            return []
+        return sorted({
+            message["_row_id"] for message in rows
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("_row_id"), int)
+            and not isinstance(message.get("_row_id"), bool)
+            and message["_row_id"] > after_row_id
+        })
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -1993,7 +2010,17 @@ class TurnRunner:
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        if presentation_fence is not None:
+            agent._gateway_commitment_turn_id = presentation_fence["turn_id"]
+        try:
+            result = self._run_conversation_with_approval(
+                agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        finally:
+            # Cached agents survive turns.  Never let a later ordinary turn
+            # inherit this turn's private ownership marker.
+            if presentation_fence is not None:
+                with suppress(Exception):
+                    delattr(agent, "_gateway_commitment_turn_id")
         # This is the last common boundary before any stream finalization or
         # adapter delivery.  Persistence is performed by the shared boundary
         # before a continuation promise is released.
