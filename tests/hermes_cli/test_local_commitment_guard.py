@@ -158,6 +158,50 @@ def test_quiet_cli_fence_stamps_and_projects_persisted_promise(monkeypatch, tmp_
         db.close()
 
 
+def test_actual_oneshot_entry_fences_and_projects_persisted_promise(monkeypatch, tmp_path):
+    """Mock construction only; execute the real one-shot runtime seam and SQLite fence."""
+    from types import SimpleNamespace
+    from hermes_cli import oneshot
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "oneshot.db")
+    db.create_session("oneshot", source="cli")
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self._session_db, self.session_id = kwargs["session_db"], kwargs["session_id"]
+            self.provider = self.model = "test"
+        def run_conversation(self, *_args, **_kwargs):
+            raw = "I will continue after this process exits."
+            self._session_db.append_message(self.session_id, role="assistant", content=raw, display_metadata={
+                "_local_commitment_turn_id": self._local_commitment_turn_id,
+                "local_commitment_guard": {"turn_id": self._local_commitment_turn_id, "content": ""}})
+            return _result(raw)
+        def shutdown_memory_provider(self, *_args): pass
+        def close(self): pass
+
+    monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: db)
+    monkeypatch.setattr(oneshot, "_load_resume_target", lambda *_args: ("oneshot", [], {}))
+    monkeypatch.setattr(oneshot, "_resolve_model_and_provider", lambda *_args: SimpleNamespace(
+        provider="", api_key=None, base_url=None, api_mode=None, model="test"))
+    monkeypatch.setattr(oneshot, "_apply_stored_session_runtime", lambda choice, *_args, **_kwargs: choice)
+    monkeypatch.setattr(guard, "local_commitment_state", lambda: True)
+    monkeypatch.setattr(guard, "propose_with_auxiliary", lambda *_: CommitmentProposal(disposition="continuing"))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kwargs: {})
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_args: set())
+    monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **_kwargs: None)
+    monkeypatch.setattr("hermes_constants.resolve_reasoning_config", lambda *_args: None)
+    monkeypatch.setattr("run_agent.AIAgent", Agent)
+    try:
+        text, result = oneshot._run_agent("continue", resume="oneshot")
+        assert "will not claim" in text and "will not claim" in result["final_response"]
+        row = db.get_messages("oneshot")[-1]
+        assert row["content"] == "I will continue after this process exits."
+        assert "will not claim" in row["display_metadata"]["local_commitment_guard"]["content"]
+    finally:
+        db.close()
+
+
 def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch, tmp_path):
     """The production TUI invoke seam must not emit a prospective promise early."""
     from types import SimpleNamespace
