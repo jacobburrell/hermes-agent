@@ -382,6 +382,60 @@ class SessionMessagesMixin:
             return True
         return self._execute_write(_do)
 
+    def begin_api_presentation_fence(self, session_id: str, *, turn_id: str, source: str,
+                                     after_row_id: int) -> bool:
+        """Persist a per-turn client fence without changing transcript rows."""
+        if not session_id or not turn_id or not source:
+            return False
+        try: watermark = max(0, int(after_row_id))
+        except (TypeError, ValueError): return False
+        def _do(conn):
+            conn.execute("INSERT OR IGNORE INTO api_presentation_fences "
+                "(session_id,turn_id,source,after_row_id,state,created_at) VALUES (?,?,?,?, 'pending', ?)",
+                (session_id, turn_id, source, watermark, time.time()))
+            return conn.execute("SELECT state FROM api_presentation_fences WHERE session_id=? AND turn_id=?",
+                (session_id, turn_id)).fetchone()["state"] == "pending"
+        return bool(self._execute_write(_do))
+
+    def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "") -> bool:
+        """Resolve a fence; fallback lives in a sidecar, never message metadata."""
+        def _do(conn):
+            fence = conn.execute("SELECT after_row_id FROM api_presentation_fences "
+                "WHERE session_id=? AND turn_id=? AND state='pending'", (session_id, turn_id)).fetchone()
+            if fence is None: return False
+            if fallback:
+                row = conn.execute("SELECT id FROM messages WHERE session_id=? AND role='assistant' "
+                    "AND active=1 AND id>? ORDER BY id DESC LIMIT 1", (session_id, int(fence["after_row_id"]))).fetchone()
+                if row is not None:
+                    conn.execute("INSERT OR REPLACE INTO api_presentation_overrides "
+                        "(session_id,turn_id,message_id,content) VALUES (?,?,?,?)",
+                        (session_id, turn_id, int(row["id"]), fallback))
+            return bool(conn.execute("UPDATE api_presentation_fences SET state=?,resolved_at=? "
+                "WHERE session_id=? AND turn_id=? AND state='pending'",
+                ("resolved" if fallback else "cleared", time.time(), session_id, turn_id)).rowcount)
+        return bool(self._execute_write(_do))
+
+    def get_api_presentation_snapshot(self, session_id: str, *, limit: Optional[int], offset: int,
+                                      latest: bool) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """Atomically read rows, sidecar overrides, and pending watermarks."""
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                sql = "SELECT * FROM messages WHERE session_id=? AND active=1 ORDER BY id " + ("DESC" if latest else "ASC")
+                params: List[Any] = [session_id]
+                if limit is not None or offset: sql += " LIMIT ? OFFSET ?"; params.extend([-1 if limit is None else limit, offset])
+                rows = conn.execute(sql, params).fetchall()
+                overrides = {int(r["message_id"]): r["content"] for r in conn.execute(
+                    "SELECT message_id,content FROM api_presentation_overrides WHERE session_id=?", (session_id,))}
+                fences = [int(r["after_row_id"]) for r in conn.execute(
+                    "SELECT after_row_id FROM api_presentation_fences WHERE session_id=? AND state='pending'", (session_id,))]
+            finally: conn.execute("ROLLBACK")
+        if latest: rows.reverse()
+        messages = [self._row_to_message_dict(row, warn_context="api_presentation_snapshot", summary_flag=True) for row in rows]
+        for msg in messages:
+            if int(msg.get("id") or 0) in overrides: msg["content"] = overrides[int(msg["id"])]
+        return messages, fences
+
     def _reaction_list(self, meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""
         reactions = (meta or {}).get(self.REACTIONS_METADATA_KEY)
