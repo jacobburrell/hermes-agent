@@ -155,6 +155,34 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_run_stream_holds_stateless_future_promise_until_guard(self, adapter, monkeypatch):
+        """/v1/runs has its own lifecycle, so it must not bypass the text fence."""
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "goals": {"commitment_admission": {"enabled": True}}})
+        monkeypatch.setattr(boundary, "_auxiliary_proposal", lambda *_args: {
+            "disposition": "continuing", "objective": "research",
+            "completion_criteria": "report", "next_action": "research"})
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            fake = MagicMock()
+            fake.session_prompt_tokens = fake.session_completion_tokens = fake.session_total_tokens = 0
+
+            def _run(**_kwargs):
+                create.call_args.kwargs["stream_delta_callback"]("I will report back.")
+                return {"final_response": "I will report back."}
+
+            fake.run_conversation.side_effect = _run
+            with patch.object(adapter, "_create_agent", return_value=fake) as create:
+                started = await cli.post("/v1/runs", json={"input": "research it"})
+                run_id = (await started.json())["run_id"]
+                events = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+        assert "I will report back." not in events
+        assert "will not claim" in events
+
+    @pytest.mark.asyncio
     async def test_room_auth_is_validated_before_body_parse_or_work_reservation(
         self, auth_adapter
     ):
