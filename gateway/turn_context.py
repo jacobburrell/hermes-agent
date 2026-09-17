@@ -15,6 +15,9 @@ from typing import Any, Callable, List, Optional
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
+    # Trusted inbound event for delivery-boundary policies.  It is never
+    # serialized into session history or adapter metadata.
+    event: Any = None
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False
