@@ -968,7 +968,43 @@ class TurnRunner:
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
                 self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
 
+        # Commitment admission decides at the final boundary.  Preserve normal
+        # streaming setup, but hold user-visible text/commentary until that
+        # decision so a prospective promise cannot escape first.
+        try:
+            from gateway.commitment_admission_boundary import enabled as _commitment_enabled
+            fence = bool(_commitment_enabled(ctx.user_config))
+        except Exception:
+            fence = True
+        if fence:
+            events: list[tuple[str, Any]] = []
+            original_delta, original_interim = stream_delta_cb, interim_assistant_cb
+            self._commitment_stream_events = events
+            self._commitment_stream_flush = (original_delta, original_interim)
+
+            def stream_delta_cb(text: Optional[str]) -> None:
+                events.append(("delta", text))
+
+            def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                events.append(("interim", (text, already_streamed)))
+        else:
+            self._commitment_stream_events = None
+            self._commitment_stream_flush = None
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
+
+    def _finish_commitment_stream_fence(self, *, release: bool) -> None:
+        events = getattr(self, "_commitment_stream_events", None)
+        callbacks = getattr(self, "_commitment_stream_flush", None)
+        self._commitment_stream_events = self._commitment_stream_flush = None
+        if not release or not events or not callbacks:
+            return
+        delta, interim = callbacks
+        for kind, value in events:
+            if kind == "delta" and delta is not None:
+                delta(value)
+            elif kind == "interim" and interim is not None:
+                text, already_streamed = value
+                interim(text, already_streamed=already_streamed)
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -1910,6 +1946,29 @@ class TurnRunner:
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        # This is the last common boundary before any stream finalization or
+        # adapter delivery.  Persistence is performed by the shared boundary
+        # before a continuation promise is released.
+        original_response = str(result.get("final_response") or "")
+        try:
+            from gateway.commitment_admission_boundary import guard_final_response
+            guarded, receipt = guard_final_response(
+                runner=runner, ctx=ctx, event=ctx.event, response=original_response)
+            if guarded != original_response:
+                result["final_response"] = guarded
+                result["response_transformed"] = True
+            if receipt is not None:
+                result["commitment_admission"] = receipt
+        except Exception:
+            try:
+                from gateway.commitment_admission_boundary import enabled as _enabled, _SAFE_REFUSAL
+                if _enabled(ctx.user_config):
+                    result["final_response"] = _SAFE_REFUSAL
+                    result["response_transformed"] = True
+            except Exception:
+                pass
+        self._finish_commitment_stream_fence(
+            release=not bool(result.get("response_transformed")))
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.

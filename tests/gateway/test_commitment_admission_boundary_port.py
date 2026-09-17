@@ -94,7 +94,7 @@ def test_completed_response_is_unchanged_and_disabled_stream_fixture_is_safe():
         resolve_display_setting=lambda *_args: False, _run_still_current=lambda: True,
     )
     stream, delta, interim, enabled = TurnRunner(SimpleNamespace(config=None), context)._setup_stream_consumer("telegram")
-    assert stream is None and delta is None and enabled is False
+    assert stream is None and callable(delta) and enabled is False
     assert callable(interim)
     assert interim("not emitted") is None
 
@@ -115,3 +115,25 @@ def test_quote_is_context_unless_adapter_marks_it_untrusted_authority(temp_home)
         response="I will continue the enrollment research.",
     )
     assert response == _SAFE_REFUSAL and receipt is not None and not receipt.may_promise_follow_up
+
+
+def test_commitment_stream_fence_releases_only_after_safe_boundary():
+    """The TurnRunner fence keeps both delta and interim callbacks private until release."""
+    context = TurnContext(_run_still_current=lambda: True)
+    turn = TurnRunner(SimpleNamespace(), context)
+    delivered = []
+    turn._commitment_stream_events = [
+        ("delta", "ordinary answer"), ("interim", ("thinking", False)),
+    ]
+    turn._commitment_stream_flush = (
+        lambda text: delivered.append(("delta", text)),
+        lambda text, *, already_streamed=False: delivered.append(("interim", text, already_streamed)),
+    )
+    assert delivered == []
+    turn._finish_commitment_stream_fence(release=True)
+    assert delivered == [("delta", "ordinary answer"), ("interim", "thinking", False)]
+
+    turn._commitment_stream_events = [("delta", "I will update you later")]
+    turn._commitment_stream_flush = (lambda text: delivered.append(("delta", text)), None)
+    turn._finish_commitment_stream_fence(release=False)
+    assert all("update you later" not in str(item) for item in delivered)
