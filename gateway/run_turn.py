@@ -1827,6 +1827,23 @@ class GatewayTurnMixin:
                             _user_msg_id_attached = True
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
+        # A guarded gateway turn may have let the agent persist raw assistant
+        # rows before its final admission decision.  Resolve its display-only
+        # fence only after *all* gateway-side transcript writes for this turn;
+        # a failed resolve intentionally leaves the pending fence in place so
+        # presentation stays fail closed while the raw model history remains
+        # untouched for cache/replay.
+        fence = agent_result.get("_gateway_commitment_presentation_fence") if isinstance(agent_result, dict) else None
+        if isinstance(fence, dict) and fence.get("turn_id") and fence.get("session_id") == sid:
+            try:
+                db = getattr(self._session_db, "_db", self._session_db)
+                await asyncio.to_thread(
+                    db.resolve_api_presentation_fence, sid,
+                    turn_id=str(fence["turn_id"]), fallback=str(fence.get("fallback") or ""),
+                )
+            except Exception:
+                logger.debug("Could not resolve gateway commitment presentation fence", exc_info=True)
+
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(
             session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
