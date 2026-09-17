@@ -644,6 +644,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     run_id, loop = run.run_id, asyncio.get_running_loop()
     commitment_guard_enabled = False
     buffered_deltas: list[Any] = []
+    presentation_db = None
+    presentation_fence = None
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -679,6 +681,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         with self._profile_scope(run.request_profile):
             commitment_guard_enabled = self._stateless_commitment_admission_enabled() is not False
+            if commitment_guard_enabled:
+                presentation_db = self._ensure_session_db()
+                presentation_fence = self._begin_commitment_presentation_fence(
+                    presentation_db, run.session_id or "", run.run_id) if presentation_db is not None else None
+                if presentation_fence is None:
+                    _finish("failed", error="Could not safely establish response presentation")
+                    return
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
@@ -688,10 +697,15 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
+        original_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
         with self._profile_scope(run.request_profile):
             result = self._guard_stateless_commitment_response(
                 result=result, user_message=run.user_message, session_id=run.session_id or "",
                 gateway_session_key=run.gateway_session_key or "", profile=run.request_profile or "")
+        final_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
+        self._finish_commitment_presentation_fence(
+            presentation_db, run.session_id or "", presentation_fence,
+            fallback=final_text if final_text != original_text else "")
         _flush_guarded_text(result)
         status, fields = terminal_run_status(result)
         if status == "cancelled":
