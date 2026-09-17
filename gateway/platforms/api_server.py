@@ -3734,6 +3734,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         guarded["final_response"] = fallback
         return guarded
 
+    @staticmethod
+    def _stateless_commitment_admission_enabled() -> bool:
+        """Read the opt-in flag in the request's already-selected profile scope."""
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            settings = cfg_get(load_config(), "goals", "commitment_admission", default={})
+            return isinstance(settings, dict) and bool(settings.get("enabled", False))
+        except Exception:
+            return False
+
     async def _run_agent(
         self, user_message: str, conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -3773,10 +3783,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
+                commitment_stream_guard = self._stateless_commitment_admission_enabled()
+                buffered_deltas: list[Any] = []
+
+                def _guarded_delta(delta: Any) -> None:
+                    if commitment_stream_guard:
+                        buffered_deltas.append(delta)
+                    elif stream_delta_callback is not None:
+                        stream_delta_callback(delta)
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
-                        stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
+                        stream_delta_callback=(_guarded_delta if stream_delta_callback is not None else None), tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
@@ -3818,6 +3836,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     result = self._guard_stateless_commitment_response(
                         result=result, user_message=user_message, session_id=session_id or "",
                         gateway_session_key=gateway_session_key or "", profile=request_profile or "")
+                    if commitment_stream_guard and stream_delta_callback is not None:
+                        final_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
+                        original = "".join(str(delta or "") for delta in buffered_deltas)
+                        if original == final_text:
+                            for delta in buffered_deltas:
+                                stream_delta_callback(delta)
+                        elif final_text:
+                            stream_delta_callback(final_text)
                     if muted and isinstance(result, dict):
                         # Project presentation only after finishing the source outcome. Keep
                         # the agent's result, transcript, failure flags and usage intact.
