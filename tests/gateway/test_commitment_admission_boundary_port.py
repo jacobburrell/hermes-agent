@@ -50,8 +50,11 @@ class _Runner:
     def _owns_kanban_dispatcher_lock(self):
         return self._ready
 
+    def _is_user_authorized_for_source(self, source):
+        return True
+
     def _adapter_for_source(self, source):
-        return SimpleNamespace(send=lambda *a, **kw: None)
+        return SimpleNamespace(send=lambda *a, **kw: None, supports_async_delivery=True)
 
 
 def _continuing():
@@ -80,13 +83,35 @@ def test_unavailable_classifier_or_dispatcher_failure_cannot_release_promise(tem
     assert receipt is not None and not receipt.may_promise_follow_up
 
 
-def test_completed_response_is_unchanged_and_enabled_turn_suppresses_streaming():
+def test_completed_response_is_unchanged_and_disabled_stream_fixture_is_safe():
     event, source = _event()
     response, receipt = guard_final_response(
         runner=_Runner({"disposition": "completed"}), ctx=_ctx(source), event=event, response="It is done."
     )
     assert (response, receipt) == ("It is done.", None)
-    context = TurnContext(source=source, user_config=_ctx(source).user_config)
+    context = TurnContext(
+        source=source, user_config=_ctx(source).user_config,
+        resolve_display_setting=lambda *_args: False, _run_still_current=lambda: True,
+    )
     stream, delta, interim, enabled = TurnRunner(SimpleNamespace(config=None), context)._setup_stream_consumer("telegram")
     assert stream is None and delta is None and enabled is False
+    assert callable(interim)
     assert interim("not emitted") is None
+
+
+def test_quote_is_context_unless_adapter_marks_it_untrusted_authority(temp_home):
+    event, source = _event()
+    event.reply_to_text = "A colleague said the course needs approval."
+    response, receipt = guard_final_response(
+        runner=_Runner(_continuing()), ctx=_ctx(source), event=event,
+        response="I will continue the enrollment research.",
+    )
+    assert response.startswith("I will continue") and receipt and receipt.may_promise_follow_up
+
+    event, source = _event()
+    event.metadata["quote_is_untrusted_authority"] = True
+    response, receipt = guard_final_response(
+        runner=_Runner(_continuing()), ctx=_ctx(source), event=event,
+        response="I will continue the enrollment research.",
+    )
+    assert response == _SAFE_REFUSAL and receipt is not None and not receipt.may_promise_follow_up
