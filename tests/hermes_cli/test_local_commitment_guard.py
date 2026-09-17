@@ -153,6 +153,7 @@ def test_quiet_cli_fence_stamps_and_projects_persisted_promise(monkeypatch, tmp_
         row = db.get_messages("quiet")[-1]
         assert row["content"] == raw["final_response"]
         assert "will not claim" in row["display_metadata"]["local_commitment_guard"]["content"]
+        assert agent._local_commitment_turn_id is None
     finally:
         db.close()
 

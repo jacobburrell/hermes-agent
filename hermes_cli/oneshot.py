@@ -553,6 +553,7 @@ def _run_agent(
     # The try spans agent construction (not just ``chat``) so the store is always closed, even when
     # ``AIAgent(...)`` raises — the one-shot exit path hard-exits via os._exit and skips finalizers.
     agent = None
+    _local_guard_fence = None
     try:
         agent = AIAgent(
             api_key=runtime.get("api_key"),
@@ -585,7 +586,6 @@ def _run_agent(
             local_commitment_state,
         )
         _local_guard_state = local_commitment_state()
-        _local_guard_fence = None
         if _local_guard_state is not False:
             _local_guard_fence = begin_local_commitment_fence(session_db, str(resume_sid or ""), source="cli-oneshot")
             if _local_guard_fence is None:
@@ -614,6 +614,10 @@ def _run_agent(
         return (result.get("final_response") or "", result)
     finally:
         if agent is not None:
+            if _local_guard_fence is not None:
+                # Covers interruption or classifier/ledger failures after the
+                # model persisted a marked row but before normal resolution.
+                finish_local_commitment_fence(session_db, _local_guard_fence, failed=True)
             # A reused in-process agent must never stamp a later turn with a
             # finished one-shot's presentation ownership marker.
             agent._local_commitment_turn_id = None

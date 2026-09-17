@@ -4141,6 +4141,16 @@ def _single_query_exit_code(result) -> int:
     return 1
 
 
+@contextmanager
+def _clear_local_commitment_turn_marker(agent, fence):
+    """Always drop a quiet-turn persistence marker, including ``SystemExit``."""
+    try:
+        yield
+    finally:
+        if fence is not None and agent is not None:
+            agent._local_commitment_turn_id = None
+
+
 def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
@@ -4176,7 +4186,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             print(f"session_id: {cli.session_id}", file=sys.stderr)
             sys.exit(0)
         cli.agent._local_commitment_turn_id = _local_guard_fence["turn_id"]
-    with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
+    with _clear_local_commitment_turn_marker(cli.agent, _local_guard_fence), bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
