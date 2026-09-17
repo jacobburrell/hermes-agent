@@ -974,7 +974,8 @@ class TurnRunner:
         # decision so a prospective promise cannot escape first.
         try:
             from gateway.commitment_admission_boundary import admission_state
-            fence = admission_state(ctx.user_config) is not False
+            fence = (not ctx.scheduled_heartbeat and not bool(getattr(ctx.event, "internal", False))
+                     and admission_state(ctx.user_config) is not False)
         except Exception:
             fence = True
         if fence:
@@ -1017,6 +1018,8 @@ class TurnRunner:
         """
         ctx = self._ctx
         try:
+            if ctx.scheduled_heartbeat or bool(getattr(ctx.event, "internal", False)):
+                return None, True
             from gateway.commitment_admission_boundary import admission_state
             if admission_state(ctx.user_config) is False:
                 return None, True
@@ -2015,6 +2018,21 @@ class TurnRunner:
         try:
             result = self._run_conversation_with_approval(
                 agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        except Exception:
+            # This process still owns the turn, so do not wait for dead-PID
+            # reconciliation after a provider/agent exception.  Exact marked
+            # rows get a safe terminal projection; a no-row failure clears.
+            if presentation_fence is not None:
+                with suppress(Exception):
+                    db = getattr(getattr(runner, "_session_db", None), "_db", runner._session_db)
+                    row_ids = db.find_api_presentation_fence_rows(
+                        ctx.session_id, turn_id=presentation_fence["turn_id"])
+                    db.resolve_api_presentation_fence(
+                        ctx.session_id, turn_id=presentation_fence["turn_id"],
+                        fallback="I can't safely confirm a continued task from this turn yet.",
+                        assistant_row_ids=row_ids, require_exact_rows=True,
+                        presented_assistant_row_id=(row_ids[-1] if row_ids else None))
+            raise
         finally:
             # Cached agents survive turns.  Never let a later ordinary turn
             # inherit this turn's private ownership marker.
@@ -2026,14 +2044,15 @@ class TurnRunner:
         # before a continuation promise is released.
         original_response = str(result.get("final_response") or "")
         try:
-            from gateway.commitment_admission_boundary import guard_final_response
-            guarded, receipt = guard_final_response(
-                runner=runner, ctx=ctx, event=ctx.event, response=original_response)
-            if guarded != original_response:
-                result["final_response"] = guarded
-                result["response_transformed"] = True
-            if receipt is not None:
-                result["commitment_admission"] = receipt
+            if not ctx.scheduled_heartbeat and not bool(getattr(ctx.event, "internal", False)):
+                from gateway.commitment_admission_boundary import guard_final_response
+                guarded, receipt = guard_final_response(
+                    runner=runner, ctx=ctx, event=ctx.event, response=original_response)
+                if guarded != original_response:
+                    result["final_response"] = guarded
+                    result["response_transformed"] = True
+                if receipt is not None:
+                    result["commitment_admission"] = receipt
         except Exception:
             # This path is reached only after the final boundary was selected
             # for this turn.  A boundary defect must not turn into a raw
