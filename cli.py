@@ -4175,6 +4175,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             print(refusal["final_response"])
             print(f"session_id: {cli.session_id}", file=sys.stderr)
             sys.exit(0)
+        cli.agent._local_commitment_turn_id = _local_guard_fence["turn_id"]
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
@@ -4189,9 +4190,11 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 platform="cli-quiet")
             if _local_guard_fence is not None:
                 finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, result)
+                cli.agent._local_commitment_turn_id = None
         except KeyboardInterrupt:
             if _local_guard_fence is not None:
                 finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, failed=True)
+                cli.agent._local_commitment_turn_id = None
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
                 sys.exit(emitter.emit_result({"failed": True, "error": "Interrupted"}, session_id=cli.session_id or "", exit_code=130))
@@ -4200,6 +4203,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         except Exception:
             if _local_guard_fence is not None:
                 finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, failed=True)
+                cli.agent._local_commitment_turn_id = None
             raise
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.

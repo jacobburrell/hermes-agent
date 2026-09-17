@@ -590,12 +590,14 @@ def _run_agent(
             _local_guard_fence = begin_local_commitment_fence(session_db, str(resume_sid or ""), source="cli-oneshot")
             if _local_guard_fence is None:
                 return (local_commitment_refusal_result()["final_response"], local_commitment_refusal_result())
+            agent._local_commitment_turn_id = _local_guard_fence["turn_id"]
         aux_before = _auxiliary_usage(session_db, resume_sid) if ledger else {}
         try:
             result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
         except Exception:
             if _local_guard_fence is not None:
                 finish_local_commitment_fence(session_db, _local_guard_fence, failed=True)
+                agent._local_commitment_turn_id = None
             raise
         # A one-shot process has no verified durable return route.  It can
         # still return a completed answer, but must not print an unverified
@@ -605,11 +607,16 @@ def _run_agent(
             result, text=str(prompt or ""), session_id=str(resume_sid or ""), platform="cli-oneshot")
         if _local_guard_fence is not None:
             finish_local_commitment_fence(session_db, _local_guard_fence, result)
+            agent._local_commitment_turn_id = None
         if ledger:
             _attach_auxiliary_usage(result, session_db, aux_before,
                                     fallback_session_id=agent.session_id or resume_sid)
         return (result.get("final_response") or "", result)
     finally:
+        if agent is not None:
+            # A reused in-process agent must never stamp a later turn with a
+            # finished one-shot's presentation ownership marker.
+            agent._local_commitment_turn_id = None
         _close_agent(agent, session_db)
 
 

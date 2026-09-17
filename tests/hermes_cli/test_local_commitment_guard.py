@@ -130,6 +130,33 @@ def test_actual_quiet_cli_entry_prints_safe_refusal_without_rewriting_history(mo
     assert calls == []  # no fence means no model execution or history rewrite
 
 
+def test_quiet_cli_fence_stamps_and_projects_persisted_promise(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import pytest
+    import cli
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "quiet.db")
+    db.create_session("quiet", source="cli")
+    raw = _result("I will continue after this exits.")
+    agent = SimpleNamespace(session_id="quiet", _session_db=db)
+    def run_conversation(**_kwargs):
+        db.append_message("quiet", role="assistant", content=raw["final_response"], display_metadata={
+            "_local_commitment_turn_id": agent._local_commitment_turn_id,
+            "local_commitment_guard": {"turn_id": agent._local_commitment_turn_id, "content": ""}})
+        return raw
+    agent.run_conversation = run_conversation
+    monkeypatch.setattr(guard, "local_commitment_state", lambda: True)
+    monkeypatch.setattr(guard, "propose_with_auxiliary", lambda *_: CommitmentProposal(disposition="continuing"))
+    try:
+        with pytest.raises(SystemExit):
+            cli._run_quiet_single_query(SimpleNamespace(agent=agent, conversation_history=[], session_id="quiet"), "continue")
+        row = db.get_messages("quiet")[-1]
+        assert row["content"] == raw["final_response"]
+        assert "will not claim" in row["display_metadata"]["local_commitment_guard"]["content"]
+    finally:
+        db.close()
+
+
 def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch, tmp_path):
     """The production TUI invoke seam must not emit a prospective promise early."""
     from types import SimpleNamespace
