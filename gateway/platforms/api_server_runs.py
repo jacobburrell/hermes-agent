@@ -370,6 +370,10 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    commitment_presentation_db: Any = None
+    commitment_presentation_fence: Any = None
+    wrapper_cancelled: bool = False
+    worker_succeeded: bool = False
 
     @property
     def approval_session_key(self) -> str:
@@ -598,7 +602,17 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
+            run.worker_succeeded = True
         finally:
+            fence = run.commitment_presentation_fence
+            if fence is not None and (not run.worker_succeeded or run.wrapper_cancelled):
+                with suppress(Exception):
+                    _api_server._finish_commitment_presentation_fence(
+                        run.commitment_presentation_db, session_id or "", fence,
+                        fallback="I can't safely confirm a continued task from this interface right now.")
+            if fence is not None and (not run.worker_succeeded or run.wrapper_cancelled):
+                with suppress(Exception):
+                    delattr(agent, "_gateway_commitment_turn_id")
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
@@ -694,6 +708,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 **run.agent_kwargs)
             if presentation_fence is not None:
                 agent._gateway_commitment_turn_id = str(presentation_fence["turn_id"])
+                run.commitment_presentation_db = presentation_db
+                run.commitment_presentation_fence = presentation_fence
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
@@ -719,6 +735,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             _finish(status, fields, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
+        run.wrapper_cancelled = True
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
@@ -731,14 +748,14 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
-        if presentation_fence is not None:
+        if presentation_fence is not None and (agent is None or run.worker_succeeded):
             with suppress(Exception):
                 with self._profile_scope(run.request_profile):
                     self._finish_commitment_presentation_fence(
                         presentation_db, run.session_id or "", presentation_fence,
                         fallback="I can't safely confirm a continued task from this interface right now.")
         _unregister_approval_notify(run.approval_session_key)
-        if agent is not None:
+        if agent is not None and run.worker_succeeded:
             with suppress(Exception):
                 delattr(agent, "_gateway_commitment_turn_id")
         with suppress(Exception):
