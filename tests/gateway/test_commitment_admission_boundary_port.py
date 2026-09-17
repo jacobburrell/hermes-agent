@@ -224,6 +224,27 @@ def test_interrupted_gateway_fence_hides_only_its_marked_rows(temp_home):
         db.close()
 
 
+def test_dead_empty_gateway_fence_reconciles_without_hiding_later_turn(temp_home):
+    """A crash before any assistant row cannot become an indefinite broad fence."""
+    db = SessionDB()
+    try:
+        db.ensure_session("origin-session", source="gateway")
+        assert db.begin_api_presentation_fence(
+            "origin-session", turn_id="crashed-empty", source="gateway_commitment", after_row_id=0)
+        # This PID is intentionally non-existent on the local host.  The
+        # snapshot reconciliation may clear only because no marked row exists.
+        db._write_sql("UPDATE api_presentation_fences SET owner_pid=? WHERE session_id=? AND turn_id=?",
+                      (999_999_999, "origin-session", "crashed-empty"))
+        db.append_message("origin-session", "assistant", "Later independent answer.")
+        shown, pending = db.get_api_presentation_snapshot(
+            "origin-session", limit=None, offset=0, latest=False)
+        assert pending == []
+        assert [row["content"] for row in shown] == ["Later independent answer."]
+        assert [row["content"] for row in db.get_messages("origin-session")] == ["Later independent answer."]
+    finally:
+        db.close()
+
+
 def test_gateway_fence_requires_session_db_only_when_commitment_mode_is_enabled():
     """No DB is a truthful refusal for guarded work, not a regression for ordinary turns."""
     event, source = _event()
