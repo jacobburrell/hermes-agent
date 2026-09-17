@@ -511,6 +511,62 @@ class TestAgentExecution:
         mock_agent.run_conversation.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_api_stream_holds_unbacked_promise_until_guard(self, adapter, monkeypatch):
+        """No SSE callback receives prospective text before stateless classification."""
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "goals": {"commitment_admission": {"enabled": True}}})
+        monkeypatch.setattr(boundary, "_auxiliary_proposal", lambda *_args: {
+            "disposition": "continuing", "objective": "research",
+            "completion_criteria": "report", "next_action": "research"})
+        delivered, during_run = [], []
+        fake = MagicMock()
+        fake.session_prompt_tokens = fake.session_completion_tokens = fake.session_total_tokens = 0
+
+        def _run(**_kwargs):
+            callback = create.call_args.kwargs["stream_delta_callback"]
+            callback("I will report back.")
+            during_run.extend(delivered)
+            return {"final_response": "I will report back."}
+
+        fake.run_conversation.side_effect = _run
+        with patch.object(adapter, "_create_agent", return_value=fake) as create:
+            result, _ = await adapter._run_agent(
+                user_message="Research it", conversation_history=[], session_id="stream-guard",
+                stream_delta_callback=delivered.append)
+        assert during_run == []
+        assert "will not claim" in result["final_response"]
+        assert delivered == [result["final_response"]]
+
+    @pytest.mark.asyncio
+    async def test_api_stream_flushes_safe_completed_text_after_guard(self, adapter, monkeypatch):
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "goals": {"commitment_admission": {"enabled": True}}})
+        monkeypatch.setattr(boundary, "_auxiliary_proposal", lambda *_args: {"disposition": "completed"})
+        delivered, during_run = [], []
+        fake = MagicMock()
+        fake.session_prompt_tokens = fake.session_completion_tokens = fake.session_total_tokens = 0
+
+        def _run(**_kwargs):
+            create.call_args.kwargs["stream_delta_callback"]("Answer")
+            during_run.extend(delivered)
+            return {"final_response": "Answer"}
+
+        fake.run_conversation.side_effect = _run
+        with patch.object(adapter, "_create_agent", return_value=fake) as create:
+            result, _ = await adapter._run_agent(
+                user_message="Question", conversation_history=[], session_id="stream-safe",
+                stream_delta_callback=delivered.append)
+        assert during_run == []
+        assert result["final_response"] == "Answer"
+        assert delivered == ["Answer"]
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter, monkeypatch):
         # Keep this legacy result-shape test independent of a developer's
         # profile-local opt-in setting.

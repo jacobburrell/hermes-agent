@@ -642,12 +642,28 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    commitment_guard_enabled = False
+    buffered_deltas: list[Any] = []
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
             return
+        if commitment_guard_enabled:
+            buffered_deltas.append(delta)
+            return
         with suppress(Exception):
             loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=delta))
+
+    def _flush_guarded_text(result: Any) -> None:
+        """Release only text approved by the stateless final boundary."""
+        if not commitment_guard_enabled:
+            return
+        final_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
+        original = "".join(str(delta or "") for delta in buffered_deltas)
+        values = buffered_deltas if original == final_text else ([final_text] if final_text else [])
+        for delta in values:
+            with suppress(Exception):
+                run.put_event(_run_event(run_id, "message.delta", delta=delta))
 
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
@@ -662,6 +678,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
+            commitment_guard_enabled = _api_server._stateless_commitment_admission_enabled()
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
@@ -671,6 +688,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
+        with self._profile_scope(run.request_profile):
+            result = _api_server._guard_stateless_commitment_response(
+                result=result, user_message=run.user_message, session_id=run.session_id or "",
+                gateway_session_key=run.gateway_session_key or "", profile=run.request_profile or "")
+        _flush_guarded_text(result)
         status, fields = terminal_run_status(result)
         if status == "cancelled":
             _finish("cancelled", fields)
