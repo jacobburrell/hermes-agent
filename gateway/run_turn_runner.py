@@ -2006,13 +2006,26 @@ class TurnRunner:
             # being left open when pre-execution fencing fails.
             self._finish_stream_consumer(refused, [], stream_consumer)
             return refused
-        turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
-        agent, reused_cached_agent = self._resolve_turn_agent(
-            turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
-        )
-        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
-        agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
-        persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+        try:
+            turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+            agent, reused_cached_agent = self._resolve_turn_agent(
+                turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
+            )
+            self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+            agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+        except Exception:
+            if presentation_fence is not None:
+                with suppress(Exception):
+                    db = getattr(getattr(runner, "_session_db", None), "_db", runner._session_db)
+                    row_ids = db.find_api_presentation_fence_rows(ctx.session_id, turn_id=presentation_fence["turn_id"])
+                    db.resolve_api_presentation_fence(
+                        ctx.session_id, turn_id=presentation_fence["turn_id"],
+                        fallback="I can't safely confirm a continued task from this turn yet.",
+                        assistant_row_ids=row_ids, require_exact_rows=True,
+                        presented_assistant_row_id=(row_ids[-1] if row_ids else None), turn_completed=True)
+            self._finish_commitment_stream_fence(release=False)
+            raise
         if presentation_fence is not None:
             agent._gateway_commitment_turn_id = presentation_fence["turn_id"]
         try:
