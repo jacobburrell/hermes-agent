@@ -192,6 +192,15 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        # Local commitment refusal is a display-only projection.  Keep the
+        # persisted assistant content intact for model replay/cache parity,
+        # while a reopened TUI transcript cannot re-expose a promise that this
+        # surface was unable to durably deliver later.
+        _local_guard = (m.get("display_metadata") or {}).get("local_commitment_guard")
+        if role == "assistant" and isinstance(_local_guard, dict):
+            _safe_text = _local_guard.get("text")
+            if isinstance(_safe_text, str) and _safe_text.strip():
+                content_text = _safe_text
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):

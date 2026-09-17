@@ -4164,6 +4164,13 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
             )
+            # Quiet CLI terminates after this turn and has no durable callback
+            # route.  Keep its raw transcript unchanged but never print an
+            # unverified unattended-work promise.
+            from hermes_cli.local_commitment_guard import guard_local_result
+            result = guard_local_result(
+                result, text=str(effective_query or ""), session_id=str(cli.session_id or ""),
+                platform="cli-quiet")
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
@@ -4181,6 +4188,9 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 follow = cli.agent.run_conversation(
                     user_message=text, conversation_history=history, **author_kwargs,
                 )
+                follow = guard_local_result(
+                    follow, text=str(text or ""), session_id=str(cli.session_id or ""),
+                    platform="cli-quiet")
                 if isinstance(follow, dict) and follow.get("messages"):
                     history = follow["messages"]
                 # Same sync contract as the main turn: a compression rotation during a

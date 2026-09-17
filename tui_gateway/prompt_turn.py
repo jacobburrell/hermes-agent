@@ -567,12 +567,34 @@ def _invoke_agent(
     """Wire the streaming callbacks and run the conversation into ``st.result``.
     ``text`` is the turn's raw submit, matched against the row staged by prompt.submit."""
     agent = st.agent
+    # TUI sessions are durable transcripts, not authenticated return routes for
+    # unattended work.  Hold visual/audio callbacks while the optional local
+    # commitment presentation decision is pending; raw model history remains
+    # the agent's own result and is never rewritten here.
+    from hermes_cli.local_commitment_guard import (
+        guard_local_result, local_commitment_state, persist_local_commitment_exception_presentation,
+        persist_local_commitment_presentation,
+    )
+    local_guard_state = local_commitment_state()
+    _local_guard_db = getattr(agent, "_session_db", None)
+    _local_guard_session_id = str(getattr(agent, "session_id", None) or session.get("session_key") or sid)
+    _local_guard_watermark = -1
+    if local_guard_state is not False and _local_guard_db is not None:
+        try:
+            _local_guard_watermark = max((int(row.get("id") or row.get("_row_id") or 0)
+                                          for row in _local_guard_db.get_messages(_local_guard_session_id)), default=0)
+        except Exception:
+            # A missing pre-turn watermark is itself fail-closed for callbacks;
+            # the normal error path still reports the turn failure.
+            _local_guard_watermark = -1
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
     hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
 
     def _stream(delta):
+        if local_guard_state is not False:
+            return
         if getattr(agent, "_mute_notification_reply", False):
             return
         if hold is not None and isinstance(delta, str):
@@ -594,6 +616,8 @@ def _invoke_agent(
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
     # by the desktop as its own segment instead of being lost to message.complete.
     def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+        if local_guard_state is not False:
+            return
         if getattr(agent, "_mute_notification_reply", False):
             return
         _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
@@ -625,8 +649,21 @@ def _invoke_agent(
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
     try:
         from agent.notification_presentation import notification_turn, event_presentation_muted
-        with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
-            st.result = agent.run_conversation(run_message, **st.run_kwargs)
+        try:
+            with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+                st.result = agent.run_conversation(run_message, **st.run_kwargs)
+        except Exception:
+            if local_guard_state is not False and _local_guard_watermark >= 0:
+                persist_local_commitment_exception_presentation(
+                    _local_guard_db, session_id=_local_guard_session_id, after_row_id=_local_guard_watermark)
+            raise
+        st.result = guard_local_result(
+            st.result, text=str(text or ""), session_id=str(session.get("session_key") or sid),
+            platform="tui", state=local_guard_state)
+        if isinstance(st.result, dict) and st.result.get("_local_commitment_presentation_override"):
+            persist_local_commitment_presentation(
+                st.result, session_db=getattr(agent, "_session_db", None),
+                session_id=str(getattr(agent, "session_id", None) or session.get("session_key") or sid))
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).

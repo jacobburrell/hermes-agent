@@ -326,6 +326,18 @@ class CLIChatTurnMixin:
         _persist_clean_user_message = message if (turn.voice_prefix or agent_message != message) else None
         _one_turn_model_restore = getattr(self, "_pending_one_turn_model_restore", None)
         self._pending_one_turn_model_restore = None
+        # Classic CLI has a durable local transcript but no authenticated return
+        # route for a background commitment.  When that optional policy is
+        # enabled (or malformed), hold every model-facing stream until the
+        # presentation classifier has made a delivery decision.  The raw agent
+        # messages remain untouched for cache parity.
+        from hermes_cli.local_commitment_guard import guard_local_result, local_commitment_state
+        _local_guard_state = local_commitment_state()
+        _saved_stream_delta = getattr(self.agent, "stream_delta_callback", None)
+        _saved_interim = getattr(self.agent, "interim_assistant_callback", None)
+        if _local_guard_state is not False:
+            self.agent.stream_delta_callback = lambda _delta: None
+            self.agent.interim_assistant_callback = None
         try:
             from agent.notification_presentation import notification_turn
             muted = getattr(turn, "mute_notification_reply", False)
@@ -333,9 +345,12 @@ class CLIChatTurnMixin:
                 turn.result = self.agent.run_conversation(
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],
-                    stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
+                    stream_callback=None if (muted or _local_guard_state is not False) else turn.stream_callback,
                     persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
                 )
+            turn.result = guard_local_result(
+                turn.result, text=str(message or ""), session_id=str(self.session_id or ""),
+                platform="cli", state=_local_guard_state)
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                 for _key, _value in _restore.items():
@@ -356,6 +371,8 @@ class CLIChatTurnMixin:
                 "completed": False, "failed": True, "error": _summary,
             }
         finally:
+            self.agent.stream_delta_callback = _saved_stream_delta
+            self.agent.interim_assistant_callback = _saved_interim
             if _one_turn_model_restore:
                 self._restore_model_runtime_snapshot(_one_turn_model_restore)
             # Credit notices paint cleanly above the prompt here, not behind streamed output.

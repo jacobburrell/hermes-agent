@@ -582,6 +582,12 @@ def _run_agent(
 
         aux_before = _auxiliary_usage(session_db, resume_sid) if ledger else {}
         result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
+        # A one-shot process has no verified durable return route.  It can
+        # still return a completed answer, but must not print an unverified
+        # promise that work will continue after this process exits.
+        from hermes_cli.local_commitment_guard import guard_local_result
+        result = guard_local_result(
+            result, text=str(prompt or ""), session_id=str(resume_sid or ""), platform="cli-oneshot")
         if ledger:
             _attach_auxiliary_usage(result, session_db, aux_before,
                                     fallback_session_id=agent.session_id or resume_sid)
