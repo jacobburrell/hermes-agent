@@ -426,10 +426,11 @@ class SessionMessagesMixin:
                     pass
                 except PermissionError:
                     continue
-                marked = conn.execute("SELECT 1 FROM messages WHERE session_id=? AND role='assistant' AND active=1 "
-                    "AND id>? AND display_metadata LIKE ? LIMIT 1",
-                    (session_id, int(fence["after_row_id"]), f'%"_gateway_commitment_fence": "{fence["turn_id"]}"%')).fetchone()
-                if marked is None:
+                candidates = conn.execute("SELECT display_metadata FROM messages WHERE session_id=? "
+                    "AND role='assistant' AND active=1 AND id>?", (session_id, int(fence["after_row_id"]))).fetchall()
+                marked = any((self._decode_display_metadata(row["display_metadata"]) or {}).get(
+                    "_gateway_commitment_fence") == fence["turn_id"] for row in candidates)
+                if not marked:
                     conn.execute("UPDATE api_presentation_fences SET state='cleared',resolved_at=? "
                         "WHERE session_id=? AND turn_id=? AND state='pending'",
                         (time.time(), session_id, fence["turn_id"]))
@@ -437,7 +438,8 @@ class SessionMessagesMixin:
 
     def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "",
                                        assistant_row_ids: Optional[Sequence[int]] = None,
-                                       require_exact_rows: bool = False) -> bool:
+                                       require_exact_rows: bool = False,
+                                       presented_assistant_row_id: Optional[int] = None) -> bool:
         """Resolve a fence against its exact owned assistant rows.
 
         ``assistant_row_ids`` is deliberately caller-owned turn evidence, not
@@ -473,6 +475,10 @@ class SessionMessagesMixin:
                 verified = sorted(int(row["id"]) for row in rows)
                 if verified != supplied:
                     return False
+            presented = (presented_assistant_row_id if isinstance(presented_assistant_row_id, int)
+                         and not isinstance(presented_assistant_row_id, bool) else None)
+            if require_exact_rows and verified and presented not in verified:
+                return False
             if fallback:
                 if not verified and not require_exact_rows:
                     # Compatibility for callers not yet capable of durable
@@ -486,7 +492,13 @@ class SessionMessagesMixin:
                     conn.execute("INSERT OR REPLACE INTO api_presentation_overrides "
                         "(session_id,turn_id,message_id,content) VALUES (?,?,?,?)",
                         (session_id, turn_id, row_id,
-                         fallback if index == 0 else _PRESENTATION_HIDDEN))
+                         fallback if row_id == (presented or verified[0]) else _PRESENTATION_HIDDEN))
+            elif require_exact_rows and verified:
+                for row_id in verified:
+                    if row_id != presented:
+                        conn.execute("INSERT OR REPLACE INTO api_presentation_overrides "
+                            "(session_id,turn_id,message_id,content) VALUES (?,?,?,?)",
+                            (session_id, turn_id, row_id, _PRESENTATION_HIDDEN))
             return bool(conn.execute("UPDATE api_presentation_fences SET state=?,resolved_at=? "
                 "WHERE session_id=? AND turn_id=? AND state='pending'",
                 ("resolved" if fallback else "cleared", time.time(), session_id, turn_id)).rowcount)

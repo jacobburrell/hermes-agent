@@ -3764,16 +3764,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not fence:
             return
         try:
-            try:
-                row_ids = db.find_api_presentation_fence_rows(session_id, turn_id=str(fence["turn_id"]))
-                db.resolve_api_presentation_fence(
-                    session_id, turn_id=str(fence["turn_id"]), fallback=fallback,
-                    assistant_row_ids=row_ids, require_exact_rows=True)
-            except (AttributeError, TypeError):
-                # Older/test SessionDB facades do not expose exact row APIs;
-                # their caller remains conservatively fenced by the legacy
-                # snapshot projection.
-                db.resolve_api_presentation_fence(session_id, turn_id=str(fence["turn_id"]), fallback=fallback)
+            row_ids = db.find_api_presentation_fence_rows(session_id, turn_id=str(fence["turn_id"]))
+            db.resolve_api_presentation_fence(
+                session_id, turn_id=str(fence["turn_id"]), fallback=fallback,
+                assistant_row_ids=row_ids, require_exact_rows=True,
+                presented_assistant_row_id=(row_ids[-1] if row_ids else None))
         except Exception:
             # Leave the earlier pending value visible rather than exposing raw
             # text if the display-only completion record cannot be written.
