@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import socket
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -395,11 +397,43 @@ class SessionMessagesMixin:
         except (TypeError, ValueError): return False
         def _do(conn):
             conn.execute("INSERT OR IGNORE INTO api_presentation_fences "
-                "(session_id,turn_id,source,after_row_id,state,created_at) VALUES (?,?,?,?, 'pending', ?)",
-                (session_id, turn_id, source, watermark, time.time()))
+                "(session_id,turn_id,source,after_row_id,state,created_at,owner_pid,owner_host) "
+                "VALUES (?,?,?,?, 'pending', ?,?,?)",
+                (session_id, turn_id, source, watermark, time.time(), os.getpid(), socket.gethostname()))
             return conn.execute("SELECT state FROM api_presentation_fences WHERE session_id=? AND turn_id=?",
                 (session_id, turn_id)).fetchone()["state"] == "pending"
         return bool(self._execute_write(_do))
+
+    def reconcile_api_presentation_fences(self, session_id: str) -> None:
+        """Clear only provably dead, marker-empty gateway fences.
+
+        A fence whose owner is alive (or whose host cannot be verified) stays
+        fail closed.  A dead owner's marked rows remain pending and are hidden
+        by their exact ids; only the no-row crash case can safely be cleared.
+        """
+        local_host = socket.gethostname()
+        def _do(conn):
+            rows = conn.execute("SELECT turn_id,after_row_id,owner_pid,owner_host FROM api_presentation_fences "
+                "WHERE session_id=? AND state='pending' AND source='gateway_commitment'", (session_id,)).fetchall()
+            for fence in rows:
+                owner_pid, owner_host = fence["owner_pid"], fence["owner_host"]
+                if not isinstance(owner_pid, int) or owner_pid <= 0 or owner_host != local_host:
+                    continue  # foreign/unverifiable owner is fail closed
+                try:
+                    os.kill(owner_pid, 0)
+                    continue  # still live
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    continue
+                marked = conn.execute("SELECT 1 FROM messages WHERE session_id=? AND role='assistant' AND active=1 "
+                    "AND id>? AND display_metadata LIKE ? LIMIT 1",
+                    (session_id, int(fence["after_row_id"]), f'%"_gateway_commitment_fence": "{fence["turn_id"]}"%')).fetchone()
+                if marked is None:
+                    conn.execute("UPDATE api_presentation_fences SET state='cleared',resolved_at=? "
+                        "WHERE session_id=? AND turn_id=? AND state='pending'",
+                        (time.time(), session_id, fence["turn_id"]))
+        self._execute_write(_do)
 
     def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "",
                                        assistant_row_ids: Optional[Sequence[int]] = None,
@@ -480,6 +514,7 @@ class SessionMessagesMixin:
     def get_api_presentation_snapshot(self, session_id: str, *, limit: Optional[int], offset: int,
                                       latest: bool) -> Tuple[List[Dict[str, Any]], List[int]]:
         """Atomically read rows, sidecar overrides, and pending watermarks."""
+        self.reconcile_api_presentation_fences(session_id)
         with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
