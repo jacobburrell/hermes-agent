@@ -15,6 +15,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -1006,6 +1007,34 @@ class TurnRunner:
                 text, already_streamed = value
                 interim(text, already_streamed=already_streamed)
 
+    def _begin_gateway_commitment_presentation_fence(self):
+        """Create a display-only fence before a commitment-guarded model turn.
+
+        Agents can flush their own transcript rows before the gateway has made
+        the final admission decision.  This sidecar fence leaves that raw model
+        history intact while making a later client projection fail closed until
+        the outer transcript writer has recorded the safe final decision.
+        """
+        ctx = self._ctx
+        try:
+            from gateway.commitment_admission_boundary import admission_state
+            if admission_state(ctx.user_config) is False:
+                return None, True
+            session_db = getattr(self._runner, "_session_db", None)
+            db = getattr(session_db, "_db", session_db)
+            if db is None or not ctx.session_id:
+                return None, False
+            turn_id = f"gateway-commitment-{uuid.uuid4().hex}"
+            watermark = db.get_active_message_watermark(ctx.session_id)
+            if not db.begin_api_presentation_fence(
+                ctx.session_id, turn_id=turn_id, source="gateway_commitment", after_row_id=watermark,
+            ):
+                return None, False
+            return {"turn_id": turn_id, "session_id": ctx.session_id}, True
+        except Exception:
+            logger.debug("Could not create gateway commitment presentation fence", exc_info=True)
+            return None, False
+
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
     @dataclasses.dataclass
@@ -1938,6 +1967,25 @@ class TurnRunner:
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        presentation_fence, fence_ready = self._begin_gateway_commitment_presentation_fence()
+        if not fence_ready:
+            # The display fence is part of the promise boundary.  Once the
+            # feature is enabled (or its config is malformed), executing the
+            # model without it could persist a raw future-work promise that a
+            # reload later exposes.  Keep the staged user turn intact but do
+            # not start the agent.
+            self._finish_commitment_stream_fence(release=False)
+            refused = {
+                "final_response": (
+                    "I can't safely confirm a continued task from this turn yet. "
+                    "Please send the request again once task delivery is available."),
+                "messages": [], "api_calls": 0, "tools": [], "response_transformed": True,
+            }
+            # A consumer may already exist (for normal streaming or TTS).  It
+            # must be finalized with the same safe terminal text rather than
+            # being left open when pre-execution fencing fails.
+            self._finish_stream_consumer(refused, [], stream_consumer)
+            return refused
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
@@ -1967,8 +2015,18 @@ class TurnRunner:
                 "I can't safely confirm a continued task from this turn yet. "
                 "Please send the request again once task delivery is available.")
             result["response_transformed"] = True
-        self._finish_commitment_stream_fence(
-            release=not bool(result.get("response_transformed")))
+        if presentation_fence is not None:
+            # The outer transcript writer resolves this after it has either
+            # accepted the agent's persisted rows or written its own rows.
+            # Until then API/session presentation remains fail closed.
+            result["_gateway_commitment_presentation_fence"] = {
+                **presentation_fence,
+                "fallback": str(result.get("final_response") or "") if result.get("response_transformed") else "",
+            }
+        # Never replay interim/delta text: even an unchanged final response
+        # does not prove each earlier partial segment was independently safe.
+        # ``_finish_stream_consumer`` below emits the single validated final.
+        self._finish_commitment_stream_fence(release=False)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.
