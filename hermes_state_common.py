@@ -523,6 +523,28 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     expires_at REAL NOT NULL
 );
 
+-- Presentation-only API turn fences. Raw transcript rows remain model history;
+-- readers use these rows to hide an unclassified assistant tail after a crash.
+CREATE TABLE IF NOT EXISTS api_presentation_fences (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    after_row_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    resolved_at REAL,
+    PRIMARY KEY (session_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_api_presentation_fences_pending
+    ON api_presentation_fences(session_id, state, after_row_id);
+CREATE TABLE IF NOT EXISTS api_presentation_overrides (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    PRIMARY KEY (session_id, turn_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,

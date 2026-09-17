@@ -451,13 +451,43 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_presentation_fences_keep_prior_refusal_after_later_normal_turn(self, tmp_path):
+        """A normal later turn must not overwrite a prior turn's display-only refusal."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("s", "api_server")
+            db.append_message("s", "user", "first")
+            first_watermark = db.get_messages("s")[-1]["id"]
+            assert db.begin_api_presentation_fence("s", turn_id="first", source="api", after_row_id=first_watermark)
+            db.append_message("s", "assistant", "I will update you later.")
+            assert db.resolve_api_presentation_fence("s", turn_id="first", fallback="Cannot promise later follow-up.")
+            db.append_message("s", "user", "second")
+            second_watermark = db.get_messages("s")[-1]["id"]
+            assert db.begin_api_presentation_fence("s", turn_id="second", source="api", after_row_id=second_watermark)
+            db.append_message("s", "assistant", "Normal answer.")
+            assert db.resolve_api_presentation_fence("s", turn_id="second")
+            db.close()
+            db = SessionDB(db_path=tmp_path / "state.db")
+            messages, pending = db.get_api_presentation_snapshot("s", limit=None, offset=0, latest=False)
+            assert pending == []
+            assert [m["content"] for m in messages if m["role"] == "assistant"] == [
+                "Cannot promise later follow-up.", "Normal answer."]
+            assert [m["content"] for m in db.get_messages("s") if m["role"] == "assistant"] == [
+                "I will update you later.", "Normal answer."]
+        finally:
+            db.close()
+
     def test_pending_presentation_fence_hides_raw_reply_without_mutating_history(self, adapter):
         """Reload projection is fail-closed while the pre-execution fence is pending."""
         class _DB:
-            def __init__(self): self.meta = {}
+            def __init__(self): self.fences = {}
+            def ensure_session(self, *_args, **_kwargs): pass
             def get_messages(self, *_args, **_kwargs): return [{"id": 7, "role": "user", "content": "request"}]
-            def set_meta(self, key, value): self.meta[key] = value
-            def get_meta(self, key): return self.meta.get(key)
+            def begin_api_presentation_fence(self, session, *, turn_id, source, after_row_id):
+                self.fences[turn_id] = {"after_id": after_row_id, "fallback": "", "pending": True}; return True
+            def resolve_api_presentation_fence(self, session, *, turn_id, fallback=""):
+                self.fences[turn_id].update(fallback=fallback, pending=False); return True
 
         db = _DB()
         fence = adapter._begin_commitment_presentation_fence(db, "session", "turn")
@@ -465,17 +495,17 @@ class TestAgentExecution:
             {"id": 7, "role": "user", "content": "request"},
             {"id": 8, "role": "assistant", "content": "I will update you later."},
         ]
-        projected = adapter._project_commitment_presentation(db, "session", raw)
+        projected = adapter._project_commitment_presentation(raw, [fence["after_id"]])
         assert projected == [raw[0]]
         assert raw[1]["content"] == "I will update you later."
         adapter._finish_commitment_presentation_fence(
             db, "session", fence, fallback="I cannot confirm unattended follow-up here.")
-        projected = adapter._project_commitment_presentation(db, "session", raw)
-        assert projected[-1]["content"] == "I cannot confirm unattended follow-up here."
+        # The real SessionDB sidecar applies this override atomically on GET;
+        # this small fake asserts the raw row remains immutable.
         assert raw[1]["content"] == "I will update you later."
         fence2 = adapter._begin_commitment_presentation_fence(db, "session", "turn-2")
         adapter._finish_commitment_presentation_fence(db, "session", fence2)
-        assert adapter._project_commitment_presentation(db, "session", raw) == raw
+        assert adapter._project_commitment_presentation(raw, []) == raw
 
     @pytest.mark.asyncio
     async def test_enabled_api_fence_creation_failure_stops_before_model(self, adapter, monkeypatch):
