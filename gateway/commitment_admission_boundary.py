@@ -34,8 +34,26 @@ def _at(mapping: Any, *path: str, default: Any = None) -> Any:
     return current
 
 
+def admission_state(config: Any) -> Optional[bool]:
+    """Return enabled/disabled, or ``None`` for an explicit malformed stanza."""
+    if not isinstance(config, Mapping):
+        return None
+    goals = config.get("goals")
+    if goals is None:
+        return False
+    if not isinstance(goals, Mapping):
+        return None
+    settings = goals.get("commitment_admission")
+    if settings is None:
+        return False
+    if not isinstance(settings, Mapping) or not isinstance(settings.get("enabled"), bool):
+        return None
+    return bool(settings["enabled"])
+
+
 def enabled(config: Any) -> bool:
-    return bool(_at(config, "goals", "commitment_admission", "enabled", default=False))
+    """Backward-compatible bool view; callers needing fail-closed use state."""
+    return admission_state(config) is True
 
 
 def _auxiliary_proposal(message: str, response: str) -> Any:
@@ -103,8 +121,11 @@ def guard_final_response(*, runner: Any, ctx: Any, event: Any, response: str) ->
     intentionally conservative: only an explicit completed/none assessment
     or a persisted continuation can retain the draft response.
     """
-    if not enabled(getattr(ctx, "user_config", None)):
+    state = admission_state(getattr(ctx, "user_config", None))
+    if state is False:
         return response, None
+    if state is None:
+        return _SAFE_REFUSAL, None
     source = getattr(ctx, "source", None)
     if source is None or event is None or not getattr(event, "_gateway_accepted", False):
         return _SAFE_REFUSAL, None

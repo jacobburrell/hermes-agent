@@ -972,8 +972,8 @@ class TurnRunner:
         # streaming setup, but hold user-visible text/commentary until that
         # decision so a prospective promise cannot escape first.
         try:
-            from gateway.commitment_admission_boundary import enabled as _commitment_enabled
-            fence = bool(_commitment_enabled(ctx.user_config))
+            from gateway.commitment_admission_boundary import admission_state
+            fence = admission_state(ctx.user_config) is not False
         except Exception:
             fence = True
         if fence:
@@ -1960,13 +1960,13 @@ class TurnRunner:
             if receipt is not None:
                 result["commitment_admission"] = receipt
         except Exception:
-            try:
-                from gateway.commitment_admission_boundary import enabled as _enabled, _SAFE_REFUSAL
-                if _enabled(ctx.user_config):
-                    result["final_response"] = _SAFE_REFUSAL
-                    result["response_transformed"] = True
-            except Exception:
-                pass
+            # This path is reached only after the final boundary was selected
+            # for this turn.  A boundary defect must not turn into a raw
+            # promise leak; the stream fence is discarded below.
+            result["final_response"] = (
+                "I can't safely confirm a continued task from this turn yet. "
+                "Please send the request again once task delivery is available.")
+            result["response_transformed"] = True
         self._finish_commitment_stream_fence(
             release=not bool(result.get("response_transformed")))
         self._finish_stream_consumer(result, agent_history, stream_consumer)
