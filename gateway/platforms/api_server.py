@@ -2971,6 +2971,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         limit = 500 if default_page else min(requested_limit, 500)
         messages = await asyncio.to_thread(
             db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page)
+        messages = await asyncio.to_thread(self._project_commitment_presentation, db, resolved_id, messages)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
@@ -3735,14 +3736,77 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return guarded
 
     @staticmethod
-    def _stateless_commitment_admission_enabled() -> bool:
-        """Read the opt-in flag in the request's already-selected profile scope."""
+    def _commitment_presentation_fence_key(session_id: str) -> str:
+        return "api_commitment_presentation:" + hashlib.sha256(session_id.encode()).hexdigest()
+
+    def _begin_commitment_presentation_fence(self, db: Any, session_id: str, turn_id: str) -> Optional[dict]:
+        """Durably fence API presentation before the model can append an assistant row.
+
+        This uses the existing SessionDB meta store, not the model transcript.  A
+        pending fence is deliberately conservative on reload: assistant rows
+        after its pre-turn watermark are withheld until the turn classifies.
+        """
+        if not session_id:
+            return None
+        try:
+            rows = db.get_messages(session_id, latest=True, limit=1)
+            watermark = int(rows[-1].get("id") or 0) if rows else 0
+            fence = {"turn_id": turn_id, "after_id": watermark, "state": "pending", "fallback": ""}
+            db.set_meta(self._commitment_presentation_fence_key(session_id), json.dumps(fence, sort_keys=True))
+            return fence
+        except Exception:
+            logger.warning("could not create stateless commitment presentation fence", exc_info=True)
+            return None
+
+    def _finish_commitment_presentation_fence(
+        self, db: Any, session_id: str, fence: Optional[dict], *, fallback: str = ""
+    ) -> None:
+        if not fence:
+            return
+        try:
+            finished = dict(fence)
+            finished["state"] = "resolved" if fallback else "cleared"
+            finished["fallback"] = fallback
+            db.set_meta(self._commitment_presentation_fence_key(session_id), json.dumps(finished, sort_keys=True))
+        except Exception:
+            # Leave the earlier pending value visible rather than exposing raw
+            # text if the display-only completion record cannot be written.
+            logger.warning("could not resolve stateless commitment presentation fence", exc_info=True)
+
+    def _project_commitment_presentation(self, db: Any, session_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Project, never mutate, assistant rows protected by one session fence."""
+        try:
+            raw = db.get_meta(self._commitment_presentation_fence_key(session_id))
+            fence = json.loads(raw) if raw else None
+            if not isinstance(fence, dict) or fence.get("state") not in {"pending", "resolved"}:
+                return messages
+            after_id = int(fence.get("after_id") or 0)
+            fallback = str(fence.get("fallback") or "") if fence.get("state") == "resolved" else ""
+            out: List[Dict[str, Any]] = []
+            replaced = False
+            for message in messages:
+                if message.get("role") != "assistant" or int(message.get("id") or 0) <= after_id:
+                    out.append(message)
+                elif fallback and not replaced:
+                    safe = dict(message)
+                    safe["content"] = fallback
+                    out.append(safe)
+                    replaced = True
+                # Pending and later raw assistant rows are intentionally hidden.
+            return out
+        except Exception:
+            # Read failures cannot prove the raw assistant output was classified.
+            return [m for m in messages if m.get("role") != "assistant"]
+
+    @staticmethod
+    def _stateless_commitment_admission_enabled() -> Optional[bool]:
+        """Read opt-in state; ``None`` is a fail-closed configuration error."""
         try:
             from hermes_cli.config import cfg_get, load_config
             settings = cfg_get(load_config(), "goals", "commitment_admission", default={})
             return isinstance(settings, dict) and bool(settings.get("enabled", False))
         except Exception:
-            return False
+            return None
 
     async def _run_agent(
         self, user_message: str, conversation_history: List[Dict[str, str]],
@@ -3783,8 +3847,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
-                commitment_stream_guard = self._stateless_commitment_admission_enabled()
+                commitment_stream_guard = self._stateless_commitment_admission_enabled() is not False
                 buffered_deltas: list[Any] = []
+                presentation_db = self._ensure_session_db() if commitment_stream_guard else None
+                presentation_fence = self._begin_commitment_presentation_fence(
+                    presentation_db, session_id or "", uuid.uuid4().hex) if presentation_db is not None else None
+                if commitment_stream_guard and presentation_fence is None:
+                    # A guard without a durable pre-execution presentation
+                    # fence cannot safely expose a streamed or reloaded reply.
+                    return ({"final_response": (
+                        "I can't safely verify a continued task from this interface right now."),
+                             "messages": [], "api_calls": 0, "tools": []},
+                            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
 
                 def _guarded_delta(delta: Any) -> None:
                     if commitment_stream_guard:
@@ -3833,11 +3907,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     result, usage = self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
+                    original_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
                     result = self._guard_stateless_commitment_response(
                         result=result, user_message=user_message, session_id=session_id or "",
                         gateway_session_key=gateway_session_key or "", profile=request_profile or "")
+                    final_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
+                    self._finish_commitment_presentation_fence(
+                        presentation_db, session_id or "", presentation_fence,
+                        fallback=final_text if final_text != original_text else "")
                     if commitment_stream_guard and stream_delta_callback is not None:
-                        final_text = str(result.get("final_response") or "") if isinstance(result, dict) else ""
                         original = "".join(str(delta or "") for delta in buffered_deltas)
                         if original == final_text:
                             for delta in buffered_deltas:
