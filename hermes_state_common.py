@@ -533,6 +533,8 @@ CREATE TABLE IF NOT EXISTS api_presentation_fences (
     state TEXT NOT NULL,
     created_at REAL NOT NULL,
     resolved_at REAL,
+    owner_pid INTEGER,
+    owner_host TEXT,
     PRIMARY KEY (session_id, turn_id)
 );
 CREATE INDEX IF NOT EXISTS idx_api_presentation_fences_pending
