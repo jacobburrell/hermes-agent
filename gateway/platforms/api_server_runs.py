@@ -678,7 +678,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
-            commitment_guard_enabled = _api_server._stateless_commitment_admission_enabled()
+            commitment_guard_enabled = self._stateless_commitment_admission_enabled()
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
@@ -689,7 +689,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         with self._profile_scope(run.request_profile):
-            result = _api_server._guard_stateless_commitment_response(
+            result = self._guard_stateless_commitment_response(
                 result=result, user_message=run.user_message, session_id=run.session_id or "",
                 gateway_session_key=run.gateway_session_key or "", profile=run.request_profile or "")
         _flush_guarded_text(result)
