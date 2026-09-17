@@ -68,7 +68,7 @@ class CommitmentAdmission:
 
     @property
     def may_promise_follow_up(self) -> bool:
-        return self.disposition == "continuing" and self.persisted and self.delivery_ready
+        return self.disposition in {"continuing", "waiting"} and self.persisted and self.delivery_ready
 
 
 def normalize_proposal(raw: Any) -> CommitmentProposal:
