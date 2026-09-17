@@ -265,6 +265,37 @@ def test_dead_empty_gateway_fence_reconciles_without_hiding_later_turn(temp_home
         db.close()
 
 
+def test_cancelled_wrapper_keeps_late_worker_promise_fenced_until_worker_finishes(temp_home):
+    """Model the /v1/runs race: wrapper cancellation cannot expose late worker output."""
+    db = SessionDB()
+    try:
+        db.ensure_session("origin-session", source="api_server")
+        assert db.begin_api_presentation_fence(
+            "origin-session", turn_id="run-cancelled", source="gateway_commitment", after_row_id=0)
+        # The async wrapper is gone, but the synchronous worker is still
+        # blocked: its durable marker keeps this future promise fenced.
+        db.append_message("origin-session", "assistant", "I will finish this later.",
+                          display_metadata={"_gateway_commitment_fence": "run-cancelled"})
+        shown, pending = db.get_api_presentation_snapshot(
+            "origin-session", limit=None, offset=0, latest=False)
+        from gateway.platforms.api_server import APIServerAdapter
+        assert APIServerAdapter._project_commitment_presentation(SimpleNamespace(), shown, pending) == []
+        ids = db.find_api_presentation_fence_rows("origin-session", turn_id="run-cancelled")
+        assert db.resolve_api_presentation_fence(
+            "origin-session", turn_id="run-cancelled",
+            fallback="I can't safely confirm a continued task from this interface right now.",
+            assistant_row_ids=ids, require_exact_rows=True,
+            presented_assistant_row_id=ids[-1], turn_completed=True)
+        shown, pending = db.get_api_presentation_snapshot(
+            "origin-session", limit=None, offset=0, latest=False)
+        assert pending == []
+        assert [row["content"] for row in shown] == [
+            "I can't safely confirm a continued task from this interface right now."]
+        assert [row["content"] for row in db.get_messages("origin-session")] == ["I will finish this later."]
+    finally:
+        db.close()
+
+
 def test_gateway_fence_requires_session_db_only_when_commitment_mode_is_enabled():
     """No DB is a truthful refusal for guarded work, not a regression for ordinary turns."""
     event, source = _event()
