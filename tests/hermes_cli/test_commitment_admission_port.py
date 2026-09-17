@@ -9,6 +9,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kb_connect
 from hermes_cli import kanban_db_notify as kb_notify
 from hermes_cli.commitment_admission import (
+    CommitmentAttachment,
     CommitmentContext,
     CommitmentProposal,
     KanbanCommitmentStore,
@@ -86,6 +87,46 @@ def test_current_split_kanban_store_stages_subscribes_promotes_and_replays(isola
         assert [(s["platform"], s["chat_id"], s["thread_id"]) for s in subscriptions] == [
             ("test", "chat-1", "thread-1")
         ]
+    finally:
+        conn.close()
+
+
+def test_replay_does_not_resume_an_operator_blocked_task_and_keeps_execution_session_separate(isolated_kanban):
+    store = KanbanCommitmentStore(assignee="jack", created_by="jackwhatsapp")
+    first = admit_commitment(_context(session_id="origin-session"), _proposal(), store)
+    conn = kb_connect.connect()
+    try:
+        assert kb.block_task(conn, first.task_id, reason="need operator approval", kind="needs_input")
+    finally:
+        conn.close()
+
+    replay = admit_commitment(_context(session_id="origin-session"), _proposal(), store)
+    assert replay.task_id == first.task_id
+    assert not replay.may_promise_follow_up
+    conn = kb_connect.connect()
+    try:
+        row = conn.execute("SELECT status, session_id FROM tasks WHERE id = ?", (first.task_id,)).fetchone()
+        assert row["status"] == "blocked"
+        assert row["session_id"] != "origin-session"
+        assert row["session_id"].startswith("commitment:")
+    finally:
+        conn.close()
+
+
+def test_attachment_bytes_are_copied_and_missing_refs_are_manifested(isolated_kanban):
+    attachment = CommitmentAttachment(
+        reference="transport:file-1", filename="notes.txt", content_type="text/plain", data=b"durable bytes",
+    )
+    result = admit_commitment(_context(attachment_refs=(attachment, "transport:missing")), _proposal(),
+                              KanbanCommitmentStore(assignee="jack", created_by="jackwhatsapp"))
+    assert result.may_promise_follow_up
+    conn = kb_connect.connect()
+    try:
+        attachments = kb.list_attachments(conn, result.task_id)
+        assert len(attachments) == 1
+        assert Path(attachments[0].stored_path).read_bytes() == b"durable bytes"
+        body = conn.execute("SELECT body FROM tasks WHERE id = ?", (result.task_id,)).fetchone()["body"]
+        assert '"state": "missing"' in body
     finally:
         conn.close()
 
