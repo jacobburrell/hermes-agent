@@ -3764,17 +3764,39 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not fence:
             return
         try:
-            db.resolve_api_presentation_fence(session_id, turn_id=str(fence["turn_id"]), fallback=fallback)
+            try:
+                row_ids = db.find_api_presentation_fence_rows(session_id, turn_id=str(fence["turn_id"]))
+                db.resolve_api_presentation_fence(
+                    session_id, turn_id=str(fence["turn_id"]), fallback=fallback,
+                    assistant_row_ids=row_ids, require_exact_rows=True)
+            except (AttributeError, TypeError):
+                # Older/test SessionDB facades do not expose exact row APIs;
+                # their caller remains conservatively fenced by the legacy
+                # snapshot projection.
+                db.resolve_api_presentation_fence(session_id, turn_id=str(fence["turn_id"]), fallback=fallback)
         except Exception:
             # Leave the earlier pending value visible rather than exposing raw
             # text if the display-only completion record cannot be written.
             logger.warning("could not resolve stateless commitment presentation fence", exc_info=True)
 
-    def _project_commitment_presentation(self, messages: List[Dict[str, Any]], pending_fences: List[int]) -> List[Dict[str, Any]]:
+    def _project_commitment_presentation(self, messages: List[Dict[str, Any]], pending_fences: List[Any]) -> List[Dict[str, Any]]:
         """Project, never mutate, assistant rows protected by one session fence."""
         try:
+            hidden = set()
+            broad_marks = []
+            for fence in pending_fences:
+                if isinstance(fence, dict):
+                    ids = fence.get("row_ids")
+                    if isinstance(ids, list) and ids:
+                        hidden.update(int(row_id) for row_id in ids if isinstance(row_id, int))
+                    else:
+                        broad_marks.append(int(fence.get("after_row_id") or 0))
+                else:
+                    broad_marks.append(int(fence))
             return [message for message in messages if not (
-                message.get("role") == "assistant" and any(int(message.get("id") or 0) > mark for mark in pending_fences))]
+                message.get("role") == "assistant" and (
+                    int(message.get("id") or 0) in hidden
+                    or any(int(message.get("id") or 0) > mark for mark in broad_marks)))]
         except Exception:
             # Read failures cannot prove the raw assistant output was classified.
             return [m for m in messages if m.get("role") != "assistant"]
@@ -3854,6 +3876,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                    if presentation_fence is not None:
+                        agent._gateway_commitment_turn_id = str(presentation_fence["turn_id"])
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
@@ -3930,6 +3954,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
+                        with suppress(Exception):
+                            delattr(agent, "_gateway_commitment_turn_id")
                         _clear_turn_process_ownership(agent)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                         # Bind the declared key to the row the turn actually ended on

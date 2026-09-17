@@ -170,6 +170,14 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     ):
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
+    display_metadata = msg.get("display_metadata")
+    # Gateway commitment admission owns a durable display-only fence for this
+    # exact turn.  Stamp only assistant rows while the gateway has explicitly
+    # scoped the agent; this private marker never reaches provider messages.
+    fence_turn_id = getattr(agent, "_gateway_commitment_turn_id", None)
+    if role == "assistant" and isinstance(fence_turn_id, str) and fence_turn_id:
+        display_metadata = dict(display_metadata) if isinstance(display_metadata, dict) else {}
+        display_metadata["_gateway_commitment_fence"] = fence_turn_id
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
@@ -177,7 +185,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": display_metadata,
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
     }
     if isinstance(msg.get("_row_id"), int):
