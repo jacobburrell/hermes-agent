@@ -439,7 +439,8 @@ class SessionMessagesMixin:
     def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str, fallback: str = "",
                                        assistant_row_ids: Optional[Sequence[int]] = None,
                                        require_exact_rows: bool = False,
-                                       presented_assistant_row_id: Optional[int] = None) -> bool:
+                                       presented_assistant_row_id: Optional[int] = None,
+                                       turn_completed: bool = False) -> bool:
         """Resolve a fence against its exact owned assistant rows.
 
         ``assistant_row_ids`` is deliberately caller-owned turn evidence, not
@@ -457,7 +458,7 @@ class SessionMessagesMixin:
             fence = conn.execute("SELECT after_row_id FROM api_presentation_fences "
                 "WHERE session_id=? AND turn_id=? AND state='pending'", (session_id, turn_id)).fetchone()
             if fence is None: return False
-            if require_exact_rows and not supplied:
+            if require_exact_rows and not supplied and not turn_completed:
                 # A provider failure may produce no assistant rows at all. It
                 # is then safe to clear; any unowned assistant row means we
                 # cannot prove this fence owns it, so keep presentation held.
