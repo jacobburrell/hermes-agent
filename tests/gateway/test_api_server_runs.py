@@ -155,6 +155,39 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_run_worker_exception_resolves_real_presentation_fence(self, tmp_path, monkeypatch):
+        """The executor worker, not its cancelled wrapper, closes a real run fence."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from hermes_cli import config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "goals": {"commitment_admission": {"enabled": True}}})
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            fake = MagicMock()
+            fake.session_prompt_tokens = fake.session_completion_tokens = fake.session_total_tokens = 0
+            def _raise(**_kwargs):
+                db = adapter._ensure_session_db()
+                db.append_message("run-fence", "assistant", "I will update you later.",
+                    display_metadata={"_gateway_commitment_fence": fake._gateway_commitment_turn_id})
+                raise RuntimeError("worker failed")
+            fake.run_conversation.side_effect = _raise
+            with patch.object(adapter, "_create_agent", return_value=fake):
+                response = await cli.post("/v1/runs", json={"input": "work", "session_id": "run-fence"})
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.02)
+        db = adapter._ensure_session_db()
+        shown, pending = db.get_api_presentation_snapshot("run-fence", limit=None, offset=0, latest=False)
+        assert pending == []
+        assert [row["content"] for row in shown] == [
+            "I can't safely confirm a continued task from this interface right now."]
+        assert [row["content"] for row in db.get_messages("run-fence")] == ["I will update you later."]
+
+    @pytest.mark.asyncio
     async def test_run_stream_holds_stateless_future_promise_until_guard(self, adapter, monkeypatch):
         """/v1/runs has its own lifecycle, so it must not bypass the text fence."""
         from hermes_cli import config as hermes_config
