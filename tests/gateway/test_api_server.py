@@ -451,6 +451,45 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_pending_presentation_fence_hides_raw_reply_without_mutating_history(self, adapter):
+        """Reload projection is fail-closed while the pre-execution fence is pending."""
+        class _DB:
+            def __init__(self): self.meta = {}
+            def get_messages(self, *_args, **_kwargs): return [{"id": 7, "role": "user", "content": "request"}]
+            def set_meta(self, key, value): self.meta[key] = value
+            def get_meta(self, key): return self.meta.get(key)
+
+        db = _DB()
+        fence = adapter._begin_commitment_presentation_fence(db, "session", "turn")
+        raw = [
+            {"id": 7, "role": "user", "content": "request"},
+            {"id": 8, "role": "assistant", "content": "I will update you later."},
+        ]
+        projected = adapter._project_commitment_presentation(db, "session", raw)
+        assert projected == [raw[0]]
+        assert raw[1]["content"] == "I will update you later."
+        adapter._finish_commitment_presentation_fence(
+            db, "session", fence, fallback="I cannot confirm unattended follow-up here.")
+        projected = adapter._project_commitment_presentation(db, "session", raw)
+        assert projected[-1]["content"] == "I cannot confirm unattended follow-up here."
+        assert raw[1]["content"] == "I will update you later."
+        fence2 = adapter._begin_commitment_presentation_fence(db, "session", "turn-2")
+        adapter._finish_commitment_presentation_fence(db, "session", fence2)
+        assert adapter._project_commitment_presentation(db, "session", raw) == raw
+
+    @pytest.mark.asyncio
+    async def test_enabled_api_fence_creation_failure_stops_before_model(self, adapter, monkeypatch):
+        from hermes_cli import config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "goals": {"commitment_admission": {"enabled": True}}})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        create = MagicMock()
+        monkeypatch.setattr(adapter, "_create_agent", create)
+        result, _ = await adapter._run_agent(
+            user_message="continue", conversation_history=[], session_id="fence-failure")
+        assert "can't safely verify" in result["final_response"]
+        create.assert_not_called()
+
     def test_stateless_commitment_guard_refuses_unsaveable_follow_up(self, adapter, monkeypatch):
         """The API can authenticate a request but cannot attest a later push route."""
         from hermes_cli import config as hermes_config
@@ -486,6 +525,16 @@ class TestAgentExecution:
             result=original, user_message="What is the answer?", session_id="api-session",
             gateway_session_key="", profile="jack",
         ) is original
+
+    def test_stateless_commitment_config_failure_is_fail_closed(self, adapter, monkeypatch):
+        from hermes_cli import config as hermes_config
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: (_ for _ in ()).throw(RuntimeError("bad config")))
+        assert adapter._stateless_commitment_admission_enabled() is None
+        guarded = adapter._guard_stateless_commitment_response(
+            result={"final_response": "I will update you later."}, user_message="work on it",
+            session_id="api-session", gateway_session_key="", profile="jack")
+        assert "will not claim" in guarded["final_response"]
 
     @pytest.mark.asyncio
     async def test_api_run_agent_applies_stateless_guard_before_return(self, adapter, monkeypatch):

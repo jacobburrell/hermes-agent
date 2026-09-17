@@ -678,7 +678,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
-            commitment_guard_enabled = self._stateless_commitment_admission_enabled()
+            commitment_guard_enabled = self._stateless_commitment_admission_enabled() is not False
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
