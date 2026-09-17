@@ -607,7 +607,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             fence = run.commitment_presentation_fence
             if fence is not None and (not run.worker_succeeded or run.wrapper_cancelled):
                 with suppress(Exception):
-                    _api_server._finish_commitment_presentation_fence(
+                    self._finish_commitment_presentation_fence(
                         run.commitment_presentation_db, session_id or "", fence,
                         fallback="I can't safely confirm a continued task from this interface right now.")
             if fence is not None and (not run.worker_succeeded or run.wrapper_cancelled):
