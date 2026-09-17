@@ -170,6 +170,16 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     ):
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
+    display_metadata = msg.get("display_metadata")
+    turn_marker = getattr(agent, "_local_commitment_turn_id", None)
+    if role == "assistant" and isinstance(turn_marker, str) and turn_marker:
+        display_metadata = {
+            **(display_metadata or {}), "_local_commitment_turn_id": turn_marker,
+            # Pending fence projection is embedded in the same row write: a
+            # crash after persistence cannot make raw future-work text visible
+            # before the resolver records its terminal display decision.
+            "local_commitment_guard": {"turn_id": turn_marker, "content": ""},
+        }
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
@@ -177,7 +187,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": display_metadata,
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
     }
     if isinstance(msg.get("_row_id"), int):

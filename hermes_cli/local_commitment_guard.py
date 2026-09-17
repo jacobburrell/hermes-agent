@@ -88,7 +88,8 @@ def finish_local_commitment_fence(session_db: Any, fence: Any, result: Any = Non
     # A classifier failure/exception must never clear an unvalidated row.
     content = override if isinstance(override, str) and override else (_VERIFY if failed else None)
     try:
-        row_ids = session_db.assistant_message_ids_after(session_id, int(fence.get("after_row_id") or 0))
+        row_ids = session_db.assistant_message_ids_for_presentation_fence(
+            session_id, turn_id=turn_id, after_row_id=int(fence.get("after_row_id") or 0))
         return bool(session_db.resolve_api_presentation_fence(
             session_id, turn_id=turn_id, presentation_key=_PRESENTATION_KEY,
             terminal_content=content, assistant_row_ids=row_ids))

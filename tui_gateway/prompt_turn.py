@@ -585,6 +585,7 @@ def _invoke_agent(
         if _local_guard_fence is None:
             st.result = local_commitment_refusal_result()
             return
+        agent._local_commitment_turn_id = _local_guard_fence["turn_id"]
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
@@ -664,6 +665,8 @@ def _invoke_agent(
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
         _usage_thread.join()
+        if _local_guard_fence is not None:
+            agent._local_commitment_turn_id = None
 
 
 def _absorb_turn_result(

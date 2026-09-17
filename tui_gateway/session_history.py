@@ -199,7 +199,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         _local_guard = (m.get("display_metadata") or {}).get("local_commitment_guard")
         if role == "assistant" and isinstance(_local_guard, dict):
             _safe_text = _local_guard.get("text", _local_guard.get("content"))
-            if isinstance(_safe_text, str) and _safe_text.strip():
+            if isinstance(_safe_text, str):
+                if not _safe_text:
+                    continue
                 content_text = _safe_text
         if _is_display_hidden_marker(role, content_text):
             continue

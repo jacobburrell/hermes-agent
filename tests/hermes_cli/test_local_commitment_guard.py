@@ -61,6 +61,19 @@ def test_tui_reload_projects_local_guard_without_rewriting_raw_content(monkeypat
     assert history[0]["content"] == raw
 
 
+def test_tui_projection_hides_empty_guarded_interim_and_keeps_terminal(monkeypatch):
+    import tui_gateway.session_history as history_mod
+    monkeypatch.setattr(history_mod, "project_compaction_message_for_display", lambda row: row, raising=False)
+    rendered = history_mod._history_to_messages([
+        {"role": "assistant", "content": "promise interim",
+         "display_metadata": {"local_commitment_guard": {"content": ""}}},
+        {"role": "assistant", "content": "promise final",
+         "display_metadata": {"local_commitment_guard": {"content": "Safe terminal."}}},
+    ])
+    assert rendered == [{"role": "assistant", "text": "Safe terminal.",
+                         "display_metadata": {"local_commitment_guard": {"content": "Safe terminal."}}}]
+
+
 def test_cli_resume_projects_fenced_content_without_mutating_raw_history():
     from hermes_cli.cli_agent_setup_mixin import _collect_resume_entries
     history = [{"role": "assistant", "content": "I will continue unattended.",
@@ -68,6 +81,29 @@ def test_cli_resume_projects_fenced_content_without_mutating_raw_history():
     entries, _idx, _full = _collect_resume_entries(history, {}, lambda text: text)
     assert entries == [("assistant", "Safe local reply.")]
     assert history[0]["content"] == "I will continue unattended."
+
+
+def test_overlapping_fences_resolve_only_marker_owned_rows(tmp_path):
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "overlap.db")
+    try:
+        db.create_session("s", source="tui")
+        first = guard.begin_local_commitment_fence(db, "s", source="tui")
+        db.append_message("s", role="assistant", content="first raw", display_metadata={
+            "_local_commitment_turn_id": first["turn_id"],
+            "local_commitment_guard": {"turn_id": first["turn_id"], "content": ""}})
+        second = guard.begin_local_commitment_fence(db, "s", source="tui")
+        db.append_message("s", role="assistant", content="second raw", display_metadata={
+            "_local_commitment_turn_id": second["turn_id"],
+            "local_commitment_guard": {"turn_id": second["turn_id"], "content": ""}})
+        assert guard.finish_local_commitment_fence(
+            db, first, {"_local_commitment_presentation_override": "safe first"})
+        rows = db.get_messages("s")
+        assert rows[0]["content"] == "first raw"
+        assert rows[0]["display_metadata"]["local_commitment_guard"]["content"] == "safe first"
+        assert rows[1]["display_metadata"]["local_commitment_guard"]["content"] == ""
+    finally:
+        db.close()
 
 
 def test_actual_quiet_cli_entry_prints_safe_refusal_without_rewriting_history(monkeypatch, capsys):
@@ -117,7 +153,8 @@ def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch
     def run_conversation(_message, **kwargs):
         kwargs["stream_callback"]("I will keep working later.")
         agent.interim_assistant_callback("I will keep working later.")
-        db.append_message("tui-session", role="assistant", content=raw["final_response"])
+        db.append_message("tui-session", role="assistant", content=raw["final_response"],
+                          display_metadata={"_local_commitment_turn_id": agent._local_commitment_turn_id})
         return raw
 
     agent = SimpleNamespace(run_conversation=run_conversation, _mute_notification_reply=False,
@@ -159,7 +196,8 @@ def test_actual_tui_invoke_exception_projects_late_partial_reply(monkeypatch, tm
     db = SessionDB(tmp_path / "exception.db")
     db.create_session("s", source="tui")
     def boom(_message, **_kwargs):
-        db.append_message("s", role="assistant", content="I will continue later.")
+        db.append_message("s", role="assistant", content="I will continue later.",
+                          display_metadata={"_local_commitment_turn_id": agent._local_commitment_turn_id})
         raise RuntimeError("provider interrupted")
 
     agent = SimpleNamespace(run_conversation=boom, _mute_notification_reply=False, _session_db=db, session_id="s")
@@ -200,7 +238,8 @@ def test_actual_interactive_cli_agent_thread_holds_stream_and_refuses(monkeypatc
         callback = getattr(cli.agent, "stream_delta_callback", None)
         if callback:
             callback("I will keep working later.")
-        db.append_message("cli-session", role="assistant", content=raw["final_response"])
+        db.append_message("cli-session", role="assistant", content=raw["final_response"],
+                          display_metadata={"_local_commitment_turn_id": cli.agent._local_commitment_turn_id})
         return raw
 
     cli = HermesCLI.__new__(HermesCLI)

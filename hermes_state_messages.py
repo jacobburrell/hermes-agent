@@ -447,11 +447,13 @@ class SessionMessagesMixin:
             return True
         return bool(self._execute_write(_do))
 
-    def assistant_message_ids_after(self, session_id: str, after_row_id: int) -> List[int]:
-        """Return concrete assistant ids after a fence watermark for a serialized local turn."""
-        rows = self._read_all("SELECT id FROM messages WHERE session_id=? AND role='assistant' "
+    def assistant_message_ids_for_presentation_fence(self, session_id: str, *, turn_id: str,
+                                                      after_row_id: int) -> List[int]:
+        """Return only assistant rows durably stamped for this exact local turn."""
+        rows = self._read_all("SELECT id,display_metadata FROM messages WHERE session_id=? AND role='assistant' "
                               "AND active=1 AND id>? ORDER BY id", (session_id, int(after_row_id)))
-        return [int(row["id"]) for row in rows]
+        return [int(row["id"]) for row in rows
+                if (self._decode_display_metadata(row["display_metadata"]) or {}).get("_local_commitment_turn_id") == turn_id]
 
     def _reaction_list(self, meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""

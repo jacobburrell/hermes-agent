@@ -345,6 +345,7 @@ class CLIChatTurnMixin:
             if _local_guard_fence is None:
                 turn.result = local_commitment_refusal_result()
                 return
+            self.agent._local_commitment_turn_id = _local_guard_fence["turn_id"]
             self.agent.stream_delta_callback = lambda _delta: None
             self.agent.interim_assistant_callback = None
         try:
@@ -384,6 +385,8 @@ class CLIChatTurnMixin:
             if _local_guard_fence is not None:
                 finish_local_commitment_fence(getattr(self.agent, "_session_db", None), _local_guard_fence, failed=True)
         finally:
+            if _local_guard_fence is not None:
+                self.agent._local_commitment_turn_id = None
             self.agent.stream_delta_callback = _saved_stream_delta
             self.agent.interim_assistant_callback = _saved_interim
             if _one_turn_model_restore:
