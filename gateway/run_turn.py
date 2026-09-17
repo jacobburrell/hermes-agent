@@ -2110,7 +2110,7 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
-                message_type=event.message_type,
+                message_type=event.message_type, event=event,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -4102,7 +4102,7 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4139,7 +4139,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
-            scheduled_heartbeat=scheduled_heartbeat,
+            scheduled_heartbeat=scheduled_heartbeat, event=event,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
