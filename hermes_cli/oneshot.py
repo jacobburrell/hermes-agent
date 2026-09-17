@@ -580,14 +580,31 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
+        from hermes_cli.local_commitment_guard import (
+            begin_local_commitment_fence, finish_local_commitment_fence, local_commitment_refusal_result,
+            local_commitment_state,
+        )
+        _local_guard_state = local_commitment_state()
+        _local_guard_fence = None
+        if _local_guard_state is not False:
+            _local_guard_fence = begin_local_commitment_fence(session_db, str(resume_sid or ""), source="cli-oneshot")
+            if _local_guard_fence is None:
+                return (local_commitment_refusal_result()["final_response"], local_commitment_refusal_result())
         aux_before = _auxiliary_usage(session_db, resume_sid) if ledger else {}
-        result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
+        try:
+            result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
+        except Exception:
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(session_db, _local_guard_fence, failed=True)
+            raise
         # A one-shot process has no verified durable return route.  It can
         # still return a completed answer, but must not print an unverified
         # promise that work will continue after this process exits.
         from hermes_cli.local_commitment_guard import guard_local_result
         result = guard_local_result(
             result, text=str(prompt or ""), session_id=str(resume_sid or ""), platform="cli-oneshot")
+        if _local_guard_fence is not None:
+            finish_local_commitment_fence(session_db, _local_guard_fence, result)
         if ledger:
             _attach_auxiliary_usage(result, session_db, aux_before,
                                     fallback_session_id=agent.session_id or resume_sid)

@@ -61,6 +61,15 @@ def test_tui_reload_projects_local_guard_without_rewriting_raw_content(monkeypat
     assert history[0]["content"] == raw
 
 
+def test_cli_resume_projects_fenced_content_without_mutating_raw_history():
+    from hermes_cli.cli_agent_setup_mixin import _collect_resume_entries
+    history = [{"role": "assistant", "content": "I will continue unattended.",
+                "display_metadata": {"local_commitment_guard": {"content": "Safe local reply."}}}]
+    entries, _idx, _full = _collect_resume_entries(history, {}, lambda text: text)
+    assert entries == [("assistant", "Safe local reply.")]
+    assert history[0]["content"] == "I will continue unattended."
+
+
 def test_actual_quiet_cli_entry_prints_safe_refusal_without_rewriting_history(monkeypatch, capsys):
     """Exercise the real ``-Q`` entry function with a no-egress classifier fake."""
     from types import SimpleNamespace
@@ -81,11 +90,11 @@ def test_actual_quiet_cli_entry_prints_safe_refusal_without_rewriting_history(mo
                             session_id="local-session"), "continue")
     assert exit_info.value.code == 0
     assert raw["messages"][0]["content"] == "I will keep working after this reply."
-    assert "will not claim" in capsys.readouterr().out
-    assert calls[0]["conversation_history"] == [{"role": "assistant", "content": "earlier"}]
+    assert "cannot verify" in capsys.readouterr().out.lower()
+    assert calls == []  # no fence means no model execution or history rewrite
 
 
-def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch):
+def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch, tmp_path):
     """The production TUI invoke seam must not emit a prospective promise early."""
     from types import SimpleNamespace
     import tui_gateway.prompt_turn as prompt_turn
@@ -100,15 +109,19 @@ def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch
         def join(self):
             pass
 
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("tui-session", source="tui")
     raw = _result("I will keep working later.")
 
     def run_conversation(_message, **kwargs):
         kwargs["stream_callback"]("I will keep working later.")
         agent.interim_assistant_callback("I will keep working later.")
+        db.append_message("tui-session", role="assistant", content=raw["final_response"])
         return raw
 
     agent = SimpleNamespace(run_conversation=run_conversation, _mute_notification_reply=False,
-                            _session_db=None, session_id="tui-session")
+                            _session_db=db, session_id="tui-session")
     st = SimpleNamespace(agent=agent, tts_queue=None, thinking_started=False, result=None, history=[])
     monkeypatch.setattr(guard, "local_commitment_state", lambda: True)
     monkeypatch.setattr(guard, "propose_with_auxiliary", lambda *_args: CommitmentProposal(
@@ -120,60 +133,33 @@ def test_actual_tui_invoke_holds_delta_and_interim_until_local_guard(monkeypatch
     monkeypatch.setattr(prompt_turn, "_emit", lambda *args: emitted.append(args), raising=False)
     import inspect
     monkeypatch.setattr(prompt_turn, "inspect", inspect, raising=False)
-    prompt_turn._invoke_agent(
-        "ui", {"session_key": "tui-session", "history_lock": __import__("threading").RLock()}, st,
-        "continue", "continue", None, [], None, None, text="continue")
-    assert emitted == []
-    assert "will not claim" in st.result["final_response"]
-    assert st.result["messages"] == raw["messages"]
+    try:
+        prompt_turn._invoke_agent(
+            "ui", {"session_key": "tui-session", "history_lock": __import__("threading").RLock()}, st,
+            "continue", "continue", None, [], None, None, text="continue")
+        assert emitted == []
+        assert "will not claim" in st.result["final_response"]
+        assert st.result["messages"] == raw["messages"]
+    finally:
+        db.close()
 
 
-def test_tui_exception_projection_hides_partial_reply_without_rewriting_raw_history():
-    raw = "I will continue after this process exits."
-
-    class DB:
-        def __init__(self):
-            self.rows = [{"id": 2, "role": "assistant", "content": raw}]
-            self.stamps = []
-
-        def get_messages(self, _sid):
-            return self.rows
-
-        def set_latest_matching_message_display_kind(self, *args, **kwargs):
-            self.stamps.append((args, kwargs))
-            return True
-
-    db = DB()
-    assert guard.persist_local_commitment_exception_presentation(db, session_id="s", after_row_id=1)
-    assert db.rows[0]["content"] == raw
-    assert db.stamps[0][1]["display_metadata"]["local_commitment_guard"]["text"].startswith("I cannot verify")
-
-
-def test_actual_tui_invoke_exception_projects_late_partial_reply(monkeypatch):
+def test_actual_tui_invoke_exception_projects_late_partial_reply(monkeypatch, tmp_path):
     """The production invoke seam stamps a persisted partial reply before re-raising."""
     from types import SimpleNamespace
     import pytest
     import tui_gateway.prompt_turn as prompt_turn
-
-    class DB:
-        def __init__(self):
-            self.rows, self.stamps = [], []
-
-        def get_messages(self, _sid):
-            return list(self.rows)
-
-        def set_latest_matching_message_display_kind(self, *args, **kwargs):
-            self.stamps.append((args, kwargs))
-            return True
 
     class Stop:
         def set(self): pass
     class Thread:
         def join(self): pass
 
-    db = DB()
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "exception.db")
+    db.create_session("s", source="tui")
     def boom(_message, **_kwargs):
-        db.rows.append({"id": 9, "role": "assistant", "content": "I will continue later."})
+        db.append_message("s", role="assistant", content="I will continue later.")
         raise RuntimeError("provider interrupted")
 
     agent = SimpleNamespace(run_conversation=boom, _mute_notification_reply=False, _session_db=db, session_id="s")
@@ -185,18 +171,28 @@ def test_actual_tui_invoke_exception_projects_late_partial_reply(monkeypatch):
     monkeypatch.setattr(prompt_turn, "_start_usage_ticker", lambda *_args: (Stop(), Thread()), raising=False)
     import inspect
     monkeypatch.setattr(prompt_turn, "inspect", inspect, raising=False)
-    with pytest.raises(RuntimeError, match="provider interrupted"):
-        prompt_turn._invoke_agent("ui", {"session_key": "s", "history_lock": __import__("threading").RLock()}, st,
-                                  "continue", "continue", None, [], None, None, text="continue")
-    assert db.rows[0]["content"] == "I will continue later."
-    assert db.stamps and "cannot verify" in db.stamps[0][1]["display_metadata"]["local_commitment_guard"]["text"].lower()
+    try:
+        with pytest.raises(RuntimeError, match="provider interrupted"):
+            prompt_turn._invoke_agent("ui", {"session_key": "s", "history_lock": __import__("threading").RLock()}, st,
+                                      "continue", "continue", None, [], None, None, text="continue")
+        row = db.get_messages("s")[-1]
+        assert row["content"] == "I will continue later."
+        assert "cannot verify" in row["display_metadata"]["local_commitment_guard"]["content"].lower()
+        import tui_gateway.session_history as history_mod
+        monkeypatch.setattr(history_mod, "project_compaction_message_for_display", lambda item: item, raising=False)
+        assert history_mod._history_to_messages(db.get_messages("s"))[-1]["text"].startswith("I cannot verify")
+    finally:
+        db.close()
 
 
-def test_actual_interactive_cli_agent_thread_holds_stream_and_refuses(monkeypatch):
+def test_actual_interactive_cli_agent_thread_holds_stream_and_refuses(monkeypatch, tmp_path):
     """Exercise the interactive CLI thread seam without a terminal/provider."""
     from types import SimpleNamespace
     from cli import HermesCLI, _ChatTurn
 
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "cli.db")
+    db.create_session("cli-session", source="cli")
     raw = _result("I will keep working later.")
     streamed = []
 
@@ -204,13 +200,14 @@ def test_actual_interactive_cli_agent_thread_holds_stream_and_refuses(monkeypatc
         callback = getattr(cli.agent, "stream_delta_callback", None)
         if callback:
             callback("I will keep working later.")
+        db.append_message("cli-session", role="assistant", content=raw["final_response"])
         return raw
 
     cli = HermesCLI.__new__(HermesCLI)
     cli.session_id = "cli-session"
     cli.conversation_history = [{"role": "user", "content": "continue"}]
     cli.agent = SimpleNamespace(run_conversation=run_conversation, stream_delta_callback=lambda text: streamed.append(text),
-                                interim_assistant_callback=None)
+                                interim_assistant_callback=None, _session_db=db)
     for name in ("_sudo_password_callback", "_approval_callback", "_secret_capture_callback",
                  "_vault_unlock_callback", "_vault_save_login_callback", "_vault_code_callback"):
         setattr(cli, name, lambda *_args, **_kwargs: None)
@@ -221,7 +218,10 @@ def test_actual_interactive_cli_agent_thread_holds_stream_and_refuses(monkeypatc
     monkeypatch.setattr(guard, "propose_with_auxiliary", lambda *_args: CommitmentProposal(
         disposition="continuing", objective="work", completion_criteria="done", next_action="start"))
     turn = _ChatTurn()
-    cli._chat_run_agent(turn, "continue")
-    assert streamed == []
-    assert "will not claim" in turn.result["final_response"]
-    assert turn.result["messages"] == raw["messages"]
+    try:
+        cli._chat_run_agent(turn, "continue")
+        assert streamed == []
+        assert "will not claim" in turn.result["final_response"]
+        assert turn.result["messages"] == raw["messages"]
+    finally:
+        db.close()

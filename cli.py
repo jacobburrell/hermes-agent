@@ -4159,6 +4159,22 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    from hermes_cli.local_commitment_guard import (
+        begin_local_commitment_fence, finish_local_commitment_fence, local_commitment_refusal_result,
+        local_commitment_state,
+    )
+    _local_guard_state = local_commitment_state()
+    _local_guard_fence = None
+    if _local_guard_state is not False:
+        _local_guard_fence = begin_local_commitment_fence(
+            getattr(cli.agent, "_session_db", None), str(cli.session_id or ""), source="cli-quiet")
+        if _local_guard_fence is None:
+            refusal = local_commitment_refusal_result()
+            if emitter is not None:
+                sys.exit(emitter.emit_result(refusal, session_id=cli.session_id or "", exit_code=0))
+            print(refusal["final_response"])
+            print(f"session_id: {cli.session_id}", file=sys.stderr)
+            sys.exit(0)
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
@@ -4171,12 +4187,20 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             result = guard_local_result(
                 result, text=str(effective_query or ""), session_id=str(cli.session_id or ""),
                 platform="cli-quiet")
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, result)
         except KeyboardInterrupt:
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, failed=True)
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
                 sys.exit(emitter.emit_result({"failed": True, "error": "Interrupted"}, session_id=cli.session_id or "", exit_code=130))
             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
             sys.exit(130)
+        except Exception:
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(getattr(cli.agent, "_session_db", None), _local_guard_fence, failed=True)
+            raise
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)

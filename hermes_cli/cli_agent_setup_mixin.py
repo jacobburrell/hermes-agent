@@ -135,6 +135,9 @@ def _collect_resume_entries(display_history, disp: dict, clean_assistant):
                 text = text[:max_user_len] + "..."
             entries.append(("user", text))
         elif role == "assistant":
+            _local_guard = (msg.get("display_metadata") or {}).get("local_commitment_guard")
+            if isinstance(_local_guard, dict) and isinstance(_local_guard.get("content"), str):
+                content = _local_guard["content"]
             text = clean_assistant("" if content is None else str(content))
             parts, full_parts = [], []
             if text:

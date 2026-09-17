@@ -572,21 +572,19 @@ def _invoke_agent(
     # commitment presentation decision is pending; raw model history remains
     # the agent's own result and is never rewritten here.
     from hermes_cli.local_commitment_guard import (
-        guard_local_result, local_commitment_state, persist_local_commitment_exception_presentation,
-        persist_local_commitment_presentation,
+        begin_local_commitment_fence, finish_local_commitment_fence, guard_local_result,
+        local_commitment_refusal_result, local_commitment_state,
     )
     local_guard_state = local_commitment_state()
     _local_guard_db = getattr(agent, "_session_db", None)
     _local_guard_session_id = str(getattr(agent, "session_id", None) or session.get("session_key") or sid)
-    _local_guard_watermark = -1
-    if local_guard_state is not False and _local_guard_db is not None:
-        try:
-            _local_guard_watermark = max((int(row.get("id") or row.get("_row_id") or 0)
-                                          for row in _local_guard_db.get_messages(_local_guard_session_id)), default=0)
-        except Exception:
-            # A missing pre-turn watermark is itself fail-closed for callbacks;
-            # the normal error path still reports the turn failure.
-            _local_guard_watermark = -1
+    _local_guard_fence = None
+    if local_guard_state is not False:
+        _local_guard_fence = begin_local_commitment_fence(
+            _local_guard_db, _local_guard_session_id, source="tui")
+        if _local_guard_fence is None:
+            st.result = local_commitment_refusal_result()
+            return
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
@@ -653,17 +651,14 @@ def _invoke_agent(
             with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
                 st.result = agent.run_conversation(run_message, **st.run_kwargs)
         except Exception:
-            if local_guard_state is not False and _local_guard_watermark >= 0:
-                persist_local_commitment_exception_presentation(
-                    _local_guard_db, session_id=_local_guard_session_id, after_row_id=_local_guard_watermark)
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(_local_guard_db, _local_guard_fence, failed=True)
             raise
         st.result = guard_local_result(
             st.result, text=str(text or ""), session_id=str(session.get("session_key") or sid),
             platform="tui", state=local_guard_state)
-        if isinstance(st.result, dict) and st.result.get("_local_commitment_presentation_override"):
-            persist_local_commitment_presentation(
-                st.result, session_db=getattr(agent, "_session_db", None),
-                session_id=str(getattr(agent, "session_id", None) or session.get("session_key") or sid))
+        if _local_guard_fence is not None:
+            finish_local_commitment_fence(_local_guard_db, _local_guard_fence, st.result)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).

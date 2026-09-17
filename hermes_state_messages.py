@@ -382,6 +382,77 @@ class SessionMessagesMixin:
             return True
         return self._execute_write(_do)
 
+    def begin_api_presentation_fence(self, session_id: str, *, turn_id: str, source: str,
+                                     after_row_id: int) -> bool:
+        """Fence one presentation turn before model execution.
+
+        This is deliberately independent of message content: a repeated model
+        reply cannot make a later turn claim an earlier row.
+        """
+        if not session_id or not turn_id or not source:
+            return False
+        try:
+            watermark = max(0, int(after_row_id))
+        except (TypeError, ValueError):
+            return False
+        def _do(conn):
+            conn.execute("INSERT OR IGNORE INTO api_presentation_fences "
+                         "(session_id,turn_id,source,after_row_id,state,created_at) VALUES (?,?,?,?, 'pending', ?)",
+                         (session_id, turn_id, source, watermark, time.time()))
+            row = conn.execute("SELECT source,after_row_id,state FROM api_presentation_fences "
+                               "WHERE session_id=? AND turn_id=?", (session_id, turn_id)).fetchone()
+            return bool(row and row["source"] == source and int(row["after_row_id"]) == watermark
+                        and row["state"] == "pending")
+        return bool(self._execute_write(_do))
+
+    def resolve_api_presentation_fence(self, session_id: str, *, turn_id: str,
+                                        presentation_key: str, terminal_content: Optional[str],
+                                        assistant_row_ids: List[int]) -> bool:
+        """Atomically project exactly this turn's assistant rows then resolve it.
+
+        Callers must supply the concrete persisted ids they observed after the
+        fence watermark.  Every supplied id is verified against the session and
+        fence range, so a matching text value can never select another turn.
+        """
+        if not session_id or not turn_id or not presentation_key:
+            return False
+        try:
+            row_ids = [int(row_id) for row_id in assistant_row_ids]
+        except (TypeError, ValueError):
+            return False
+        if len(set(row_ids)) != len(row_ids) or any(row_id <= 0 for row_id in row_ids):
+            return False
+        def _do(conn):
+            fence = conn.execute("SELECT after_row_id,state,source FROM api_presentation_fences "
+                                 "WHERE session_id=? AND turn_id=?", (session_id, turn_id)).fetchone()
+            if fence is None or fence["state"] != "pending":
+                return False
+            if row_ids:
+                marks = ",".join("?" for _ in row_ids)
+                rows = conn.execute(
+                    f"SELECT id,display_metadata FROM messages WHERE session_id=? AND role='assistant' "
+                    f"AND active=1 AND id>? AND id IN ({marks}) ORDER BY id",
+                    [session_id, int(fence["after_row_id"]), *row_ids]).fetchall()
+                if [int(row["id"]) for row in rows] != sorted(row_ids):
+                    return False
+                final_id = max(row_ids)
+                for row in rows:
+                    meta = self._decode_display_metadata(row["display_metadata"]) or {}
+                    meta[presentation_key] = {"turn_id": turn_id, "source": fence["source"],
+                                              "content": terminal_content if int(row["id"]) == final_id else ""}
+                    conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row["id"]))
+            conn.execute("UPDATE api_presentation_fences SET state='resolved',resolved_at=? "
+                         "WHERE session_id=? AND turn_id=? AND state='pending'",
+                         (time.time(), session_id, turn_id))
+            return True
+        return bool(self._execute_write(_do))
+
+    def assistant_message_ids_after(self, session_id: str, after_row_id: int) -> List[int]:
+        """Return concrete assistant ids after a fence watermark for a serialized local turn."""
+        rows = self._read_all("SELECT id FROM messages WHERE session_id=? AND role='assistant' "
+                              "AND active=1 AND id>? ORDER BY id", (session_id, int(after_row_id)))
+        return [int(row["id"]) for row in rows]
+
     def _reaction_list(self, meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""
         reactions = (meta or {}).get(self.REACTIONS_METADATA_KEY)

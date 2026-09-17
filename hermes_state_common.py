@@ -450,6 +450,20 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Presentation-only ownership fence. Raw assistant content stays immutable
+-- for model replay; local clients may project a safe replacement after a
+-- turn whose future-work claim cannot be durably delivered.
+CREATE TABLE IF NOT EXISTS api_presentation_fences (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    after_row_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    resolved_at REAL,
+    PRIMARY KEY (session_id, turn_id)
+);
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,

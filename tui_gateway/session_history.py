@@ -198,7 +198,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # surface was unable to durably deliver later.
         _local_guard = (m.get("display_metadata") or {}).get("local_commitment_guard")
         if role == "assistant" and isinstance(_local_guard, dict):
-            _safe_text = _local_guard.get("text")
+            _safe_text = _local_guard.get("text", _local_guard.get("content"))
             if isinstance(_safe_text, str) and _safe_text.strip():
                 content_text = _safe_text
         if _is_display_hidden_marker(role, content_text):

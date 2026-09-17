@@ -331,11 +331,20 @@ class CLIChatTurnMixin:
         # enabled (or malformed), hold every model-facing stream until the
         # presentation classifier has made a delivery decision.  The raw agent
         # messages remain untouched for cache parity.
-        from hermes_cli.local_commitment_guard import guard_local_result, local_commitment_state
+        from hermes_cli.local_commitment_guard import (
+            begin_local_commitment_fence, finish_local_commitment_fence, guard_local_result,
+            local_commitment_refusal_result, local_commitment_state,
+        )
         _local_guard_state = local_commitment_state()
+        _local_guard_fence = None
         _saved_stream_delta = getattr(self.agent, "stream_delta_callback", None)
         _saved_interim = getattr(self.agent, "interim_assistant_callback", None)
         if _local_guard_state is not False:
+            _local_guard_fence = begin_local_commitment_fence(
+                getattr(self.agent, "_session_db", None), str(self.session_id or ""), source="cli")
+            if _local_guard_fence is None:
+                turn.result = local_commitment_refusal_result()
+                return
             self.agent.stream_delta_callback = lambda _delta: None
             self.agent.interim_assistant_callback = None
         try:
@@ -351,6 +360,8 @@ class CLIChatTurnMixin:
             turn.result = guard_local_result(
                 turn.result, text=str(message or ""), session_id=str(self.session_id or ""),
                 platform="cli", state=_local_guard_state)
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(getattr(self.agent, "_session_db", None), _local_guard_fence, turn.result)
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                 for _key, _value in _restore.items():
@@ -370,6 +381,8 @@ class CLIChatTurnMixin:
                 "messages": [], "api_calls": 0,
                 "completed": False, "failed": True, "error": _summary,
             }
+            if _local_guard_fence is not None:
+                finish_local_commitment_fence(getattr(self.agent, "_session_db", None), _local_guard_fence, failed=True)
         finally:
             self.agent.stream_delta_callback = _saved_stream_delta
             self.agent.interim_assistant_callback = _saved_interim
