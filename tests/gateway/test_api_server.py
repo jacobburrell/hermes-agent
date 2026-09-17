@@ -451,8 +451,71 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_stateless_commitment_guard_refuses_unsaveable_follow_up(self, adapter, monkeypatch):
+        """The API can authenticate a request but cannot attest a later push route."""
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(
+            hermes_config, "load_config",
+            lambda: {"goals": {"commitment_admission": {"enabled": True}}},
+        )
+        monkeypatch.setattr(
+            boundary, "_auxiliary_proposal",
+            lambda *_args: {"disposition": "continuing", "objective": "research",
+                             "completion_criteria": "report", "next_action": "research"},
+        )
+        result = adapter._guard_stateless_commitment_response(
+            result={"final_response": "I will investigate and report back."},
+            user_message="Please investigate this.", session_id="api-session",
+            gateway_session_key="api-key", profile="jack",
+        )
+        assert "will not claim" in result["final_response"]
+
+    def test_stateless_commitment_guard_keeps_completed_response(self, adapter, monkeypatch):
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(
+            hermes_config, "load_config",
+            lambda: {"goals": {"commitment_admission": {"enabled": True}}},
+        )
+        monkeypatch.setattr(boundary, "_auxiliary_proposal", lambda *_args: {"disposition": "completed"})
+        original = {"final_response": "The answer is 42."}
+        assert adapter._guard_stateless_commitment_response(
+            result=original, user_message="What is the answer?", session_id="api-session",
+            gateway_session_key="", profile="jack",
+        ) is original
+
     @pytest.mark.asyncio
-    async def test_run_agent_uses_session_id_as_task_id(self, adapter):
+    async def test_api_run_agent_applies_stateless_guard_before_return(self, adapter, monkeypatch):
+        from hermes_cli import config as hermes_config
+        import gateway.commitment_admission_boundary as boundary
+
+        monkeypatch.setattr(
+            hermes_config, "load_config",
+            lambda: {"goals": {"commitment_admission": {"enabled": True}}},
+        )
+        monkeypatch.setattr(
+            boundary, "_auxiliary_proposal",
+            lambda *_args: {"disposition": "waiting", "objective": "research",
+                             "completion_criteria": "report", "waiting_for": "an answer"},
+        )
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "I will update you later."}
+        mock_agent.session_prompt_tokens = mock_agent.session_completion_tokens = mock_agent.session_total_tokens = 0
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, _usage = await adapter._run_agent(
+                user_message="Please research it.", conversation_history=[], session_id="api-session")
+        assert "will not claim" in result["final_response"]
+        mock_agent.run_conversation.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_uses_session_id_as_task_id(self, adapter, monkeypatch):
+        # Keep this legacy result-shape test independent of a developer's
+        # profile-local opt-in setting.
+        from hermes_cli import config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {})
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
         mock_agent.session_prompt_tokens = 1

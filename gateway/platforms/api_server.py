@@ -3698,6 +3698,42 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             usage["runtime"] = runtime
         return result, usage
 
+    def _guard_stateless_commitment_response(
+        self, *, result: Any, user_message: str, session_id: str,
+        gateway_session_key: str, profile: str,
+    ) -> Any:
+        """Fail closed on API promises this stateless surface cannot deliver.
+
+        This adapter bypasses ``TurnRunner``.  Its authenticated HTTP request
+        does not attest a durable push destination, so it never creates a task
+        or borrows another adapter's subscription.  Only an available
+        ``none``/``completed`` classifier result preserves the draft response.
+        """
+        if not isinstance(result, dict) or not str(result.get("final_response") or "").strip():
+            return result
+        settings: dict[str, Any] = {}
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            from hermes_cli.commitment_admission import normalize_proposal
+            from gateway.commitment_admission_boundary import _auxiliary_proposal
+
+            settings = cfg_get(load_config(), "goals", "commitment_admission", default={})
+            if not isinstance(settings, dict) or not bool(settings.get("enabled", False)):
+                return result
+            proposal = normalize_proposal(
+                _auxiliary_proposal(str(user_message or ""), str(result.get("final_response") or "")))
+            if proposal.classification == "available" and proposal.disposition in {"none", "completed"}:
+                return result
+        except Exception:
+            logger.info("stateless commitment guard unavailable", exc_info=True)
+
+        fallback = str(settings.get("persistence_failure_message") or (
+            "I can help in this response, but this interface cannot save a reliable "
+            "follow-up or later notification. I will not claim that work will continue unattended."))
+        guarded = dict(result)
+        guarded["final_response"] = fallback
+        return guarded
+
     async def _run_agent(
         self, user_message: str, conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -3779,6 +3815,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     result, usage = self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
+                    result = self._guard_stateless_commitment_response(
+                        result=result, user_message=user_message, session_id=session_id or "",
+                        gateway_session_key=gateway_session_key or "", profile=request_profile or "")
                     if muted and isinstance(result, dict):
                         # Project presentation only after finishing the source outcome. Keep
                         # the agent's result, transcript, failure flags and usage intact.
