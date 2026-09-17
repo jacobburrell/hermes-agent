@@ -155,7 +155,7 @@ def test_gateway_presentation_fence_keeps_raw_history_but_projects_guarded_turn(
         assert db.resolve_api_presentation_fence(
             "origin-session", turn_id=fence["turn_id"], fallback=_SAFE_REFUSAL,
             assistant_row_ids=db.find_api_presentation_fence_rows("origin-session", turn_id=fence["turn_id"]),
-            require_exact_rows=True)
+            require_exact_rows=True, presented_assistant_row_id=1)
         # A later normal turn clears only its own fence; it never overwrites
         # the earlier refused projection.
         later, later_ready = turn._begin_gateway_commitment_presentation_fence()
@@ -165,7 +165,7 @@ def test_gateway_presentation_fence_keeps_raw_history_but_projects_guarded_turn(
         assert db.resolve_api_presentation_fence(
             "origin-session", turn_id=later["turn_id"],
             assistant_row_ids=db.find_api_presentation_fence_rows("origin-session", turn_id=later["turn_id"]),
-            require_exact_rows=True)
+            require_exact_rows=True, presented_assistant_row_id=2)
         shown, pending = db.get_api_presentation_snapshot(
             "origin-session", limit=None, offset=0, latest=False)
         assert pending == []
@@ -190,13 +190,33 @@ def test_exact_gateway_fence_hides_every_owned_intermediate_not_later_turn(temp_
         assert len(owned) == 2
         assert db.resolve_api_presentation_fence(
             "origin-session", turn_id="guarded", fallback=_SAFE_REFUSAL,
-            assistant_row_ids=owned, require_exact_rows=True)
+            assistant_row_ids=owned, require_exact_rows=True, presented_assistant_row_id=owned[-1])
         shown, pending = db.get_api_presentation_snapshot(
             "origin-session", limit=None, offset=0, latest=False)
         assert pending == []
         assert [row["content"] for row in shown] == [_SAFE_REFUSAL, "A later independent answer"]
         assert [row["content"] for row in db.get_messages("origin-session")] == [
             "I will keep working", "I will update you later", "A later independent answer"]
+    finally:
+        db.close()
+
+
+def test_unchanged_final_hides_owned_interim_rows(temp_home):
+    db = SessionDB()
+    try:
+        db.ensure_session("origin-session", source="gateway")
+        assert db.begin_api_presentation_fence(
+            "origin-session", turn_id="normal", source="gateway_commitment", after_row_id=0)
+        for text in ("draft interim", "Validated final"):
+            db.append_message("origin-session", "assistant", text,
+                              display_metadata={"_gateway_commitment_fence": "normal"})
+        ids = db.find_api_presentation_fence_rows("origin-session", turn_id="normal")
+        assert db.resolve_api_presentation_fence(
+            "origin-session", turn_id="normal", assistant_row_ids=ids,
+            require_exact_rows=True, presented_assistant_row_id=ids[-1])
+        shown, _ = db.get_api_presentation_snapshot("origin-session", limit=None, offset=0, latest=False)
+        assert [row["content"] for row in shown] == ["Validated final"]
+        assert [row["content"] for row in db.get_messages("origin-session")] == ["draft interim", "Validated final"]
     finally:
         db.close()
 
@@ -254,4 +274,9 @@ def test_gateway_fence_requires_session_db_only_when_commitment_mode_is_enabled(
 
     disabled_ctx = TurnContext(source=source, session_id="origin-session", user_config={})
     fence, ready = TurnRunner(SimpleNamespace(_session_db=None), disabled_ctx)._begin_gateway_commitment_presentation_fence()
+    assert (fence, ready) == (None, True)
+
+    heartbeat_ctx = TurnContext(source=source, session_id="origin-session", scheduled_heartbeat=True,
+                                user_config=_ctx(source).user_config)
+    fence, ready = TurnRunner(SimpleNamespace(_session_db=None), heartbeat_ctx)._begin_gateway_commitment_presentation_fence()
     assert (fence, ready) == (None, True)
