@@ -106,7 +106,7 @@ def guard_final_response(*, runner: Any, ctx: Any, event: Any, response: str) ->
     if not enabled(getattr(ctx, "user_config", None)):
         return response, None
     source = getattr(ctx, "source", None)
-    if source is None or not getattr(event, "_gateway_accepted", False):
+    if source is None or event is None or not getattr(event, "_gateway_accepted", False):
         return _SAFE_REFUSAL, None
     assessor = getattr(runner, "_commitment_proposer", None)
     raw = assessor(getattr(event, "text", ""), response, source) if callable(assessor) else _auxiliary_proposal(
@@ -121,15 +121,27 @@ def guard_final_response(*, runner: Any, ctx: Any, event: Any, response: str) ->
         return _SAFE_REFUSAL, None
     profile = str(getattr(source, "profile", None) or "default")
     platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    adapter = getattr(runner, "_adapter_for_source", lambda _: None)(source)
+    try:
+        from gateway.wake import adapter_supports_push
+        return_capable = bool(adapter_supports_push(adapter) and callable(getattr(adapter, "send", None)))
+    except Exception:
+        return_capable = False
+    metadata = getattr(event, "metadata", None)
     context = CommitmentContext(
         profile=profile, requester_id=str(getattr(source, "user_id", "") or ""),
         session_id=str(getattr(ctx, "session_id", "") or ""), platform=str(platform),
         chat_id=str(getattr(source, "chat_id", "") or ""),
         message_id=str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or ""),
-        text=str(getattr(event, "text", "") or ""), authorized=True, operational=not bool(getattr(event, "internal", False)),
-        internal=bool(getattr(event, "internal", False)), quoted=bool(getattr(event, "reply_to_text", None)),
+        text=str(getattr(event, "text", "") or ""),
+        authorized=bool(getattr(runner, "_is_user_authorized_for_source", lambda _source: False)(source)),
+        operational=not bool(getattr(event, "internal", False)),
+        internal=bool(getattr(event, "internal", False)),
+        # A quoted message is context, not authority. Only an adapter's
+        # explicit classification marks it unusable for commitment admission.
+        quoted=bool(isinstance(metadata, Mapping) and metadata.get("quote_is_untrusted_authority")),
         chat_type=str(getattr(source, "chat_type", "") or ""), thread_id=str(getattr(source, "thread_id", "") or ""),
-        attachment_refs=_attachments(event), return_capable=bool(getattr(runner, "_adapter_for_source", lambda _: None)(source)),
+        attachment_refs=_attachments(event), return_capable=return_capable,
         dispatcher_ready=_dispatcher_ready(runner),
     )
     settings = _at(getattr(ctx, "user_config", None), "goals", "commitment_admission", default={})
