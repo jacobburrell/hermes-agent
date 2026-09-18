@@ -1,6 +1,7 @@
 """Focused current-main coverage for the transport-neutral commitment store."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,27 @@ def test_attachment_bytes_are_copied_and_missing_refs_are_manifested(isolated_ka
         assert Path(attachments[0].stored_path).read_bytes() == b"durable bytes"
         body = conn.execute("SELECT body FROM tasks WHERE id = ?", (result.task_id,)).fetchone()["body"]
         assert '"state": "missing"' in body
+    finally:
+        conn.close()
+
+
+def test_long_body_reconciliation_and_waiting_condition_are_durable(isolated_kanban):
+    proposal = _proposal(
+        disposition="waiting",
+        objective="Enroll in the requested course " + ("with supporting detail " * 80),
+        completion_criteria="Enrollment is confirmed with the registrar.",
+        next_action="Resume after the registrar replies.",
+        waiting_for="Explicit approval from Alice",
+    )
+    result = admit_commitment(_context(message_id="long-wait"), proposal,
+                              KanbanCommitmentStore(assignee="jack", created_by="jackwhatsapp"))
+    assert result.task_id and result.persisted and result.delivery_ready
+    conn = kb_connect.connect()
+    try:
+        task = kb.get_task(conn, result.task_id)
+        body = json.loads(task.body)
+        assert body["waiting_for"] == "Explicit approval from Alice"
+        assert body["objective"] == proposal.objective
     finally:
         conn.close()
 

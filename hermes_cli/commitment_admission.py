@@ -164,6 +164,7 @@ class KanbanCommitmentStore:
         manifest = self._attachment_manifest(context.attachment_refs)
         body = json.dumps({"kind": "user_commitment", "objective": proposal.objective,
             "completion_criteria": proposal.completion_criteria, "next_action": proposal.next_action,
+            "waiting_for": proposal.waiting_for,
             "origin": {"profile": context.profile, "requester_id": context.requester_id,
                        "platform": context.platform, "chat_id": context.chat_id,
                        "thread_id": context.thread_id, "message_id": context.message_id,
@@ -178,7 +179,8 @@ class KanbanCommitmentStore:
             task = kb.get_task(conn, str(task_id))
             # An idempotency collision must be the same trusted obligation;
             # never borrow another requester/profile's task merely by key.
-            if task is None or _clean(getattr(task, "body", "")) != body:
+            stored_body = str(getattr(task, "body", "") or "").replace("\0", "").strip() if task else ""
+            if task is None or stored_body != body:
                 raise RuntimeError("commitment task linkage does not match source")
             comments = {
                 str(row[0]) for row in conn.execute(
