@@ -374,7 +374,13 @@ export async function extractBridgeEvent({
   const quotedMessageId = contextInfo?.stanzaId || null;
   const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
   const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
-  const hasQuotedMessage = !!contextInfo?.quotedMessage;
+  // Some native stanzas retain only the reply identity (stanzaId and
+  // participant) after the quoted payload is pruned.  That is still a real
+  // reply: preserve the identity so Python can apply the ordinary owned-reply
+  // admission and reply-context path.  A missing payload only means the
+  // quoted text/media may be unavailable, never that the reply itself ceased
+  // to exist.
+  const hasQuotedMessage = !!quotedMessageId;
   let quotedText = textFromQuotedMessage(contextInfo?.quotedMessage);
   let quotedMediaUrls = [];
   let quotedMediaType = '';

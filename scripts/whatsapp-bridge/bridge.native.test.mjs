@@ -129,6 +129,30 @@ import {
   console.log('  ✓ inbound quoted metadata includes quoted text');
 }
 
+// -- stanza-only reply identity remains a real reply ----------------------
+{
+  // Baileys can omit contextInfo.quotedMessage while retaining stanzaId and
+  // participant.  The bridge must not turn that native reply into ambient
+  // text: downstream admission needs its identity even when text/media
+  // cannot be reconstructed locally.
+  const event = await extractBridgeEvent({
+    msg: {
+      key: { id: 'incoming-stanza-only', remoteJid: '15551234567@s.whatsapp.net', participant: '15550001111@s.whatsapp.net', fromMe: false },
+      pushName: 'Tester', messageTimestamp: 124,
+      message: { extendedTextMessage: { text: 'yes, do that', contextInfo: {
+        stanzaId: 'outbound-stanza-only', participant: '15559998888@s.whatsapp.net', remoteJid: '15551234567@s.whatsapp.net',
+      } } },
+    },
+    chatId: '15551234567@s.whatsapp.net', senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111', botIds: ['15559998888@s.whatsapp.net'], downloadMedia: async () => Buffer.from(''),
+  });
+  assert.equal(event.quotedMessageId, 'outbound-stanza-only');
+  assert.equal(event.quotedParticipant, '15559998888@s.whatsapp.net');
+  assert.equal(event.hasQuotedMessage, true);
+  assert.equal(event.quotedText, '');
+  console.log('  ✓ stanza-only reply keeps native quote identity');
+}
+
 // -- reply to uncaptioned quoted media resolves the cached original file --
 {
   // contextInfo.quotedMessage only ever carries a thumbnail-sized stub for

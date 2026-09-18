@@ -217,6 +217,33 @@ class TestBridgeEventMetadata:
         assert event.raw_message["hasQuotedMessage"] is True
 
     @pytest.mark.asyncio
+    async def test_stanza_only_reply_keeps_context_and_explicit_reply_admission(self):
+        """A native reply identity survives even when Baileys omitted its payload."""
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        data = {
+            "messageId": "incoming-stanza-only",
+            "chatId": "15551234567@g.us",
+            "senderId": "15550001111@s.whatsapp.net",
+            "senderName": "Tester", "chatName": "Group", "isGroup": True,
+            "body": "yes, do that", "hasMedia": False, "mediaUrls": [],
+            "quotedMessageId": "outbound-stanza-only",
+            "quotedParticipant": "15559999999@s.whatsapp.net",
+            "botIds": ["15559999999@s.whatsapp.net"],
+            # Simulates a bridge version/native stanza where the optional
+            # quoted payload was pruned but stanzaId survived.
+            "hasQuotedMessage": False,
+        }
+
+        assert adapter._should_process_message(data) is True
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.reply_to_message_id == "outbound-stanza-only"
+        assert event.reply_to_author_id == "15559999999@s.whatsapp.net"
+        assert event.reply_to_is_own_message is True
+
+    @pytest.mark.asyncio
     async def test_reply_to_uncaptioned_image_attaches_quoted_media(self, tmp_path, monkeypatch):
         # contextInfo.quotedMessage only ever carries a thumbnail-sized stub
         # for media (or nothing for an uncaptioned attachment). The bridge
@@ -342,4 +369,3 @@ class TestWhatsAppTier:
         from gateway.display_config import resolve_display_setting
         # TIER_MEDIUM has streaming: None (follow global), not False
         assert resolve_display_setting({}, "whatsapp", "streaming") is None
-

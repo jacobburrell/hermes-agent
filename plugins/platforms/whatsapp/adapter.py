@@ -834,8 +834,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if msg_type == MessageType.VOICE and cached_urls and str(body).strip().lower() == "[ptt received]":
                 body = ""  # Bridge placeholder for captionless voice notes; the audio is the payload.
             # Quoted message stays in structured fields only — GatewayRunner renders the "[Replying to: ...]" pointer.
-            quoted = bool(data.get("hasQuotedMessage"))
-            raw_reply_id = data.get("quotedMessageId") if quoted else None
+            # Older/partially hydrated bridge envelopes can retain the native
+            # stanza identity while omitting the optional quoted payload.
+            # The identity is sufficient to preserve a real reply pointer and
+            # let the shared explicit-reply gate decide admission; do not
+            # silently erase it because ``hasQuotedMessage`` is stale/false.
+            raw_reply_id = data.get("quotedMessageId")
+            quoted = bool(raw_reply_id)
             if quoted:
                 for path, mime in self._quoted_media(data, raw_reply_id):
                     cached_urls.append(path)
