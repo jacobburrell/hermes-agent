@@ -209,8 +209,6 @@ function rememberSentMessage(sent, payload) {
 
 function trackSentMessageId(sent, chatId) {
   rememberSentId(sent?.key?.id);
-<<<<<<< HEAD
-=======
   try {
     outboundOwnership.remember({
       messageId: sent?.key?.id,
@@ -222,7 +220,6 @@ function trackSentMessageId(sent, chatId) {
     // after a failed directory fsync a restart will conservatively deny.
     console.warn('[bridge] failed to persist outbound ownership:', err?.message || err);
   }
->>>>>>> c0b585f3de (fix(whatsapp): scope native reply admission)
 }
 
 function redactWhatsAppId(value) {
