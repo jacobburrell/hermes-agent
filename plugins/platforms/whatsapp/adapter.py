@@ -403,6 +403,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 raise ValueError("attachment cache root could not be resolved") from exc
         return roots
 
+    def set_pairing_intake_handler(self, handler) -> None:
+        """Install the profile-routed pairing-only gateway edge."""
+        self._pairing_intake_handler = handler
+
     def _is_allowed_profile_bridge_path(self, value: str) -> bool:
         # Production adapters bind their owner during __init__.  Keep the
         # long-standing cache validation available to deliberately bare test

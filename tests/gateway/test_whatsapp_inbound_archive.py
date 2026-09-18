@@ -865,6 +865,60 @@ async def test_leased_unpaired_pairing_dm_reaches_pairing_edge_then_acks_without
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "acknowledged"),
+    (("pairing_handshake", True), ("pairing_rate_limited", True), ("pending", False), (None, False)),
+)
+async def test_production_adapter_wiring_binds_pairing_edge_before_leased_intake(tmp_path, outcome, acknowledged):
+    """Runner wiring, not a test-only attribute, owns the pairing callback."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    raw = _leased_raw(
+        mid=f"wired-{outcome}", chatId="209066827718687@lid", senderId="209066827718687@lid",
+        accountId="1555000@s.whatsapp.net", isGroup=False, body="ACK-DM",
+    )
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._running = True; adapter._bridge_port = 1; adapter.platform = Platform.WHATSAPP
+    adapter._inbound_consumer_id = "test-consumer"; adapter._http_session = _Session(adapter, [raw])
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    adapter._dm_policy = "pairing"; adapter._is_archive_authorized = Mock(return_value=False)
+    adapter._should_process_message = Mock(return_value=True); adapter.handle_message = AsyncMock()
+    home = tmp_path / "profile"; (home / "cache").mkdir(parents=True)
+    archive = WhatsAppInboundArchive(home / "whatsapp" / "inbound-archive-v1", home, home / "cache")
+    adapter._inbound_archive_instance = Mock(return_value=archive)
+    adapter._ack_inbound_receipt = AsyncMock(return_value=True)
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = None; runner._busy_text_mode = "off"
+    runner._primary_message_handler = lambda: (lambda _event: None)
+    runner._handle_adapter_fatal_error = lambda _adapter: None
+    runner._primary_busy_session_handler = lambda: None
+    runner._handle_reaction_event = lambda _event: None
+    runner._recover_telegram_topic_thread_id = lambda *_args: None
+    runner._make_adapter_auth_check = lambda _platform: (lambda *_args, **_kwargs: False)
+    runner._primary_platform_event_handler = lambda: None
+    runner._handle_pairing_intake = AsyncMock(return_value=outcome)
+    # The ordinary handler setters are irrelevant to the pairing-only edge;
+    # neutralize them while exercising the real production wiring method.
+    adapter.set_message_handler = lambda _handler: None
+    adapter.set_fatal_error_handler = lambda _handler: None
+    adapter.set_session_store = lambda _store: None
+    adapter.set_busy_session_handler = lambda _handler: None
+    adapter.set_reaction_handler = lambda _handler: None
+    adapter.set_topic_recovery_fn = lambda _handler: None
+    adapter.set_authorization_check = lambda _handler: None
+    adapter.set_platform_event_handler = lambda _handler: None
+    runner._wire_adapter_handlers(adapter)
+
+    await adapter._poll_messages()
+
+    runner._handle_pairing_intake.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._ack_inbound_receipt.await_count == int(acknowledged)
+
+
+@pytest.mark.asyncio
 async def test_leased_unarchived_policy_drop_acks_without_gateway_or_archive(tmp_path):
     """Revoked/unknown non-pairing traffic settles safely without content retention."""
     raw = _leased_raw(

@@ -1107,6 +1107,13 @@ class GatewayAdapterLifecycleMixin:
         adapter.set_authorization_check(
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
+        # WhatsApp's unpaired-DM path is intentionally narrower than the
+        # regular handler.  Bind it here, alongside the profile-scoped auth
+        # callback, so the adapter can settle a leased pairing receipt without
+        # admitting it to a model/session turn.
+        _set_pairing_intake = getattr(adapter, "set_pairing_intake_handler", None)
+        if callable(_set_pairing_intake):
+            _set_pairing_intake(self._handle_pairing_intake)
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
 
