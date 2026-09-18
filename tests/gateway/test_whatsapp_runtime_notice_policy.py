@@ -122,6 +122,7 @@ def test_status_and_notice_callbacks_do_not_schedule_whatsapp_retry_provider_or_
         _status_chat_id="chat-a",
         _status_thread_metadata=None,
         _cleanup_progress=False,
+        mute_notification_reply=False,
     )
     turn = TurnRunner(runner, ctx)
     turn._schedule = lambda coro, *_args: scheduled.append(coro)

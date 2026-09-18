@@ -12,10 +12,11 @@ import {
 } from 'fs';
 import path from 'path';
 import { randomBytes } from 'crypto';
-import { normalizeWhatsAppId } from './bridge_helpers.js';
-
 function normalizeId(value) {
-  return normalizeWhatsAppId(value);
+  // Outbound ownership is a bridge-account routing proof, not an inbound
+  // mention comparison.  Device-qualified JIDs therefore remain distinct:
+  // normalizing away ``:device`` could authorize a quote from another route.
+  return String(value || '').trim();
 }
 
 function defaultFsyncDirectory(dir) {
