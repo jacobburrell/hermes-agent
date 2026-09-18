@@ -47,6 +47,18 @@ class BridgeReceipt:
 
 
 @dataclass(frozen=True)
+class UnarchivedBridgeDisposition:
+    """Content-free disposition for a leased pairing or policy-drop event."""
+    delivery_id: str
+    event_digest: str
+    request: dict[str, object]
+    disposition: str
+    effect_state: str
+    ready: bool
+    acknowledged: bool
+
+
+@dataclass(frozen=True)
 class BridgeRecovery:
     """One private, generation-fenced recovery clarification candidate."""
     delivery_id: str
@@ -225,6 +237,11 @@ class WhatsAppInboundArchive:
                 consumer_id TEXT NOT NULL,
                 epoch INTEGER NOT NULL,
                 token TEXT NOT NULL,
+                handoff_epoch INTEGER,
+                handoff_owner_id TEXT,
+                handoff_owner_generation INTEGER,
+                consumer_role TEXT,
+                legacy_commit_id TEXT,
                 ready INTEGER NOT NULL DEFAULT 0,
                 recovery_pending INTEGER NOT NULL DEFAULT 0,
                 album_key TEXT,
@@ -242,6 +259,30 @@ class WhatsAppInboundArchive:
                 obligation_id TEXT,
                 owner_pid INTEGER,
                 owner_started_at INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(profile_scope, delivery_id)
+            );
+            CREATE TABLE IF NOT EXISTS archive_unarchived_disposition (
+                profile_scope TEXT NOT NULL,
+                delivery_id TEXT NOT NULL,
+                bridge_event_digest TEXT NOT NULL,
+                consumer_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                handoff_epoch INTEGER NOT NULL DEFAULT 1,
+                handoff_owner_id TEXT NOT NULL DEFAULT 'candidate',
+                handoff_owner_generation INTEGER NOT NULL DEFAULT 1,
+                consumer_role TEXT NOT NULL DEFAULT 'candidate',
+                legacy_commit_id TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                effect_state TEXT NOT NULL DEFAULT 'pending',
+                ready INTEGER NOT NULL DEFAULT 0,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(profile_scope, delivery_id)
@@ -286,6 +327,13 @@ class WhatsAppInboundArchive:
                 db.execute("ALTER TABLE archive_bridge_receipt ADD COLUMN album_key TEXT")
             if "recovery_key" not in columns:
                 db.execute("ALTER TABLE archive_bridge_receipt ADD COLUMN recovery_key TEXT")
+            for column, declaration in (
+                ("handoff_epoch", "INTEGER"), ("handoff_owner_id", "TEXT"),
+                ("handoff_owner_generation", "INTEGER"), ("consumer_role", "TEXT"),
+                ("legacy_commit_id", "TEXT"),
+            ):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE archive_bridge_receipt ADD COLUMN {column} {declaration}")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS archive_bridge_receipt_recovery_generation "
                 "ON archive_bridge_receipt(profile_scope,recovery_key,recovery_pending,acknowledged)"
@@ -296,6 +344,20 @@ class WhatsAppInboundArchive:
             album_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(archive_album_handoff)")}
             if "primary_event_id" not in album_columns:
                 db.execute("ALTER TABLE archive_album_handoff ADD COLUMN primary_event_id INTEGER")
+            disposition_columns = {
+                str(row["name"]) for row in db.execute("PRAGMA table_info(archive_unarchived_disposition)")
+            }
+            if "effect_state" not in disposition_columns:
+                # A legacy row was written before the external pairing outcome
+                # was durably known.  It is never evidence of a confirmed send.
+                db.execute(
+                    "ALTER TABLE archive_unarchived_disposition "
+                    "ADD COLUMN effect_state TEXT NOT NULL DEFAULT 'uncertain'"
+                )
+            db.execute(
+                "UPDATE archive_unarchived_disposition SET effect_state='uncertain' "
+                "WHERE disposition='pairing_intake' AND (effect_state IS NULL OR effect_state='')"
+            )
         self._secure()
 
     def _validate_paths(self):
@@ -729,12 +791,28 @@ class WhatsAppInboundArchive:
             or not consumer_id or len(consumer_id) > 128 or not token or len(token) > 256 or epoch < 1
         ):
             raise ArchiveRejected("invalid inbound bridge lease")
-        return delivery_id, event_digest, {
+        request: dict[str, object] = {
             "consumerId": consumer_id,
             "deliveryId": delivery_id,
             "epoch": epoch,
             "token": token,
         }
+        handoff_values = ("handoffEpoch", "ownerId", "ownerGeneration", "consumerRole", "commitId")
+        if any(key in lease for key in handoff_values):
+            if not all(key in lease for key in handoff_values):
+                raise ArchiveRejected("incomplete inbound handoff fence")
+            try:
+                request["handoffEpoch"] = int(lease["handoffEpoch"])
+                request["ownerGeneration"] = int(lease["ownerGeneration"])
+            except (TypeError, ValueError) as exc:
+                raise ArchiveRejected("invalid inbound handoff fence") from exc
+            request["ownerId"] = str(lease["ownerId"])
+            request["consumerRole"] = str(lease["consumerRole"])
+            request["commitId"] = str(lease["commitId"])
+            if (int(request["handoffEpoch"]) < 1 or int(request["ownerGeneration"]) < 1
+                    or not request["ownerId"] or not request["consumerRole"]):
+                raise ArchiveRejected("invalid inbound handoff fence")
+        return delivery_id, event_digest, request
 
     @staticmethod
     def _receipt_from_row(row: sqlite3.Row) -> BridgeReceipt:
@@ -744,6 +822,14 @@ class WhatsAppInboundArchive:
             "epoch": int(row["epoch"]),
             "token": str(row["token"]),
         }
+        if row["handoff_epoch"] is not None:
+            request.update({
+                "handoffEpoch": int(row["handoff_epoch"]),
+                "ownerId": str(row["handoff_owner_id"]),
+                "ownerGeneration": int(row["handoff_owner_generation"]),
+                "consumerRole": str(row["consumer_role"]),
+                "commitId": str(row["legacy_commit_id"]),
+            })
         return BridgeReceipt(
             delivery_id=str(row["delivery_id"]), event_digest=str(row["bridge_event_digest"]),
             request=request, ready=bool(row["ready"]), acknowledged=bool(row["acknowledged"]),
@@ -751,6 +837,179 @@ class WhatsAppInboundArchive:
             album_key=(str(row["album_key"]) if row["album_key"] else None),
             recovery_key=(str(row["recovery_key"]) if row["recovery_key"] else None),
         )
+
+    @staticmethod
+    def _unarchived_disposition_from_row(row: sqlite3.Row) -> UnarchivedBridgeDisposition:
+        request: dict[str, object] = {
+            "consumerId": str(row["consumer_id"]),
+            "deliveryId": str(row["delivery_id"]),
+            "epoch": int(row["epoch"]),
+            "token": str(row["token"]),
+            "handoffEpoch": int(row["handoff_epoch"]),
+            "ownerId": str(row["handoff_owner_id"]),
+            "ownerGeneration": int(row["handoff_owner_generation"]),
+            "consumerRole": str(row["consumer_role"]),
+            "commitId": str(row["legacy_commit_id"]),
+        }
+        return UnarchivedBridgeDisposition(
+            delivery_id=str(row["delivery_id"]), event_digest=str(row["bridge_event_digest"]),
+            request=request, disposition=str(row["disposition"]),
+            effect_state=str(row["effect_state"]), ready=bool(row["ready"]),
+            acknowledged=bool(row["acknowledged"]),
+        )
+
+    @staticmethod
+    def _unarchived_identity(data: Mapping[str, Any], account_id: Any) -> tuple[str, str, str, str]:
+        values = (
+            str(account_id or "").strip().lower(), str(data.get("chatId") or "").strip(),
+            str(data.get("senderId") or data.get("from") or "").strip(),
+            str(data.get("messageId") or "").strip(),
+        )
+        if not all(values) or any(len(value) > 512 for value in values):
+            raise ArchiveRejected("invalid unarchived bridge identity")
+        return values
+
+    def stage_unarchived_disposition(
+        self, lease: Mapping[str, Any], data: Mapping[str, Any], disposition: str, *, account_id: Any,
+    ) -> UnarchivedBridgeDisposition:
+        """Stage an exact no-content pairing/drop disposition before bridge ACK.
+
+        A later lease generation may rebind the exact same event identity, but
+        cannot cross an account, chat, sender, message, or disposition.
+        """
+        if disposition not in {"pairing_intake", "discard"}:
+            raise ArchiveRejected("invalid unarchived disposition")
+        delivery_id, event_digest, request = self._receipt_identity(lease)
+        account, chat_id, sender_id, message_id = self._unarchived_identity(data, account_id)
+        handoff = {
+            "handoffEpoch": int(lease.get("handoffEpoch") or 1),
+            "ownerId": str(lease.get("ownerId") or "candidate"),
+            "ownerGeneration": int(lease.get("ownerGeneration") or 1),
+            "consumerRole": str(lease.get("consumerRole") or "candidate"),
+            "commitId": str(lease.get("commitId") or ""),
+        }
+        request.update(handoff)
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM archive_unarchived_disposition WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, delivery_id),
+            ).fetchone()
+            if row is not None:
+                identity = (
+                    str(row["bridge_event_digest"]), str(row["account_id"]), str(row["chat_id"]),
+                    str(row["sender_id"]), str(row["message_id"]), str(row["disposition"]),
+                )
+                if identity != (event_digest, account, chat_id, sender_id, message_id, disposition):
+                    raise ArchiveRejected("unarchived bridge disposition collision")
+                previous_epoch = int(row["epoch"])
+                if bool(row["acknowledged"]) or int(request["epoch"]) < previous_epoch:
+                    raise ArchiveRejected("stale unarchived bridge lease")
+                if int(request["epoch"]) == previous_epoch:
+                    same_lease = (
+                        str(row["consumer_id"]) == str(request["consumerId"])
+                        and str(row["token"]) == str(request["token"])
+                        and int(row["handoff_epoch"]) == int(request["handoffEpoch"])
+                        and str(row["handoff_owner_id"]) == str(request["ownerId"])
+                        and int(row["handoff_owner_generation"]) == int(request["ownerGeneration"])
+                        and str(row["consumer_role"]) == str(request["consumerRole"])
+                        and str(row["legacy_commit_id"]) == str(request["commitId"])
+                    )
+                    if not same_lease:
+                        raise ArchiveRejected("incompatible unarchived bridge lease")
+                else:
+                    db.execute(
+                        """UPDATE archive_unarchived_disposition
+                           SET consumer_id=?,epoch=?,token=?,handoff_epoch=?,handoff_owner_id=?,handoff_owner_generation=?,consumer_role=?,legacy_commit_id=?,ready=0,updated_at=?
+                           WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=? AND acknowledged=0""",
+                        (request["consumerId"], request["epoch"], request["token"], request["handoffEpoch"],
+                         request["ownerId"], request["ownerGeneration"], request["consumerRole"], request["commitId"],
+                         now, self.scope, delivery_id, event_digest),
+                    )
+                    row = db.execute(
+                        "SELECT * FROM archive_unarchived_disposition WHERE profile_scope=? AND delivery_id=?",
+                        (self.scope, delivery_id),
+                    ).fetchone()
+                return self._unarchived_disposition_from_row(row)
+            effect_state = "pending" if disposition == "pairing_intake" else "confirmed"
+            db.execute(
+                """INSERT INTO archive_unarchived_disposition(
+                       profile_scope,delivery_id,bridge_event_digest,consumer_id,epoch,token,handoff_epoch,handoff_owner_id,handoff_owner_generation,consumer_role,legacy_commit_id,account_id,chat_id,sender_id,message_id,disposition,effect_state,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (self.scope, delivery_id, event_digest, request["consumerId"], request["epoch"], request["token"],
+                 request["handoffEpoch"], request["ownerId"], request["ownerGeneration"], request["consumerRole"],
+                 request["commitId"], account, chat_id, sender_id, message_id, disposition, effect_state, now, now),
+            )
+            row = db.execute(
+                "SELECT * FROM archive_unarchived_disposition WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, delivery_id),
+            ).fetchone()
+            return self._unarchived_disposition_from_row(row)
+
+    def _set_unarchived_pairing_effect_state(
+        self, receipt: UnarchivedBridgeDisposition, expected: str, state: str,
+    ) -> UnarchivedBridgeDisposition:
+        if receipt.disposition != "pairing_intake" or state not in {"pending", "attempted", "confirmed", "rate_limited", "uncertain"}:
+            raise ArchiveRejected("invalid unarchived pairing effect transition")
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_unarchived_disposition SET effect_state=?,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=? AND handoff_epoch=? AND handoff_owner_id=? AND handoff_owner_generation=? AND consumer_role=? AND legacy_commit_id=? AND disposition='pairing_intake' AND effect_state=? AND acknowledged=0""",
+                (state, time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"], receipt.request["handoffEpoch"],
+                 receipt.request["ownerId"], receipt.request["ownerGeneration"], receipt.request["consumerRole"], receipt.request["commitId"], expected),
+            )
+            if cursor.rowcount != 1:
+                raise ArchiveRejected("unarchived pairing effect changed")
+            row = db.execute(
+                "SELECT * FROM archive_unarchived_disposition WHERE profile_scope=? AND delivery_id=?",
+                (self.scope, receipt.delivery_id),
+            ).fetchone()
+            return self._unarchived_disposition_from_row(row)
+
+    def mark_unarchived_pairing_attempted(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        return self._set_unarchived_pairing_effect_state(receipt, "pending", "attempted")
+
+    def reset_unarchived_pairing_pending(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        return self._set_unarchived_pairing_effect_state(receipt, "attempted", "pending")
+
+    def mark_unarchived_pairing_confirmed(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        return self._set_unarchived_pairing_effect_state(receipt, "attempted", "confirmed")
+
+    def mark_unarchived_pairing_rate_limited(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        return self._set_unarchived_pairing_effect_state(receipt, "attempted", "rate_limited")
+
+    def mark_unarchived_pairing_uncertain(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        return self._set_unarchived_pairing_effect_state(receipt, "attempted", "uncertain")
+
+    def mark_unarchived_disposition_ready(self, receipt: UnarchivedBridgeDisposition) -> UnarchivedBridgeDisposition:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_unarchived_disposition SET ready=1,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=? AND handoff_epoch=? AND handoff_owner_id=? AND handoff_owner_generation=? AND consumer_role=? AND legacy_commit_id=? AND disposition=? AND acknowledged=0""",
+                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"], receipt.request["handoffEpoch"],
+                 receipt.request["ownerId"], receipt.request["ownerGeneration"], receipt.request["consumerRole"], receipt.request["commitId"], receipt.disposition),
+            )
+            if cursor.rowcount != 1:
+                raise ArchiveRejected("unarchived disposition changed before ready")
+            row = db.execute("SELECT * FROM archive_unarchived_disposition WHERE profile_scope=? AND delivery_id=?", (self.scope, receipt.delivery_id)).fetchone()
+            return self._unarchived_disposition_from_row(row)
+
+    def mark_unarchived_disposition_acked(self, receipt: UnarchivedBridgeDisposition) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE archive_unarchived_disposition SET acknowledged=1,updated_at=?
+                   WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
+                     AND consumer_id=? AND epoch=? AND token=? AND handoff_epoch=? AND handoff_owner_id=? AND handoff_owner_generation=? AND consumer_role=? AND legacy_commit_id=? AND disposition=? AND ready=1 AND acknowledged=0""",
+                (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"], receipt.request["handoffEpoch"],
+                 receipt.request["ownerId"], receipt.request["ownerGeneration"], receipt.request["consumerRole"], receipt.request["commitId"], receipt.disposition),
+            )
+            return cursor.rowcount > 0
 
     def bind_bridge_receipt(self, event_id: int, lease: Mapping[str, Any], *, ready: bool = False) -> BridgeReceipt:
         """Persist/refresh one exact bridge lease after archive commit, before ACK."""
@@ -785,11 +1044,23 @@ class WhatsAppInboundArchive:
                         or str(request["token"]) != previous_token
                     ):
                         raise ArchiveRejected("incompatible inbound bridge lease binding")
+                    previous_handoff = tuple(row[key] for key in (
+                        "handoff_epoch", "handoff_owner_id", "handoff_owner_generation", "consumer_role", "legacy_commit_id",
+                    ))
+                    requested_handoff = (
+                        request.get("handoffEpoch"), request.get("ownerId"), request.get("ownerGeneration"),
+                        request.get("consumerRole"), request.get("commitId"),
+                    )
+                    if any(value is not None for value in previous_handoff) and previous_handoff != requested_handoff:
+                        raise ArchiveRejected("incompatible inbound handoff binding")
+                    if any(value is not None for value in requested_handoff) and any(value is not None for value in previous_handoff):
+                        # Exact existing fence must survive the lease rebind.
+                        pass
                     db.execute(
                         """UPDATE archive_bridge_receipt
-                           SET consumer_id=?,epoch=?,token=?,ready=MAX(ready,?),updated_at=?
+                           SET consumer_id=?,epoch=?,token=?,handoff_epoch=COALESCE(handoff_epoch,?),handoff_owner_id=COALESCE(handoff_owner_id,?),handoff_owner_generation=COALESCE(handoff_owner_generation,?),consumer_role=COALESCE(consumer_role,?),legacy_commit_id=COALESCE(legacy_commit_id,?),ready=MAX(ready,?),updated_at=?
                            WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?""",
-                        (request["consumerId"], request["epoch"], request["token"], int(ready), now,
+                        (request["consumerId"], request["epoch"], request["token"], *requested_handoff, int(ready), now,
                          self.scope, delivery_id, event_digest),
                     )
                     row = db.execute(
@@ -799,10 +1070,11 @@ class WhatsAppInboundArchive:
                 return self._receipt_from_row(row)
             db.execute(
                 """INSERT INTO archive_bridge_receipt(
-                       profile_scope,delivery_id,event_id,bridge_event_digest,consumer_id,epoch,token,ready,acknowledged,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,0,?,?)""",
+                       profile_scope,delivery_id,event_id,bridge_event_digest,consumer_id,epoch,token,handoff_epoch,handoff_owner_id,handoff_owner_generation,consumer_role,legacy_commit_id,ready,acknowledged,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
                 (self.scope, delivery_id, event_id, event_digest, request["consumerId"], request["epoch"],
-                 request["token"], int(ready), now, now),
+                 request["token"], request.get("handoffEpoch"), request.get("ownerId"), request.get("ownerGeneration"),
+                 request.get("consumerRole"), request.get("commitId"), int(ready), now, now),
             )
             row = db.execute(
                 "SELECT * FROM archive_bridge_receipt WHERE profile_scope=? AND delivery_id=?",
@@ -815,9 +1087,13 @@ class WhatsAppInboundArchive:
             cursor = db.execute(
                 """UPDATE archive_bridge_receipt SET ready=1,updated_at=?
                    WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
-                     AND consumer_id=? AND epoch=? AND token=? AND acknowledged=0""",
+                     AND consumer_id=? AND epoch=? AND token=?
+                     AND (handoff_epoch IS NULL OR (handoff_epoch=? AND handoff_owner_id=? AND handoff_owner_generation=? AND consumer_role=? AND legacy_commit_id=?))
+                     AND acknowledged=0""",
                 (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
-                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"],
+                 receipt.request.get("handoffEpoch"), receipt.request.get("ownerId"), receipt.request.get("ownerGeneration"),
+                 receipt.request.get("consumerRole"), receipt.request.get("commitId")),
             )
             if cursor.rowcount != 1:
                 raise ArchiveRejected("inbound bridge receipt changed before ready")
@@ -1030,9 +1306,12 @@ class WhatsAppInboundArchive:
                 """UPDATE archive_bridge_receipt SET acknowledged=1,updated_at=?
                    WHERE profile_scope=? AND delivery_id=? AND bridge_event_digest=?
                      AND consumer_id=? AND epoch=? AND token=?
+                     AND (handoff_epoch IS NULL OR (handoff_epoch=? AND handoff_owner_id=? AND handoff_owner_generation=? AND consumer_role=? AND legacy_commit_id=?))
                      AND ready=1 AND recovery_pending=1 AND acknowledged=0""",
                 (time.time(), self.scope, receipt.delivery_id, receipt.event_digest,
-                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"]),
+                 receipt.request["consumerId"], receipt.request["epoch"], receipt.request["token"],
+                 receipt.request.get("handoffEpoch"), receipt.request.get("ownerId"), receipt.request.get("ownerGeneration"),
+                 receipt.request.get("consumerRole"), receipt.request.get("commitId")),
             )
             return cursor.rowcount > 0
 

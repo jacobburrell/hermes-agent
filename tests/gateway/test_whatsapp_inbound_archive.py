@@ -944,8 +944,8 @@ async def test_pairing_disposition_survives_ack_crash_and_redelivery_without_sec
 
 
 @pytest.mark.asyncio
-async def test_completed_pairing_disposition_rebinds_new_lease_and_reacks_without_resend(tmp_path):
-    """Lease expiry/new consumer preserves a completed pairing edge and only re-ACKs."""
+async def test_confirmed_pairing_disposition_rebinds_new_lease_and_reacks_without_resend(tmp_path):
+    """Lease expiry/new consumer preserves a confirmed pairing edge and only re-ACKs."""
     raw = _leased_raw(
         mid="pairing-rebind", chatId="209066827718687@lid", senderId="209066827718687@lid",
         accountId="1555000@s.whatsapp.net", isGroup=False,
@@ -971,7 +971,7 @@ async def test_completed_pairing_disposition_rebinds_new_lease_and_reacks_withou
     adapter._pairing_intake_handler = AsyncMock(return_value="pairing_handshake")
     adapter._ack_inbound_receipt = AsyncMock(return_value=False)
 
-    await adapter._poll_messages()  # completed effect, lost bridge ACK
+    await adapter._poll_messages()  # confirmed effect, lost bridge ACK
     adapter._inbound_consumer_id = "fresh-consumer"
     adapter._running = True; adapter._http_session = _Session(adapter, [renewed])
     adapter._ack_inbound_receipt = AsyncMock(return_value=True)
@@ -983,7 +983,7 @@ async def test_completed_pairing_disposition_rebinds_new_lease_and_reacks_withou
         assert tuple(db.execute(
             "SELECT consumer_id,epoch,token,handoff_owner_id,handoff_owner_generation,effect_state,acknowledged "
             "FROM archive_unarchived_disposition"
-        ).fetchone()) == ("fresh-consumer", 2, "fresh-token", "fresh-candidate", 2, "completed", 1)
+        ).fetchone()) == ("fresh-consumer", 2, "fresh-token", "fresh-candidate", 2, "confirmed", 1)
 
 
 @pytest.mark.asyncio

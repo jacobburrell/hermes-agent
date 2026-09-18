@@ -79,27 +79,58 @@ class GatewayInboundMixin:
                 break
         return event
 
-    async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
-        """DM an unauthorized sender a pairing code (rate-limited; groups never reach here)."""
+    async def _hm_offer_pairing_code(self, source: SessionSource) -> str:
+        """Offer one pairing response and return its delivery-safe outcome."""
         platform_name = source.platform.value if source.platform else "unknown"
         pairing_store = self._pairing_store_for(source)
         if pairing_store is None:
             logger.error("Cannot offer pairing code on %s: no pairing store", platform_name)
-            return
+            return "unavailable"
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.error("Cannot offer pairing code on %s: no adapter", platform_name)
+            return "unavailable"
         # Rate-limit ALL pairing responses (code or rejection) so a burst of DMs doesn't spam.
         if pairing_store._is_rate_limited(platform_name, source.user_id):
-            return
+            return "rate_limited"
         code = pairing_store.generate_code(platform_name, source.user_id, source.user_name or "")
-        adapter = self._adapter_for_source(source)
         if code:
             reply = pairing_code_reply(platform_name, code, pairing_profile_arg(pairing_store))
         else:
             reply = PAIRING_RATE_LIMITED_REPLY
-        if adapter:
-            await adapter.send(source.chat_id, reply)
+        try:
+            result = await adapter.send(source.chat_id, reply)
+        except Exception:
+            logger.warning("Pairing response send raised on %s", platform_name, exc_info=True)
+            return "uncertain"
+        if getattr(result, "success", None) is not True:
+            return "uncertain"
         if not code:
-            # Record rate limit so subsequent messages are silently ignored
             pairing_store._record_rate_limit(platform_name, source.user_id)
+            return "rate_limited"
+        return "confirmed"
+
+    async def _handle_pairing_intake(self, event: MessageEvent) -> Optional[str]:
+        """Resolve one unpaired DM without creating a session or model turn."""
+        try:
+            source = event.source
+            if (getattr(event, "internal", False) or source.chat_type != "dm"
+                    or not source.user_id or getattr(source, "is_bot", False)):
+                return "discard"
+            if self._is_user_authorized_for_source(source):
+                return "retry"
+            behavior = self._get_unauthorized_dm_behavior(source.platform, profile=getattr(source, "profile", None))
+            if behavior != "pair":
+                return "discard"
+            outcome = await self._hm_offer_pairing_code(source)
+            return {
+                "confirmed": "pairing_handshake",
+                "rate_limited": "pairing_rate_limited",
+                "unavailable": "pending",
+            }.get(outcome)
+        except Exception:
+            logger.warning("Pairing intake resolution failed", exc_info=True)
+            return None
 
     async def _hm_send_unauthorized_decline(self, source: SessionSource) -> None:
         """``decline`` behavior: one short refusal per sender per DECLINE_DEDUPE_SECONDS, then silence

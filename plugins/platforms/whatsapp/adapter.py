@@ -331,6 +331,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
+        # Bound once from the bridge's live handoff state.  A replacement
+        # bridge generation is not adopted by this running adapter.
+        self._inbound_handoff_owner_id = None
+        self._inbound_handoff_epoch = None
+        self._inbound_handoff_generation = None
+        self._inbound_handoff_binding_verified = False
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
@@ -614,14 +620,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         data["_addressed_followup_context"] = context
         return context
 
-    def _is_archive_authorized(self, data: Dict[str, Any]) -> bool:
-        """Keep authorized inbound evidence locally without changing admission."""
+    def _is_archive_authorized(self, data: Dict[str, Any]) -> Optional[bool]:
+        """Use the profile-bound gateway verdict; resolver failure stays pending."""
         chat_id = str(data.get("chatId") or "")
         if self._is_broadcast_chat(chat_id):
             return False
         if data.get("isGroup", False):
             return self._is_group_allowed(chat_id)
-        return self._is_dm_allowed(str(data.get("senderId") or data.get("from") or ""))
+        sender_id = str(data.get("senderId") or data.get("from") or "")
+        callback_present = callable(getattr(self, "_authorization_check", None))
+        verdict = self._is_sender_authorized(sender_id, "dm", chat_id)
+        if verdict is not None:
+            return verdict
+        return None if callback_present else self._is_dm_allowed(sender_id)
 
     async def _archive_media_slots(self, data: Dict[str, Any]) -> tuple[list[Optional[str]], int]:
         """Collect only bridge-cache files for private archival before event construction."""
@@ -1384,6 +1395,96 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] {bridge_exit}")
         return bool(bridge_exit)
 
+    def _build_unarchived_pairing_event(self, data: Dict[str, Any]) -> MessageEvent:
+        """Build only the bounded event needed by the pairing edge.
+
+        An unpaired direct message is never archive context and never enters
+        the general agent path merely to offer a pairing code.
+        """
+        return MessageEvent(
+            text=str(data.get("body") or ""), message_type=MessageType.TEXT,
+            source=self.build_source(
+                chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="dm",
+                user_id=data.get("senderId"), user_name=data.get("senderName"),
+                message_id=data.get("messageId"),
+            ),
+            message_id=data.get("messageId"),
+        )
+
+    @staticmethod
+    def _unarchived_account_id(data: Dict[str, Any]) -> str:
+        lease = data.get("_inboundLease") if isinstance(data.get("_inboundLease"), dict) else {}
+        return str(lease.get("accountNamespace") or "").strip().lower()
+
+    async def _stage_unarchived_inbound_disposition(self, data: Dict[str, Any], lease: Dict[str, Any], disposition: str):
+        try:
+            return await asyncio.to_thread(
+                self._inbound_archive_instance().stage_unarchived_disposition,
+                lease, data, disposition, account_id=self._unarchived_account_id(data),
+            )
+        except Exception:
+            logger.warning("[%s] WhatsApp unarchived disposition staging failed", self.name)
+            return None
+
+    async def _ack_staged_unarchived_disposition(self, receipt) -> bool:
+        try:
+            archive = self._inbound_archive_instance()
+            if not receipt.ready:
+                receipt = await asyncio.to_thread(archive.mark_unarchived_disposition_ready, receipt)
+            if not await self._ack_inbound_receipt(receipt):
+                return False
+            return await asyncio.to_thread(archive.mark_unarchived_disposition_acked, receipt)
+        except Exception:
+            logger.warning("[%s] WhatsApp unarchived disposition acknowledgement failed", self.name)
+            return False
+
+    async def _settle_unarchived_inbound_lease(self, data: Dict[str, Any], lease: Dict[str, Any], disposition: str) -> bool:
+        receipt = await self._stage_unarchived_inbound_disposition(data, lease, disposition)
+        return bool(receipt) and await self._ack_staged_unarchived_disposition(receipt)
+
+    async def _handoff_unarchived_pairing_intake(self, data: Dict[str, Any], lease: Dict[str, Any]) -> bool:
+        """Run the typed pairing-only edge with write-ahead outcome fencing."""
+        handler = getattr(self, "_pairing_intake_handler", None)
+        if not callable(handler):
+            logger.warning("[%s] WhatsApp pairing intake handler is unavailable", self.name)
+            return False
+        receipt = await self._stage_unarchived_inbound_disposition(data, lease, "pairing_intake")
+        if receipt is None:
+            return False
+        if receipt.effect_state in {"confirmed", "rate_limited"}:
+            return await self._ack_staged_unarchived_disposition(receipt)
+        if receipt.effect_state in {"attempted", "uncertain"}:
+            # External pairing delivery may already have happened.  A retry
+            # without reconciliation would duplicate a one-time handshake.
+            return False
+        try:
+            archive = self._inbound_archive_instance()
+            receipt = await asyncio.to_thread(archive.mark_unarchived_pairing_attempted, receipt)
+            disposition = await handler(self._build_unarchived_pairing_event(data))
+        except Exception:
+            logger.warning("[%s] WhatsApp pairing intake outcome is uncertain", self.name)
+            with suppress(Exception):
+                await asyncio.to_thread(self._inbound_archive_instance().mark_unarchived_pairing_uncertain, receipt)
+            return False
+        if disposition in {"retry", "pending"}:
+            with suppress(Exception):
+                await asyncio.to_thread(self._inbound_archive_instance().reset_unarchived_pairing_pending, receipt)
+            return False
+        try:
+            if disposition == "pairing_handshake":
+                receipt = await asyncio.to_thread(archive.mark_unarchived_pairing_confirmed, receipt)
+            elif disposition == "pairing_rate_limited":
+                receipt = await asyncio.to_thread(archive.mark_unarchived_pairing_rate_limited, receipt)
+            elif disposition == "discard":
+                receipt = await asyncio.to_thread(archive.mark_unarchived_pairing_confirmed, receipt)
+            else:
+                receipt = await asyncio.to_thread(archive.mark_unarchived_pairing_uncertain, receipt)
+                return False
+        except Exception:
+            logger.warning("[%s] WhatsApp pairing completion persistence failed", self.name)
+            return False
+        return await self._ack_staged_unarchived_disposition(receipt)
+
     def _inbound_lease_for(self, data: Dict[str, Any]) -> Optional[dict[str, Any]]:
         lease = data.get("_inboundLease")
         if not isinstance(lease, dict):
@@ -1392,9 +1493,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         delivery_id = str(lease.get("deliveryId") or "").lower()
         digest = str(lease.get("eventDigest") or "").lower()
         token = str(lease.get("token") or "")
+        initialized_handoff = hasattr(self, "_inbound_handoff_binding_verified")
         try:
             epoch = int(lease.get("epoch"))
             expires_at = int(lease.get("expiresAt"))
+            handoff_epoch = int(lease.get("handoffEpoch", 1))
+            owner_generation = int(lease.get("ownerGeneration", 1))
         except (TypeError, ValueError):
             return None
         if (
@@ -1402,12 +1506,58 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             or len(delivery_id) != 64 or any(char not in "0123456789abcdef" for char in delivery_id)
             or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
             or not token or len(token) > 256 or epoch < 1
+            or (initialized_handoff and (
+                not bool(getattr(self, "_inbound_handoff_binding_verified", False))
+                or "handoffEpoch" not in lease or "ownerGeneration" not in lease or "ownerId" not in lease
+                or handoff_epoch != getattr(self, "_inbound_handoff_epoch", None)
+                or owner_generation != getattr(self, "_inbound_handoff_generation", None)
+                or str(lease.get("ownerId") or "") != str(getattr(self, "_inbound_handoff_owner_id", ""))
+                or str(lease.get("consumerRole") or "candidate") != "candidate"
+            ))
             # A bridge must never hand Python an already-expired lease.  Do
             # not ACK or dispatch if a delayed poll response crosses expiry.
             or expires_at <= int(time.time() * 1000)
         ):
             return None
+        if not initialized_handoff:
+            # Direct/legacy embeddings predate the bridge handoff endpoint.
+            # Give their receipts an explicit stable legacy fence rather than
+            # persisting an unbound acknowledgement.
+            lease = dict(lease)
+            lease.setdefault("handoffEpoch", 1)
+            lease.setdefault("ownerId", "candidate")
+            lease.setdefault("ownerGeneration", 1)
+            lease.setdefault("consumerRole", "candidate")
+            lease.setdefault("commitId", "")
         return lease
+
+    async def _ensure_inbound_handoff_binding(self) -> bool:
+        """Bind once to a verified live bridge generation; never auto-adopt a replacement."""
+        if not hasattr(self, "_inbound_handoff_binding_verified"):
+            return True
+        try:
+            async with self._bridge_req("get", "handoff/state", 5) as response:
+                if response.status != 200:
+                    return False
+                state = await response.json()
+            owner = str(state.get("ownerId") or "") if isinstance(state, dict) else ""
+            epoch = int(state.get("handoffEpoch")) if isinstance(state, dict) else 0
+            generation = int(state.get("ownerGeneration")) if isinstance(state, dict) else 0
+            if not (isinstance(state, dict) and state.get("state") == "CANDIDATE_ACTIVE"
+                    and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", owner) and epoch >= 1 and generation >= 1):
+                return False
+        except (Exception, TypeError, ValueError):
+            return False
+        current = (owner, epoch, generation)
+        if self._inbound_handoff_binding_verified:
+            return current == (
+                self._inbound_handoff_owner_id,
+                self._inbound_handoff_epoch,
+                self._inbound_handoff_generation,
+            )
+        self._inbound_handoff_owner_id, self._inbound_handoff_epoch, self._inbound_handoff_generation = current
+        self._inbound_handoff_binding_verified = True
+        return True
 
     async def _ack_inbound_receipt(self, receipt) -> bool:
         try:
@@ -1487,6 +1637,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 break
             try:
                 consumer_id = getattr(self, "_inbound_consumer_id", None)
+                if consumer_id and not await self._ensure_inbound_handoff_binding():
+                    # A failed/replaced bridge handoff leaves leased ingress for
+                    # recovery rather than adopting a different device route.
+                    await asyncio.sleep(0.25)
+                    continue
                 params = {"consumerId": consumer_id} if consumer_id else None
                 async with self._bridge_req("get", "messages", 30, params=params) as resp:
                     if resp.status == 200:
@@ -1574,8 +1729,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             else:
                                 archive_id = None
                             if archive_id is None and lease_required:
-                                # The later admission slice will define terminal disposition
-                                # for unauthorized traffic. Do not settle a leased record here.
+                                # Pairing reaches only the dedicated, typed pairing
+                                # handler; every other unarchived lease is a
+                                # content-free policy drop.  Neither may enter the
+                                # ordinary agent path or leave a bridge lease wedged.
+                                if admitted and not msg_data.get("isGroup", False) and self._dm_policy == "pairing":
+                                    await self._handoff_unarchived_pairing_intake(msg_data, lease)
+                                else:
+                                    await self._settle_unarchived_inbound_lease(msg_data, lease, "discard")
                                 continue
                             receipt = None
                             if lease_required:
