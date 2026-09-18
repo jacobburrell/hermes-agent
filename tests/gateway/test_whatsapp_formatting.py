@@ -244,6 +244,26 @@ class TestBridgeEventMetadata:
         assert event.reply_to_is_own_message is True
 
     @pytest.mark.asyncio
+    async def test_stanza_only_reply_to_another_participant_is_not_admitted(self):
+        """A stanza ID is context, not authority to process arbitrary group replies."""
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter.config.extra = {"require_mention": True}
+        data = {
+            "messageId": "incoming-other-stanza", "chatId": "15551234567@g.us",
+            "senderId": "15550001111@s.whatsapp.net", "senderName": "Tester",
+            "chatName": "Group", "isGroup": True, "body": "sounds good",
+            "hasMedia": False, "mediaUrls": [],
+            "quotedMessageId": "another-participant-message",
+            "quotedParticipant": "15558888888@s.whatsapp.net",
+            "botIds": ["15559999999@s.whatsapp.net"],
+            "hasQuotedMessage": False,
+        }
+
+        assert adapter._should_process_message(data) is False
+        assert await adapter._build_message_event(data) is None
+
+    @pytest.mark.asyncio
     async def test_reply_to_uncaptioned_image_attaches_quoted_media(self, tmp_path, monkeypatch):
         # contextInfo.quotedMessage only ever carries a thumbnail-sized stub
         # for media (or nothing for an uncaptioned attachment). The bridge
